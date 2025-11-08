@@ -1,0 +1,77 @@
+use crate::models::{MessageEnvelope, SortableEnvelope};
+use crate::output::TableOutput;
+use anyhow::Result;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use tokio::sync::mpsc::Receiver;
+use tokio::time::{Duration, interval};
+
+/// Receives envelopes from all partitions, maintains a min-heap by timestamp,
+/// and periodically flushes in-order rows to the output sink.
+pub async fn run_merger(
+    mut rx: Receiver<MessageEnvelope>,
+    out: &mut TableOutput,
+    watermark: usize,
+    flush_interval_ms: u64,
+    max_messages: Option<usize>,
+) -> Result<()> {
+    let mut heap: BinaryHeap<Reverse<SortableEnvelope>> = BinaryHeap::new();
+    let mut tick = interval(Duration::from_millis(flush_interval_ms));
+    let mut emitted: usize = 0;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = tick.tick() => {
+                // periodic flush
+                drain_heap(&mut heap, out, usize::MAX, &mut emitted, max_messages);
+                if done(emitted, max_messages) { break; }
+            }
+
+            maybe_msg = rx.recv() => {
+                if let Some(env) = maybe_msg {
+                    heap.push(Reverse(SortableEnvelope(env)));
+                    if heap.len() >= watermark {
+                        // flush oldest ~half to keep latency low
+                        let target = heap.len() / 2;
+                        drain_heap(&mut heap, out, target, &mut emitted, max_messages);
+                        if done(emitted, max_messages) { break; }
+                    }
+                } else {
+                    // producers finished; drain all remaining
+                    drain_heap(&mut heap, out, usize::MAX, &mut emitted, max_messages);
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn drain_heap(
+    heap: &mut BinaryHeap<Reverse<SortableEnvelope>>,
+    out: &mut TableOutput,
+    max_rows: usize,
+    emitted: &mut usize,
+    max_messages: Option<usize>,
+) {
+    let mut n = 0usize;
+    while let Some(Reverse(SortableEnvelope(env))) = heap.pop() {
+        out.push(&env);
+        *emitted += 1;
+        n += 1;
+        if n >= max_rows || done(*emitted, max_messages) {
+            break;
+        }
+    }
+    if n > 0 {
+        out.flush_block();
+    }
+}
+
+#[inline]
+fn done(emitted: usize, max: Option<usize>) -> bool {
+    max.map(|m| emitted >= m).unwrap_or(false)
+}

@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rdkafka = { version = "0.36", features = ["cmake-build"] }
-clap = { version = "4.4", features = ["derive"] }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+colored = "2.1"
+rdkafka = { version = "0.36", features = ["cmake-build", "tokio"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.35", features = ["full"] }
-anyhow = "1.0"
-colored = "2.1"
-uuid = { version = "1.6", features = ["v4"] }
+uuid = { version = "1.8", features = ["v4"] }
+comfy-table = "7.1"
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time", "sync"] }
