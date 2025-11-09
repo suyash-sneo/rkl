@@ -13,6 +13,11 @@ Simple parser is built which can parse
 5. LIMIT takes a number
 
 
+## TUI
+- Main TUI
+- Envs TUI
+
+
 ## Test queries:
 
 I've tested the following queries using `cargo run -- --query "<query>" and they seem to be working fine. Displaying the data in a tabular format.
