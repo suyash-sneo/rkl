@@ -4,6 +4,14 @@ A TUI kafka tool that allows you to write SQL-like queries to read data from Kaf
 
 ![RKL TUI Screenshot](/assets/rkl-screenshot.png?raw=true)
 
+**Installation**
+- Install to `~/.local/bin` (no sudo):
+  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/main/scripts/install.sh | bash`
+- Optional: install a specific version:
+  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/main/scripts/install.sh | RKL_VERSION=v0.1.0 bash`
+- Optional: custom install location:
+  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/main/scripts/install.sh | RKL_INSTALL_DIR="$HOME/bin" bash`
+
 # Progress
 
 ## Query Parsing
@@ -42,5 +50,4 @@ SELECT key, value FROM random-data WHERE value->data->field3 = false LIMIT 5
 # Tests 
 
 One simple test to validate parsing for a sample query.
-
 
