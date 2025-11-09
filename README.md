@@ -4,19 +4,34 @@ A TUI kafka tool that allows you to write SQL-like queries to read data from Kaf
 
 ![RKL TUI Screenshot](/assets/rkl-screenshot.png?raw=true)
 
-**Installation**
-- Install to `~/.local/bin` (no sudo):
-  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | bash`
-- Optional: install a specific version:
-  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | RKL_VERSION=v0.1.0 bash`
-- Optional: custom install location:
-  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | RKL_INSTALL_DIR="$HOME/bin" bash`
+# Instructions
 
-**Uninstall**
-- Remove from the default location (`~/.local/bin`):
-  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/uninstall.sh | bash`
-- If you installed to a custom location:
-  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/uninstall.sh | RKL_INSTALL_DIR="$HOME/bin" bash`
+## Installation
+Install latest (no sudo):
+```sh
+curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | bash
+```
+
+Install a specific version:
+```sh
+curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | RKL_VERSION=v0.1.0 bash
+```
+
+Custom install location:
+```sh
+curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | RKL_INSTALL_DIR="$HOME/bin" bash
+```
+
+## Uninstall
+Default location (`~/.local/bin`):
+```sh
+curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/uninstall.sh | bash
+```
+
+Uninstall from a custom location:
+```sh
+curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/uninstall.sh | RKL_INSTALL_DIR="$HOME/bin" bash
+```
 
 # Progress
 
