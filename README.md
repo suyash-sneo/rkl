@@ -1,9 +1,12 @@
 # RKL
 
-A CLI (to be TUI) based tool that allows you to write SQL-like queries to read data from Kafka topics and display them in your terminal in table-like format
+A TUI kafka tool that allows you to write SQL-like queries to read data from Kafka topics.
 
+![RKL TUI Screenshot](/assets/rkl-screenshot.png?raw=true)
 
 # Progress
+
+## Query Parsing
 
 Simple parser is built which can parse
 1. SELECT can be key[, value]
@@ -12,15 +15,21 @@ Simple parser is built which can parse
 4. ORDER BY takes timestamp only but can be followed by ASC/DESC
 5. LIMIT takes a number
 
-
 ## TUI
-- Main TUI
-- Envs TUI
+
+Main TUI with: 
+1. Envs window
+2. Query editor (with highlighting for current and last-run query) plus SQL syntax highlighting
+3. Output with table-like results
+4. Side output-pane for full data under the cursor
+5. Help footer
+
+Env TUI with:
+1. Left list of envs (basically hosts)
+2. Right side for inputs like hots, private/public key, CA, etc
 
 
-## Test queries:
-
-I've tested the following queries using `cargo run -- --query "<query>" and they seem to be working fine. Displaying the data in a tabular format.
+# Test queries:
 
 ```rkl
 SELECT key, value FROM random-data LIMIT 5
