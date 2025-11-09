@@ -1,9 +1,21 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "rkl")]
 #[command(about = "Search Kafka topics without committing offsets", long_about = None)]
-pub struct Args {
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Commands {
+    /// Run once with a query or search, printing a table
+    Run(RunArgs),
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct RunArgs {
     /// Kafka broker address
     #[arg(short, long, default_value = "localhost:9092")]
     pub broker: String,
@@ -59,8 +71,26 @@ pub struct Args {
     pub flush_interval_ms: u64,
 }
 
-impl Args {
-    pub fn parse_cli() -> Self {
-        Self::parse()
+impl Cli {
+    pub fn parse_cli() -> Self { Self::parse() }
+}
+
+impl Default for RunArgs {
+    fn default() -> Self {
+        Self {
+            broker: "localhost:9092".to_string(),
+            topic: None,
+            search: None,
+            query: None,
+            max_messages: None,
+            partition: None,
+            offset: "beginning".to_string(),
+            keys_only: false,
+            no_color: false,
+            max_cell_width: 120,
+            channel_capacity: 2048,
+            watermark: 256,
+            flush_interval_ms: 250,
+        }
     }
 }

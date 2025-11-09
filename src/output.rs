@@ -2,6 +2,12 @@ use crate::models::MessageEnvelope;
 use comfy_table::{Attribute, Cell, ContentArrangement, Table, presets::UTF8_FULL};
 use time::{OffsetDateTime, format_description::well_known::Iso8601};
 
+/// Generic sink trait used by the merger to emit rows in batches.
+pub trait OutputSink {
+    fn push(&mut self, env: &MessageEnvelope);
+    fn flush_block(&mut self);
+}
+
 pub struct TableOutput {
     table: Table,
     no_color: bool,
@@ -42,7 +48,10 @@ impl TableOutput {
         }
     }
 
-    pub fn push(&mut self, env: &MessageEnvelope) {
+}
+
+impl OutputSink for TableOutput {
+    fn push(&mut self, env: &MessageEnvelope) {
         let ts_str = fmt_ts(env.timestamp_ms);
         let mut row = vec![
             cell(env.partition, self.no_color),
@@ -60,7 +69,7 @@ impl TableOutput {
         self.rows_buffered += 1;
     }
 
-    pub fn flush_block(&mut self) {
+    fn flush_block(&mut self) {
         if self.rows_buffered == 0 {
             return;
         }
@@ -81,7 +90,9 @@ impl TableOutput {
         }
         self.rows_buffered = 0;
     }
+}
 
+impl TableOutput {
     pub fn finish(&mut self) {
         self.flush_block();
     }

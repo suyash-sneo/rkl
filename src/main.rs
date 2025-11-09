@@ -4,9 +4,10 @@ mod merger;
 mod models;
 mod output;
 mod query;
+mod tui;
 
 use anyhow::{Context, Result};
-use args::Args;
+use args::{Cli, Commands, RunArgs};
 use colored::*;
 use consumer::spawn_partition_consumer;
 use merger::run_merger;
@@ -21,7 +22,14 @@ use tokio::task::JoinSet;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse_cli();
+    let cli = Cli::parse_cli();
+    match cli.command {
+        None => {
+            // No subcommand -> launch TUI with default settings
+            return tui::run(RunArgs::default()).await;
+        }
+        Some(Commands::Run(args)) => {
+            let args = args;
 
     // Parse --query if provided and compute effective settings
     println!(
@@ -121,5 +129,7 @@ async fn main() -> Result<()> {
     }
 
     table_out.finish();
-    Ok(())
+    return Ok(());
+        }
+    }
 }

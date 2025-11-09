@@ -1,5 +1,5 @@
 use crate::models::{MessageEnvelope, SortableEnvelope};
-use crate::output::TableOutput;
+use crate::output::OutputSink;
 use anyhow::Result;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -34,9 +34,9 @@ impl HeapKind {
 
 /// Receives envelopes from all partitions, maintains a min-heap by timestamp,
 /// and periodically flushes in-order rows to the output sink.
-pub async fn run_merger(
+pub async fn run_merger<S: OutputSink + Send>(
     mut rx: Receiver<MessageEnvelope>,
-    out: &mut TableOutput,
+    out: &mut S,
     watermark: usize,
     flush_interval_ms: u64,
     max_messages: Option<usize>,
@@ -77,9 +77,9 @@ pub async fn run_merger(
     Ok(())
 }
 
-fn drain_heap(
+fn drain_heap<S: OutputSink>(
     heap: &mut HeapKind,
-    out: &mut TableOutput,
+    out: &mut S,
     max_rows: usize,
     emitted: &mut usize,
     max_messages: Option<usize>,

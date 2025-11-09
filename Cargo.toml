@@ -14,3 +14,6 @@ uuid = { version = "1.8", features = ["v4"] }
 comfy-table = "7.1"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time", "sync"] }
+ratatui = "0.27"
+crossterm = "0.27"
+arboard = "3.4"

@@ -29,3 +29,4 @@ SELECT key, value FROM random-data WHERE value->data->field3 = false LIMIT 5
 
 One simple test to validate parsing for a sample query.
 
+

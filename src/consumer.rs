@@ -1,4 +1,4 @@
-use crate::args::Args;
+use crate::args::RunArgs;
 use crate::models::{MessageEnvelope, OffsetSpec};
 use crate::query::SelectQuery;
 use anyhow::{Context, Result};
@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
 pub async fn spawn_partition_consumer(
-    args: Args,
+    args: RunArgs,
     partition: i32,
     offset_spec: OffsetSpec,
     tx: Sender<MessageEnvelope>,
