@@ -1,9 +1,10 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, terminal};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -25,7 +26,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen)?;
+    execute!(stdout, terminal::EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -39,6 +40,15 @@ pub async fn run(args: RunArgs) -> Result<()> {
 
     // Main loop
     let res = loop {
+        // Handle transient pressed button animation
+        if app.copy_btn_pressed {
+            if let Some(deadline) = app.copy_btn_deadline {
+                if Instant::now() >= deadline { app.copy_btn_pressed = false; app.copy_btn_deadline = None; }
+            } else {
+                app.copy_btn_pressed = false;
+            }
+        }
+
         // Draw UI
         terminal.draw(|f| draw(f, &app))?;
 
@@ -224,6 +234,14 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         (KeyCode::F(5), _) | (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
                             if matches!(app.focus, super::app::Focus::Results) { if let Some(s) = selected_cell_text(&app) { match copy_to_clipboard(&s) { Ok(()) => app.status = "Copied to clipboard".to_string(), Err(e) => app.status = format!("Clipboard error: {}", e) } } }
                         }
+                        (KeyCode::F(6), _) => {
+                            if matches!(app.focus, super::app::Focus::Results) {
+                                if let Some(s) = selected_cell_text(&app) {
+                                    match copy_to_clipboard(&s) { Ok(()) => app.status = "Copied".to_string(), Err(e) => app.status = format!("Clipboard error: {}", e) }
+                                    app.copy_btn_pressed = true; app.copy_btn_deadline = Some(Instant::now() + Duration::from_millis(150));
+                                } else { app.status = "No content to copy".to_string(); }
+                            }
+                        }
                         (KeyCode::Char(ch), _) => {
                             if app.show_env_modal {
                                 // Modal text input and commands
@@ -263,14 +281,24 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 if let Some(sel) = app.env_store.selected { if sel > 0 { app.env_store.selected = Some(sel - 1); } }
                                 else if !app.env_store.envs.is_empty() { app.env_store.selected = Some(0); }
                                 if let Some(i) = app.env_store.selected { if let Some(e) = app.env_store.envs.get(i) { if let Some(ed) = app.env_editor.as_mut() { ed.idx = Some(i); ed.name = e.name.clone(); ed.host = e.host.clone(); ed.private_key_pem = e.private_key_pem.clone().unwrap_or_default(); ed.public_key_pem = e.public_key_pem.clone().unwrap_or_default(); ed.ssl_ca_pem = e.ssl_ca_pem.clone().unwrap_or_default(); } } }
-                            } else if matches!(app.focus, super::app::Focus::Results) { if app.selected_row > 0 { app.selected_row -= 1; } }
+                            } else if matches!(app.focus, super::app::Focus::Results) { if app.selected_row > 0 { app.selected_row -= 1; app.json_vscroll = 0; } }
                         }
                         (KeyCode::Down, _) => {
                             if app.show_env_modal {
                                 if let Some(sel) = app.env_store.selected { if sel + 1 < app.env_store.envs.len() { app.env_store.selected = Some(sel + 1); } }
                                 else if !app.env_store.envs.is_empty() { app.env_store.selected = Some(0); }
                                 if let Some(i) = app.env_store.selected { if let Some(e) = app.env_store.envs.get(i) { if let Some(ed) = app.env_editor.as_mut() { ed.idx = Some(i); ed.name = e.name.clone(); ed.host = e.host.clone(); ed.private_key_pem = e.private_key_pem.clone().unwrap_or_default(); ed.public_key_pem = e.public_key_pem.clone().unwrap_or_default(); ed.ssl_ca_pem = e.ssl_ca_pem.clone().unwrap_or_default(); } } }
-                            } else if matches!(app.focus, super::app::Focus::Results) { if app.selected_row + 1 < app.rows.len() { app.selected_row += 1; } }
+                            } else if matches!(app.focus, super::app::Focus::Results) { if app.selected_row + 1 < app.rows.len() { app.selected_row += 1; app.json_vscroll = 0; } }
+                        }
+                        (KeyCode::Left, KeyModifiers::SHIFT) => {
+                            if matches!(app.focus, super::app::Focus::Results) {
+                                app.table_hscroll = app.table_hscroll.saturating_sub(2);
+                            }
+                        }
+                        (KeyCode::Right, KeyModifiers::SHIFT) => {
+                            if matches!(app.focus, super::app::Focus::Results) {
+                                app.table_hscroll = app.table_hscroll.saturating_add(2);
+                            }
                         }
                         (KeyCode::Left, _) => {
                             if app.show_env_modal {
@@ -286,6 +314,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 }
                             } else if matches!(app.focus, super::app::Focus::Results) {
                                 if app.selected_col > 0 { app.selected_col -= 1; } else { app.selected_col = 0; }
+                                app.json_vscroll = 0;
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 if app.input_cursor>0 { app.input_cursor-=1; }
                             }
@@ -304,16 +333,20 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 }
                             } else if matches!(app.focus, super::app::Focus::Results) {
                                 let cols = if app.keys_only { 4 } else { 5 }; if app.selected_col + 1 < cols { app.selected_col += 1; }
+                                app.json_vscroll = 0;
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 if app.input_cursor<app.input.len() { app.input_cursor+=1; }
                             }
                         }
-                        (KeyCode::PageUp, _) => { if matches!(app.focus, super::app::Focus::Results) { let step = 10; app.selected_row = app.selected_row.saturating_sub(step); } }
-                        (KeyCode::PageDown, _) => { if matches!(app.focus, super::app::Focus::Results) { let step = 10; if app.rows.len() > 0 { app.selected_row = (app.selected_row + step).min(app.rows.len()-1); } } }
-                        (KeyCode::Home, _) => { if matches!(app.focus, super::app::Focus::Results) { app.selected_row = 0; } }
-                        (KeyCode::End, _) => { if matches!(app.focus, super::app::Focus::Results) { if app.rows.len() > 0 { app.selected_row = app.rows.len()-1; } } }
+                        (KeyCode::PageUp, _) => { if matches!(app.focus, super::app::Focus::Results) { let step = 10; app.selected_row = app.selected_row.saturating_sub(step); app.json_vscroll = 0; } }
+                        (KeyCode::PageDown, _) => { if matches!(app.focus, super::app::Focus::Results) { let step = 10; if !app.rows.is_empty() { app.selected_row = (app.selected_row + step).min(app.rows.len()-1); app.json_vscroll = 0; } } }
+                        (KeyCode::Home, _) => { if matches!(app.focus, super::app::Focus::Results) { app.selected_row = 0; app.json_vscroll = 0; } }
+                        (KeyCode::End, _) => { if matches!(app.focus, super::app::Focus::Results) { if !app.rows.is_empty() { app.selected_row = app.rows.len()-1; app.json_vscroll = 0; } } }
                         _ => {}
                     }
+                }
+                Event::Mouse(me) => {
+                    handle_mouse(&mut app, me);
                 }
                 _ => {}
             }
@@ -323,7 +356,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // Restore terminal
     disable_raw_mode().ok();
     // Use crossterm global execute to restore screen
-    execute!(std::io::stdout(), terminal::LeaveAlternateScreen, crossterm::cursor::Show).ok();
+    execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, terminal::LeaveAlternateScreen, crossterm::cursor::Show).ok();
 
     res
 }
@@ -446,6 +479,7 @@ fn selected_cell_text(app: &AppState) -> Option<String> {
     Some(s)
 }
 
+
 fn copy_to_clipboard(s: &str) -> Result<()> {
     let mut cb = arboard::Clipboard::new().context("open clipboard")?;
     cb.set_text(s.to_string()).context("set clipboard text")?;
@@ -476,4 +510,112 @@ async fn test_connection(host: &str, ssl: crate::models::SslConfig) -> Result<()
     let consumer: StreamConsumer = cfg.create().context("create consumer")?;
     let _ = consumer.fetch_metadata(None, Duration::from_secs(5)).context("fetch metadata")?;
     Ok(())
+}
+
+fn handle_mouse(app: &mut AppState, me: MouseEvent) {
+    // Compute the layout rects like ui.rs to know where the table and json panes are
+    let (w, h) = match crossterm::terminal::size() { Ok(x) => x, Err(_) => (0, 0) };
+    let root = Rect { x: 0, y: 0, width: w, height: h };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(3),
+        ])
+        .split(root);
+    let results_area = rows[3];
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .split(results_area);
+    let table_rect = cols[0];
+    let json_rect = cols[1];
+    let json_inner = Rect { x: json_rect.x.saturating_add(1), y: json_rect.y.saturating_add(1), width: json_rect.width.saturating_sub(2), height: json_rect.height.saturating_sub(2) };
+
+    let mx = me.column;
+    let my = me.row;
+
+    match me.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if point_in(mx, my, table_rect) {
+                // Map click Y to an approximate row index
+                // account for borders + header (top border + header row)
+                let data_start_y = table_rect.y.saturating_add(2);
+                if my >= data_start_y && my < table_rect.y.saturating_add(table_rect.height.saturating_sub(1)) {
+                    let y_rel = (my - data_start_y) as usize;
+                    let visible_rows = table_rect.height.saturating_sub(3) as usize; // top border + header + bottom border
+                    let approx_first = app.selected_row.saturating_sub(visible_rows / 2);
+                    let new_row = (approx_first + y_rel).min(app.rows.len().saturating_sub(1));
+                    if new_row != app.selected_row { app.selected_row = new_row; app.json_vscroll = 0; }
+                }
+
+                // Map click X to column index (approximate using constraints)
+                let inner_x = table_rect.x.saturating_add(1);
+                if mx >= inner_x {
+                    let mut x_rel = (mx - inner_x) as usize;
+                    // Partition (10)
+                    let mut col = 0usize;
+                    let mut widths = vec![10usize, 12, 26, 30];
+                    if !app.keys_only { widths.push(usize::MAX); }
+                    for (i, w) in widths.iter().enumerate() {
+                        if i + 1 == widths.len() && *w == usize::MAX {
+                            col = i; break;
+                        }
+                        if x_rel < *w { col = i; break; } else { x_rel = x_rel.saturating_sub(*w + 1); }
+                    }
+                    let max_cols = if app.keys_only { 4 } else { 5 };
+                    if col < max_cols { if app.selected_col != col { app.selected_col = col; app.json_vscroll = 0; } }
+                }
+            } else if point_in(mx, my, json_rect) {
+                // Detect click on Copy button in the JSON pane (top-right of inner area)
+                let label = "[ Copy ]";
+                let btn_w = label.chars().count() as u16;
+                if json_inner.width >= btn_w {
+                    let btn_rect = Rect { x: json_inner.x + json_inner.width - btn_w, y: json_inner.y, width: btn_w, height: 1 };
+                    if point_in(mx, my, btn_rect) {
+                        if let Some(s) = selected_cell_text(app) {
+                            if let Err(e) = copy_to_clipboard(&s) { app.status = format!("Clipboard error: {}", e); } else { app.status = "Payload copied".to_string(); }
+                            app.copy_btn_pressed = true; app.copy_btn_deadline = Some(Instant::now() + Duration::from_millis(150));
+                        } else {
+                            app.status = "No payload to copy".to_string();
+                        }
+                        return; // handled
+                    }
+                }
+                // Otherwise, ignore; allow native selection by terminal
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if point_in(mx, my, table_rect) {
+                if app.selected_row > 0 { app.selected_row -= 1; }
+            } else if point_in(mx, my, json_rect) {
+                app.json_vscroll = app.json_vscroll.saturating_sub(1);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if point_in(mx, my, table_rect) {
+                if app.selected_row + 1 < app.rows.len() { app.selected_row += 1; }
+            } else if point_in(mx, my, json_rect) {
+                app.json_vscroll = app.json_vscroll.saturating_add(1);
+            }
+        }
+        MouseEventKind::ScrollLeft => {
+            if point_in(mx, my, table_rect) {
+                app.table_hscroll = app.table_hscroll.saturating_sub(4);
+            }
+        }
+        MouseEventKind::ScrollRight => {
+            if point_in(mx, my, table_rect) {
+                app.table_hscroll = app.table_hscroll.saturating_add(4);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn point_in(x: u16, y: u16, r: Rect) -> bool {
+    x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
 }

@@ -1,5 +1,6 @@
 use crate::models::{MessageEnvelope, SslConfig};
 use super::env_store::{EnvStore, Environment};
+use std::time::Instant;
 
 #[derive(Default)]
 pub struct AppState {
@@ -17,6 +18,11 @@ pub struct AppState {
     pub env_store: EnvStore,
     pub show_env_modal: bool,
     pub env_editor: Option<EnvEditor>,
+    // Results/table view state
+    pub table_hscroll: usize,
+    pub json_vscroll: u16,
+    pub copy_btn_pressed: bool,
+    pub copy_btn_deadline: Option<Instant>,
 }
 
 impl AppState {
@@ -42,6 +48,10 @@ impl AppState {
             env_store,
             show_env_modal: false,
             env_editor: None,
+            table_hscroll: 0,
+            json_vscroll: 0,
+            copy_btn_pressed: false,
+            copy_btn_deadline: None,
         }
     }
 

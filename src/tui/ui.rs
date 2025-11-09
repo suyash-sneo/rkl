@@ -3,9 +3,14 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::*;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, List, ListItem, Clear};
+use ratatui::widgets::{
+    Block, Borders, Cell, Paragraph, Row, Table, TableState, List, ListItem, Clear,
+    Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 
 use super::app::{AppState, Focus, EnvFieldFocus};
+
+pub(super) const COPY_BTN_LABEL: &str = "[ Copy ]";
 
 pub fn draw(frame: &mut Frame, app: &AppState) {
     let size = frame.size();
@@ -24,7 +29,7 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
     draw_env_bar(frame, chunks[0], app);
     draw_input(frame, chunks[1], app);
     draw_status(frame, chunks[2], &app.status);
-    draw_table(frame, chunks[3], app);
+    draw_results(frame, chunks[3], app);
     draw_footer(frame, chunks[4], app);
     if app.show_env_modal {
         let area = centered_rect(80, 80, size);
@@ -73,7 +78,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
     let cols = if app.keys_only { 4 } else { 5 };
     let col = if cols == 0 { 0 } else { app.selected_col + 1 };
     let legend = format!(
-        "Tab: Focus | Enter: Run | Results: arrows navigate, F5/C-y copy | Ctrl-Q/Ctrl-C: Quit | Row {row}/{total} Col {col}/{cols}"
+        "Tab: Focus | Enter: Run | Results: arrows navigate, Shift-←/→ h-scroll, Mouse click/scroll | F5/C-y copy cell | Click [Copy] | Ctrl-Q/Ctrl-C: Quit | Row {row}/{total} Col {col}/{cols}"
     );
     let block = Block::default().borders(Borders::ALL).title("Help");
     let para = Paragraph::new(legend).block(block);
@@ -187,6 +192,17 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+fn draw_results(frame: &mut Frame, area: Rect, app: &AppState) {
+    // Split results into left (table) and right (json detail)
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .split(area);
+
+    draw_table(frame, cols[0], app);
+    draw_json_detail(frame, cols[1], app);
+}
+
 fn draw_table(frame: &mut Frame, area: Rect, app: &AppState) {
     let headers = if app.keys_only {
         vec![
@@ -205,6 +221,7 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &AppState) {
         ]
     };
 
+    // Create single-line rows with truncated previews; full JSON moves to right pane
     let rows: Vec<Row> = app
         .rows
         .iter()
@@ -240,6 +257,24 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &AppState) {
         state.select(Some(app.selected_row.min(app.rows.len() - 1)));
     }
     frame.render_stateful_widget(table, area, &mut state);
+
+    // Vertical scrollbar for table (binds to selected_row)
+    let total_rows = app.rows.len();
+    if total_rows > 0 {
+        let mut vs = ScrollbarState::new(total_rows).position(app.selected_row.min(total_rows - 1));
+        let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(vbar, area, &mut vs);
+    }
+
+    // Horizontal scrollbar for table (approximate by preview width)
+    let content_w_estimate = estimate_table_content_width(app);
+    let visible_w = area.width.saturating_sub(2) as usize; // minus borders
+    let h_content = content_w_estimate.saturating_sub(visible_w).saturating_add(1);
+    if h_content > 1 {
+        let mut hs = ScrollbarState::new(h_content).position(app.table_hscroll.min(h_content - 1));
+        let hbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom);
+        frame.render_stateful_widget(hbar, area, &mut hs);
+    }
 }
 
 fn header_span(text: &str) -> Span<'_> {
@@ -256,19 +291,23 @@ fn make_row(idx: usize, env: &MessageEnvelope, app: &AppState) -> Row<'static> {
             style_cell(Cell::from(env.offset.to_string()), selected && app.selected_col == 1),
             style_cell(Cell::from(ts), selected && app.selected_col == 2),
             style_cell(Cell::from(env.key.clone()), selected && app.selected_col == 3),
-        ]);
+        ])
+        .height(1);
         row
     } else {
-        let value_text = env.value.as_deref().unwrap_or("null");
-        let (value, height) = make_json_cell_and_height(value_text);
-        let mut row = Row::new(vec![
+        // For the table, render a one-line minified preview of the value with hscroll
+        let raw_value = env.value.as_deref().unwrap_or("null");
+        let preview = json_preview_minified(raw_value);
+        let hscroll = app.table_hscroll;
+        let preview = apply_hscroll(&preview, hscroll);
+        let row = Row::new(vec![
             style_cell(Cell::from(env.partition.to_string()), selected && app.selected_col == 0),
             style_cell(Cell::from(env.offset.to_string()), selected && app.selected_col == 1),
             style_cell(Cell::from(ts), selected && app.selected_col == 2),
             style_cell(Cell::from(env.key.clone()), selected && app.selected_col == 3),
-            style_cell(Cell::from(value), selected && app.selected_col == 4),
-        ]);
-        row = row.height(height);
+            style_cell(Cell::from(preview), selected && app.selected_col == 4),
+        ])
+        .height(1);
         row
     }
 }
@@ -290,6 +329,7 @@ fn fmt_ts(ms: i64) -> String {
     tm.format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| ms.to_string())
 }
 
+#[allow(dead_code)]
 fn make_json_cell_and_height(s: &str) -> (Text<'static>, u16) {
     // Small highlighter for JSON-ish strings.
     // If it isn't JSON, return plain text with height 1.
@@ -353,4 +393,115 @@ fn json_to_highlighted_lines(v: &serde_json::Value) -> Vec<Line<'static>> {
     }
     walk(v, 0, &mut lines);
     lines
+}
+
+fn json_preview_minified(s: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| s.to_string()),
+        Err(_) => {
+            // Use the first line only for non-JSON
+            s.lines().next().unwrap_or("").to_string()
+        }
+    }
+}
+
+fn apply_hscroll(s: &str, offset: usize) -> String {
+    if offset == 0 { return s.to_string(); }
+    s.chars().skip(offset).collect()
+}
+
+fn estimate_table_content_width(app: &AppState) -> usize {
+    // Approximate widths of fixed columns + spacing + average key/value preview length
+    let fixed: usize = 10 + 1 + 12 + 1 + 26 + 1 + 30 + 1; // partition+sp+offset+sp+ts+sp+key+sp
+    if app.keys_only {
+        // no value column
+        return fixed.saturating_sub(1); // last spacing unnecessary
+    }
+    let mut max_preview = 0usize;
+    for env in &app.rows {
+        let raw = env.value.as_deref().unwrap_or("null");
+        let p = json_preview_minified(raw);
+        max_preview = max_preview.max(p.chars().count());
+    }
+    fixed + max_preview
+}
+
+fn draw_json_detail(frame: &mut Frame, area: Rect, app: &AppState) {
+    // Show the currently selected cell content with wrapping and vertical scroll
+    let (title_suffix, raw) = selected_cell_for_detail(app);
+    let title = format!("Details ({})", title_suffix);
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Build Text using existing highlighter
+    let text: Text = match raw.as_deref() {
+        Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(v) => Text::from(json_to_highlighted_lines(&v)),
+            Err(_) => Text::from(s.to_string()),
+        },
+        None => Text::from(""),
+    };
+
+    let para = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((app.json_vscroll, 0));
+    frame.render_widget(para, inner_area);
+
+    // Draw Copy button at top-right of inner area
+    let btn_w = COPY_BTN_LABEL.chars().count() as u16;
+    if inner_area.width > btn_w {
+        let btn_rect = Rect { x: inner_area.x + inner_area.width - btn_w, y: inner_area.y, width: btn_w, height: 1 };
+        let style = if app.copy_btn_pressed {
+            // pressed look
+            Style::default().fg(Color::Black).bg(Color::LightYellow)
+        } else {
+            // raised look
+            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+        };
+        let btn = Paragraph::new(COPY_BTN_LABEL).style(style);
+        frame.render_widget(btn, btn_rect);
+    }
+
+    // Vertical scrollbar for JSON
+    // Estimate content length by lines (simple; Paragraph wrap may change it, but this is sufficient)
+    let content_len = match raw.as_deref() {
+        Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(v) => json_to_highlighted_lines(&v).len(),
+            Err(_) => s.lines().count(),
+        },
+        None => 0,
+    };
+    if content_len > 0 {
+        let mut vs = ScrollbarState::new(content_len).position(app.json_vscroll.min((content_len.saturating_sub(1)) as u16) as usize);
+        let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(vbar, area, &mut vs);
+    }
+}
+
+fn selected_cell_for_detail(app: &AppState) -> (String, Option<String>) {
+    if app.rows.is_empty() {
+        return ("none".to_string(), None);
+    }
+    let idx = app.selected_row.min(app.rows.len() - 1);
+    let env = &app.rows[idx];
+    let (title, s) = if app.keys_only {
+        match app.selected_col.min(3) {
+            0 => ("Partition", env.partition.to_string()),
+            1 => ("Offset", env.offset.to_string()),
+            2 => ("Timestamp", fmt_ts(env.timestamp_ms)),
+            3 => ("Key", env.key.clone()),
+            _ => ("", String::new()),
+        }
+    } else {
+        match app.selected_col.min(4) {
+            0 => ("Partition", env.partition.to_string()),
+            1 => ("Offset", env.offset.to_string()),
+            2 => ("Timestamp", fmt_ts(env.timestamp_ms)),
+            3 => ("Key", env.key.clone()),
+            4 => ("Value", env.value.as_deref().unwrap_or("null").to_string()),
+            _ => ("", String::new()),
+        }
+    };
+    (title.to_string(), Some(s))
 }
