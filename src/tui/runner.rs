@@ -1,9 +1,10 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, terminal};
+use crossterm::event::{PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags, KeyboardEnhancementFlags};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -26,7 +27,17 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
+    // Enter alt screen, enable mouse, and request enhanced keyboard so Ctrl-Enter is detectable on supporting terminals (kitty/wezterm/xterm)
+    execute!(
+        stdout,
+        terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
+        )
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -73,10 +84,67 @@ pub async fn run(args: RunArgs) -> Result<()> {
         // Handle key input (non-blocking poll)
         if crossterm::event::poll(Duration::from_millis(50))? {
             match crossterm::event::read()? {
-                Event::Key(KeyEvent { code, modifiers, .. }) => {
+                Event::Key(key) => {
+                    // With keyboard enhancement flags, terminals can emit Press/Repeat/Release.
+                    // Only act on Press to avoid duplicate input.
+                    if key.kind != KeyEventKind::Press { continue; }
+                    let KeyEvent { code, modifiers, .. } = key;
                     match (code, modifiers) {
                         (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
                         (KeyCode::Char('q'), KeyModifiers::CONTROL) => break Ok(()),
+                        // Some macOS terminals send Ctrl-Enter as Ctrl-J (LF) or Ctrl-M (CR)
+                        // Ctrl-Enter (and common terminal fallbacks) → run
+                        (KeyCode::Char('j'), m) | (KeyCode::Char('m'), m) if m.contains(KeyModifiers::CONTROL) => {
+                            if !app.show_env_modal && matches!(app.focus, super::app::Focus::Query) {
+                                let (qs, qe) = find_query_range(&app.input, app.input_cursor);
+                                let input = app.input[qs..qe].trim().to_string();
+                                if input.is_empty() { app.status = "Please enter a query".to_string(); continue; }
+                                match parse_query(&input) {
+                                    Ok(ast) => {
+                                        let keys_only = !ast.select.iter().any(|i| matches!(i, SelectItem::Value));
+                                        app.keys_only = keys_only;
+                                        app.clear_rows();
+                                        run_counter += 1;
+                                        app.current_run = Some(run_counter);
+                                        app.last_run_query_range = Some((qs, qe));
+                                        let env_host = app.selected_env().map(|e| e.host.clone()).unwrap_or(app.host.clone());
+                                        app.status = format!("Running (run {}): topic '{}' on {}. Press q to quit.", run_counter, ast.from, env_host);
+                                        let mut run_args = args.clone();
+                                        run_args.broker = env_host;
+                                        app.clamp_selection();
+                                        let ssl = app.current_ssl_config();
+                                        spawn_pipeline_with_ssl(run_args, input, run_counter, tx_evt.clone(), ssl).await;
+                                    }
+                                    Err(e) => { app.status = format!("Parse error: {}", e); }
+                                }
+                            }
+                        }
+                        (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
+                            if !app.show_env_modal && matches!(app.focus, super::app::Focus::Query) {
+                                let (qs, qe) = find_query_range(&app.input, app.input_cursor);
+                                let input = app.input[qs..qe].trim().to_string();
+                                if input.is_empty() { app.status = "Please enter a query".to_string(); continue; }
+                                match parse_query(&input) {
+                                    Ok(ast) => {
+                                        let keys_only = !ast.select.iter().any(|i| matches!(i, SelectItem::Value));
+                                        app.keys_only = keys_only;
+                                        app.clear_rows();
+                                        run_counter += 1;
+                                        app.current_run = Some(run_counter);
+                                        app.last_run_query_range = Some((qs, qe));
+                                        let env_host = app.selected_env().map(|e| e.host.clone()).unwrap_or(app.host.clone());
+                                        app.status = format!("Running (run {}): topic '{}' on {}. Press q to quit.", run_counter, ast.from, env_host);
+                                        let mut run_args = args.clone();
+                                        run_args.broker = env_host;
+                                        app.clamp_selection();
+                                        let ssl = app.current_ssl_config();
+                                        spawn_pipeline_with_ssl(run_args, input, run_counter, tx_evt.clone(), ssl).await;
+                                    }
+                                    Err(e) => { app.status = format!("Parse error: {}", e); }
+                                }
+                            }
+                        }
+                        // Only Enter and Ctrl-Enter are used for editor newline/run
                         (KeyCode::Enter, _) => {
                             if app.show_env_modal {
                                 // Save current editor as env (create or update) and close
@@ -115,26 +183,13 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 };
                                 app.env_editor = Some(EnvEditor { idx, name_cursor: 0, name, host_cursor: 0, host, private_key_cursor: 0, private_key_pem: privk, public_key_cursor: 0, public_key_pem: pubk, ssl_ca_cursor: 0, ssl_ca_pem: ca, field_focus: EnvFieldFocus::Name });
                                 app.show_env_modal = true;
+                            } else if matches!(app.focus, super::app::Focus::Query) {
+                                // GUI-like: Enter inserts newline in editor, ensure caret stays visible
+                                app.input.insert(app.input_cursor, '\n');
+                                app.input_cursor += 1;
+                                ensure_input_cursor_visible(&mut app);
                             } else {
-                                let input = app.input.trim().to_string();
-                                if input.is_empty() { app.status = "Please enter a query".to_string(); continue; }
-                                match parse_query(&input) {
-                                    Ok(ast) => {
-                                        let keys_only = !ast.select.iter().any(|i| matches!(i, SelectItem::Value));
-                                        app.keys_only = keys_only;
-                                        app.clear_rows();
-                                        run_counter += 1;
-                                        app.current_run = Some(run_counter);
-                                        let env_host = app.selected_env().map(|e| e.host.clone()).unwrap_or(app.host.clone());
-                                        app.status = format!("Running (run {}): topic '{}' on {}. Press q to quit.", run_counter, ast.from, env_host);
-                                        let mut run_args = args.clone();
-                                        run_args.broker = env_host;
-                                        app.clamp_selection();
-                                        let ssl = app.current_ssl_config();
-                                        spawn_pipeline_with_ssl(run_args, input, run_counter, tx_evt.clone(), ssl).await;
-                                    }
-                                    Err(e) => { app.status = format!("Parse error: {}", e); }
-                                }
+                                // Results: ignore Enter
                             }
                         }
                         (KeyCode::Backspace, _) => {
@@ -282,6 +337,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 else if !app.env_store.envs.is_empty() { app.env_store.selected = Some(0); }
                                 if let Some(i) = app.env_store.selected { if let Some(e) = app.env_store.envs.get(i) { if let Some(ed) = app.env_editor.as_mut() { ed.idx = Some(i); ed.name = e.name.clone(); ed.host = e.host.clone(); ed.private_key_pem = e.private_key_pem.clone().unwrap_or_default(); ed.public_key_pem = e.public_key_pem.clone().unwrap_or_default(); ed.ssl_ca_pem = e.ssl_ca_pem.clone().unwrap_or_default(); } } }
                             } else if matches!(app.focus, super::app::Focus::Results) { if app.selected_row > 0 { app.selected_row -= 1; app.json_vscroll = 0; } }
+                            else if matches!(app.focus, super::app::Focus::Query) { move_cursor_up(&mut app); }
                         }
                         (KeyCode::Down, _) => {
                             if app.show_env_modal {
@@ -289,6 +345,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 else if !app.env_store.envs.is_empty() { app.env_store.selected = Some(0); }
                                 if let Some(i) = app.env_store.selected { if let Some(e) = app.env_store.envs.get(i) { if let Some(ed) = app.env_editor.as_mut() { ed.idx = Some(i); ed.name = e.name.clone(); ed.host = e.host.clone(); ed.private_key_pem = e.private_key_pem.clone().unwrap_or_default(); ed.public_key_pem = e.public_key_pem.clone().unwrap_or_default(); ed.ssl_ca_pem = e.ssl_ca_pem.clone().unwrap_or_default(); } } }
                             } else if matches!(app.focus, super::app::Focus::Results) { if app.selected_row + 1 < app.rows.len() { app.selected_row += 1; app.json_vscroll = 0; } }
+                            else if matches!(app.focus, super::app::Focus::Query) { move_cursor_down(&mut app); }
                         }
                         (KeyCode::Left, KeyModifiers::SHIFT) => {
                             if matches!(app.focus, super::app::Focus::Results) {
@@ -335,18 +392,24 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 let cols = if app.keys_only { 4 } else { 5 }; if app.selected_col + 1 < cols { app.selected_col += 1; }
                                 app.json_vscroll = 0;
                             } else if matches!(app.focus, super::app::Focus::Query) {
-                                if app.input_cursor<app.input.len() { app.input_cursor+=1; }
+                                if app.input_cursor<app.input.len() { app.input_cursor+=1; ensure_input_cursor_visible(&mut app); }
                             }
                         }
-                        (KeyCode::PageUp, _) => { if matches!(app.focus, super::app::Focus::Results) { let step = 10; app.selected_row = app.selected_row.saturating_sub(step); app.json_vscroll = 0; } }
-                        (KeyCode::PageDown, _) => { if matches!(app.focus, super::app::Focus::Results) { let step = 10; if !app.rows.is_empty() { app.selected_row = (app.selected_row + step).min(app.rows.len()-1); app.json_vscroll = 0; } } }
-                        (KeyCode::Home, _) => { if matches!(app.focus, super::app::Focus::Results) { app.selected_row = 0; app.json_vscroll = 0; } }
-                        (KeyCode::End, _) => { if matches!(app.focus, super::app::Focus::Results) { if !app.rows.is_empty() { app.selected_row = app.rows.len()-1; app.json_vscroll = 0; } } }
+                        (KeyCode::PageUp, _) => { if matches!(app.focus, super::app::Focus::Results) { let step = 10; app.selected_row = app.selected_row.saturating_sub(step); app.json_vscroll = 0; } else if matches!(app.focus, super::app::Focus::Query) { scroll_input(&mut app, true); } }
+                        (KeyCode::PageDown, _) => { if matches!(app.focus, super::app::Focus::Results) { let step = 10; if !app.rows.is_empty() { app.selected_row = (app.selected_row + step).min(app.rows.len()-1); app.json_vscroll = 0; } } else if matches!(app.focus, super::app::Focus::Query) { scroll_input(&mut app, false); } }
+                        (KeyCode::Home, _) => { if matches!(app.focus, super::app::Focus::Results) { app.selected_row = 0; app.json_vscroll = 0; } else if matches!(app.focus, super::app::Focus::Query) { move_cursor_line_home(&mut app); } }
+                        (KeyCode::End, _) => { if matches!(app.focus, super::app::Focus::Results) { if !app.rows.is_empty() { app.selected_row = app.rows.len()-1; app.json_vscroll = 0; } } else if matches!(app.focus, super::app::Focus::Query) { move_cursor_line_end(&mut app); } }
                         _ => {}
                     }
                 }
                 Event::Mouse(me) => {
                     handle_mouse(&mut app, me);
+                }
+                Event::Paste(s) => {
+                    if matches!(app.focus, super::app::Focus::Query) {
+                        for ch in s.chars() { app.input.insert(app.input_cursor, ch); app.input_cursor+=1; }
+                        ensure_input_cursor_visible(&mut app);
+                    }
                 }
                 _ => {}
             }
@@ -356,7 +419,13 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // Restore terminal
     disable_raw_mode().ok();
     // Use crossterm global execute to restore screen
-    execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, terminal::LeaveAlternateScreen, crossterm::cursor::Show).ok();
+    execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        PopKeyboardEnhancementFlags,
+        terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    ).ok();
 
     res
 }
@@ -520,12 +589,17 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Length(8),
             Constraint::Length(1),
             Constraint::Fill(1),
             Constraint::Length(3),
         ])
         .split(root);
+    let query_area = rows[1];
+    // Derive editor inner & content rects (gutter width 6, border 1)
+    let q_inner = Rect { x: query_area.x.saturating_add(1), y: query_area.y.saturating_add(1), width: query_area.width.saturating_sub(2), height: query_area.height.saturating_sub(2) };
+    let q_cols = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(6), Constraint::Min(1)]).split(q_inner);
+    let _q_gutter = q_cols[0]; let q_content = q_cols[1];
     let results_area = rows[3];
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -540,6 +614,20 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
 
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if point_in(mx, my, q_content) {
+                // Position cursor by click
+                let y_rel = my.saturating_sub(q_content.y) as usize;
+                let target_line = app.input_vscroll as usize + y_rel;
+                let line_starts = compute_line_starts(&app.input);
+                let line = target_line.min(line_starts.len().saturating_sub(1));
+                let line_start = line_starts[line];
+                let line_end = if line + 1 < line_starts.len() { line_starts[line + 1] - 1 } else { app.input.len() };
+                let x_rel = mx.saturating_sub(q_content.x) as usize;
+                let col = x_rel.min(line_end.saturating_sub(line_start));
+                app.input_cursor = line_start + col;
+                ensure_input_cursor_visible(app);
+                return;
+            }
             if point_in(mx, my, table_rect) {
                 // Map click Y to an approximate row index
                 // account for borders + header (top border + header row)
@@ -589,14 +677,18 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
             }
         }
         MouseEventKind::ScrollUp => {
-            if point_in(mx, my, table_rect) {
+            if point_in(mx, my, q_content) {
+                app.input_vscroll = app.input_vscroll.saturating_sub(1);
+            } else if point_in(mx, my, table_rect) {
                 if app.selected_row > 0 { app.selected_row -= 1; }
             } else if point_in(mx, my, json_rect) {
                 app.json_vscroll = app.json_vscroll.saturating_sub(1);
             }
         }
         MouseEventKind::ScrollDown => {
-            if point_in(mx, my, table_rect) {
+            if point_in(mx, my, q_content) {
+                app.input_vscroll = app.input_vscroll.saturating_add(1);
+            } else if point_in(mx, my, table_rect) {
                 if app.selected_row + 1 < app.rows.len() { app.selected_row += 1; }
             } else if point_in(mx, my, json_rect) {
                 app.json_vscroll = app.json_vscroll.saturating_add(1);
@@ -618,4 +710,133 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
 
 fn point_in(x: u16, y: u16, r: Rect) -> bool {
     x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
+}
+
+fn compute_line_starts(text: &str) -> Vec<usize> {
+    let mut v = Vec::new();
+    let mut acc = 0usize;
+    for (i, l) in text.split('\n').enumerate() {
+        v.push(acc);
+        acc += l.len();
+        if i + 1 < text.split('\n').count() { acc += 1; }
+    }
+    if v.is_empty() { v.push(0); }
+    v
+}
+
+fn find_query_range(s: &str, cursor: usize) -> (usize, usize) {
+    let bytes = s.as_bytes();
+    let cur = cursor.min(bytes.len());
+    let mut start = 0usize;
+    let mut i = cur;
+    while i > 0 {
+        i -= 1;
+        let b = bytes[i];
+        if b == b';' { start = i + 1; break; }
+        if b == b'\n' && i > 0 && bytes[i - 1] == b'\n' { start = i + 1; break; }
+    }
+    let mut end = bytes.len();
+    i = cur;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b';' { end = i + 1; break; }
+        if b == b'\n' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' { end = i; break; }
+        i += 1;
+    }
+    (start, end)
+}
+
+fn move_cursor_up(app: &mut AppState) {
+    let (line, col) = line_col(&app.input, app.input_cursor);
+    if line == 0 { return; }
+    let prev_start = nth_line_start(&app.input, line - 1);
+    let prev_len = line_len(&app.input, line - 1);
+    app.input_cursor = prev_start + col.min(prev_len);
+    ensure_input_cursor_visible(app);
+}
+
+fn move_cursor_down(app: &mut AppState) {
+    let (line, col) = line_col(&app.input, app.input_cursor);
+    let total = app.input.split('\n').count();
+    if line + 1 >= total { return; }
+    let next_start = nth_line_start(&app.input, line + 1);
+    let next_len = line_len(&app.input, line + 1);
+    app.input_cursor = next_start + col.min(next_len);
+    ensure_input_cursor_visible(app);
+}
+
+fn move_cursor_line_home(app: &mut AppState) {
+    let (line, _) = line_col(&app.input, app.input_cursor);
+    app.input_cursor = nth_line_start(&app.input, line);
+    ensure_input_cursor_visible(app);
+}
+
+fn move_cursor_line_end(app: &mut AppState) {
+    let (line, _) = line_col(&app.input, app.input_cursor);
+    let start = nth_line_start(&app.input, line);
+    let len = line_len(&app.input, line);
+    app.input_cursor = start + len;
+    ensure_input_cursor_visible(app);
+}
+
+fn line_col(text: &str, cursor: usize) -> (usize, usize) {
+    let idx = cursor.min(text.len());
+    let mut count = 0usize;
+    for (i, l) in text.split('\n').enumerate() {
+        let llen = l.len();
+        if count + llen >= idx { return (i, idx - count); } else { count += llen + 1; }
+    }
+    (0, 0)
+}
+
+fn nth_line_start(text: &str, n: usize) -> usize {
+    if n == 0 { return 0; }
+    let mut count = 0usize;
+    for (i, l) in text.split('\n').enumerate() {
+        if i == n { return count; }
+        count += l.len() + 1;
+    }
+    text.len()
+}
+
+fn line_len(text: &str, n: usize) -> usize {
+    text.split('\n').nth(n).map(|l| l.len()).unwrap_or(0)
+}
+
+fn ensure_input_cursor_visible(app: &mut AppState) {
+    // Keep cursor within the visible editor viewport using actual layout metrics
+    let (w, h) = crossterm::terminal::size().unwrap_or((0, 0));
+    if w == 0 || h == 0 { return; }
+    // Mirror ui.rs layout
+    let root = Rect { x: 0, y: 0, width: w, height: h };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // host
+            Constraint::Length(8), // editor
+            Constraint::Length(1), // status
+            Constraint::Fill(1),   // results
+            Constraint::Length(3), // footer
+        ])
+        .split(root);
+    let query_area = rows[1];
+    let inner = Rect { x: query_area.x.saturating_add(1), y: query_area.y.saturating_add(1), width: query_area.width.saturating_sub(2), height: query_area.height.saturating_sub(2) };
+    let cols = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(6), Constraint::Min(1)]).split(inner);
+    let content = cols[1];
+    let visible_lines = content.height.max(1) as usize;
+
+    let (line, col) = line_col(&app.input, app.input_cursor);
+    let wrap_w = content.width.max(1) as usize;
+    let vis_line = line + (col / wrap_w);
+    let top = app.input_vscroll as usize;
+    let bottom_excl = top + visible_lines;
+    if vis_line < top {
+        app.input_vscroll = vis_line as u16;
+    } else if vis_line >= bottom_excl {
+        app.input_vscroll = (vis_line + 1 - visible_lines) as u16;
+    }
+}
+
+fn scroll_input(app: &mut AppState, up: bool) {
+    if up { app.input_vscroll = app.input_vscroll.saturating_sub(5); } else { app.input_vscroll = app.input_vscroll.saturating_add(5); }
 }

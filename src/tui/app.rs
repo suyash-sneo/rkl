@@ -6,6 +6,7 @@ use std::time::Instant;
 pub struct AppState {
     pub input: String,
     pub input_cursor: usize,
+    pub input_vscroll: u16,
     pub status: String,
     pub rows: Vec<MessageEnvelope>,
     pub keys_only: bool,
@@ -23,6 +24,7 @@ pub struct AppState {
     pub json_vscroll: u16,
     pub copy_btn_pressed: bool,
     pub copy_btn_deadline: Option<Instant>,
+    pub last_run_query_range: Option<(usize, usize)>,
 }
 
 impl AppState {
@@ -36,6 +38,7 @@ impl AppState {
         Self {
             input: initial_input.clone(),
             input_cursor: initial_input.len(),
+            input_vscroll: 0,
             status: String::from("Enter a query and press Enter"),
             rows: Vec::new(),
             keys_only: false,
@@ -52,6 +55,7 @@ impl AppState {
             json_vscroll: 0,
             copy_btn_pressed: false,
             copy_btn_deadline: None,
+            last_run_query_range: None,
         }
     }
 

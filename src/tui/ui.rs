@@ -19,7 +19,7 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),   // host input
-            Constraint::Length(3),   // query input
+            Constraint::Length(8),   // query input (taller, multiline)
             Constraint::Length(1),   // status
             Constraint::Fill(1),     // table grows to fill available space
             Constraint::Length(3),   // footer (needs 3: top+content+bottom)
@@ -42,17 +42,90 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
     let focused = app.focus == Focus::Query;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(if focused { "Query (Enter to run) [FOCUSED]" } else { "Query (Enter to run)" });
-    let para = Paragraph::new(app.input.clone()).block(block);
-    frame.render_widget(para, area);
+    let title = if focused { "Query (Enter: Newline | Ctrl-Enter: Run current) [FOCUSED]" } else { "Query (Enter: Newline | Ctrl-Enter: Run current)" };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Split inner into gutter and content
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(6), Constraint::Min(1)])
+        .split(inner);
+    let gutter = cols[0];
+    let content = cols[1];
+
+    // Compute line starts to style per-line highlights, and find query ranges
+    let text = &app.input;
+    let lines: Vec<&str> = text.split('\n').collect();
+    let line_starts: Vec<usize> = {
+        let mut v = Vec::with_capacity(lines.len());
+        let mut acc = 0usize;
+        for (i, l) in lines.iter().enumerate() {
+            v.push(acc);
+            acc += l.len();
+            if i + 1 < lines.len() { acc += 1; } // newline
+        }
+        v
+    };
+    let (cur_q_start, cur_q_end) = find_query_range(text, app.input_cursor);
+    let last_range = app.last_run_query_range;
+
+    // Build content lines with SQL-ish highlighting and per-line background for current/last-run query regions
+    let mut out_lines: Vec<Line> = Vec::with_capacity(lines.len());
+    for (i, &lstart) in line_starts.iter().enumerate() {
+        let lend = lstart + lines[i].len();
+        let mut line = Line::from(highlight_sql_line(lines[i]));
+        if intersects(lstart, lend, cur_q_start, cur_q_end) {
+            // Current query highlight
+            line = line.style(Style::default().bg(Color::Rgb(35, 60, 100)));
+        } else if let Some((ls, le)) = last_range {
+            if intersects(lstart, lend, ls, le) {
+                // Last run query highlight
+                line = line.style(Style::default().bg(Color::DarkGray));
+            }
+        }
+        out_lines.push(line);
+    }
+
+    // Render content paragraph with wrapping + vertical scroll
+    let para = Paragraph::new(Text::from(out_lines))
+        .wrap(Wrap { trim: false })
+        .scroll((app.input_vscroll, 0));
+    frame.render_widget(para, content);
+
+    // Render gutter: line numbers and markers for current and last-run query
+    let mut gut: Vec<Line> = Vec::with_capacity(lines.len());
+    let _cur_first_line = byte_index_to_line(&line_starts, cur_q_start);
+    let last_first_line = last_range.map(|(s, _)| byte_index_to_line(&line_starts, s));
+    for (i, &lstart) in line_starts.iter().enumerate() {
+        let lend = lstart + lines[i].len();
+        let is_cur = intersects(lstart, lend, cur_q_start, cur_q_end);
+        let is_last = last_range.map(|(ls, le)| intersects(lstart, lend, ls, le)).unwrap_or(false);
+        let marker = if is_cur && Some(i) == last_first_line { "➤▶" } else if is_cur { "➤" } else if Some(i) == last_first_line || is_last { "▶" } else { " " };
+        let no = format!("{:>3}", i + 1);
+        // Add an extra trailing space after the line number to separate gutter from content
+        let mut line = Line::from(vec![
+            Span::styled(marker, Style::default().fg(Color::Yellow)),
+            Span::raw(" "),
+            Span::styled(no, Style::default().fg(Color::Gray)),
+            Span::raw(" "),
+        ]);
+        if is_cur {
+            line = line.style(Style::default().bg(Color::Rgb(35, 60, 100)));
+        } else if is_last {
+            line = line.style(Style::default().bg(Color::DarkGray));
+        }
+        gut.push(line);
+    }
+    let gp = Paragraph::new(Text::from(gut)).scroll((app.input_vscroll, 0));
+    frame.render_widget(gp, gutter);
+
+    // Position caret
     if focused {
-        let inner_x = area.x.saturating_add(1);
-        let inner_y = area.y.saturating_add(1);
-        let max_w = area.width.saturating_sub(2);
-        let col = (app.input_cursor as u16).min(max_w);
-        frame.set_cursor(inner_x + col, inner_y);
+        if let Some((cx, cy)) = caret_pos_multiline(content, text, app.input_cursor, app.input_vscroll) {
+            frame.set_cursor(cx, cy);
+        }
     }
 }
 
@@ -78,7 +151,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
     let cols = if app.keys_only { 4 } else { 5 };
     let col = if cols == 0 { 0 } else { app.selected_col + 1 };
     let legend = format!(
-        "Tab: Focus | Enter: Run | Results: arrows navigate, Shift-←/→ h-scroll, Mouse click/scroll | F5/C-y copy cell | Click [Copy] | Ctrl-Q/Ctrl-C: Quit | Row {row}/{total} Col {col}/{cols}"
+        "Tab: Focus | Query: Enter newline, Ctrl-Enter run current | Results: arrows, Shift-←/→ h-scroll, Mouse | F5/C-y copy cell | Click [Copy] | Ctrl-Q/Ctrl-C: Quit | Row {row}/{total} Col {col}/{cols}"
     );
     let block = Block::default().borders(Borders::ALL).title("Help");
     let para = Paragraph::new(legend).block(block);
@@ -190,6 +263,120 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+fn caret_pos_multiline(area: Rect, text: &str, cursor: usize, vscroll: u16) -> Option<(u16, u16)> {
+    // Compute (line, col) in logical lines and map to screen using vscroll and wrapping
+    let inner_x = area.x.saturating_add(0);
+    let inner_y = area.y.saturating_add(0);
+    let max_w = area.width;
+    if max_w == 0 { return None; }
+    let (line, col) = line_col_at(text, cursor);
+    // With wrapping, we need to account for col overflow into visual lines
+    let wrap_w = max_w as usize;
+    let add_lines = col / wrap_w; // number of extra wrapped lines within this logical line
+    let vis_line = line + add_lines;
+    let vis_col = (col % wrap_w) as u16;
+    let y = inner_y + vis_line.saturating_sub(vscroll as usize) as u16;
+    let x = inner_x + vis_col;
+    Some((x, y))
+}
+
+fn line_col_at(text: &str, cursor: usize) -> (usize, usize) {
+    let idx = cursor.min(text.len());
+    let mut line = 0usize;
+    let mut col = 0usize;
+    let mut count = 0usize;
+    for l in text.split('\n') {
+        let llen = l.len();
+        if count + llen >= idx {
+            col = idx - count;
+            break;
+        } else {
+            count += llen + 1;
+            line += 1;
+        }
+    }
+    (line, col)
+}
+
+fn find_query_range(s: &str, cursor: usize) -> (usize, usize) {
+    let bytes = s.as_bytes();
+    let cur = cursor.min(bytes.len());
+    // prev boundary
+    let mut start = 0usize;
+    let mut i = cur;
+    while i > 0 {
+        i -= 1;
+        let b = bytes[i];
+        if b == b';' { start = i + 1; break; }
+        if b == b'\n' && i > 0 && bytes[i - 1] == b'\n' { start = i + 1; break; }
+    }
+    // next boundary
+    let mut end = bytes.len();
+    i = cur;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b';' { end = i + 1; break; }
+        if b == b'\n' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' { end = i; break; }
+        i += 1;
+    }
+    (start, end)
+}
+
+fn intersects(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
+    // [a_start, a_end) intersects [b_start, b_end)
+    a_start < b_end && b_start < a_end
+}
+
+fn byte_index_to_line(line_starts: &[usize], byte_idx: usize) -> usize {
+    // find greatest line_starts[i] <= byte_idx
+    let mut lo = 0usize;
+    let mut hi = line_starts.len();
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if line_starts[mid] <= byte_idx { lo = mid; } else { hi = mid; }
+    }
+    lo
+}
+
+fn highlight_sql_line(s: &str) -> Vec<Span<'static>> {
+    // Very small SQL-ish highlighter
+    let mut spans: Vec<Span> = Vec::new();
+    let mut word = String::new();
+    let mut in_string = false;
+    for ch in s.chars() {
+        match ch {
+            '\'' | '"' => {
+                if !word.is_empty() { push_word(&mut spans, &word); word.clear(); }
+                in_string = !in_string;
+                spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::Yellow)));
+            }
+            c if c.is_alphanumeric() || c == '_' => { word.push(c); }
+            _ => {
+                if !word.is_empty() { push_word(&mut spans, &word); word.clear(); }
+                let color = if in_string { Color::Yellow } else { Color::Gray };
+                spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
+            }
+        }
+    }
+    if !word.is_empty() { push_word(&mut spans, &word); }
+    spans
+}
+
+fn push_word(spans: &mut Vec<Span<'static>>, w: &str) {
+    let kw = [
+        "select","from","where","and","or","limit","order","by","asc","desc",
+        // note: treat Kafka columns like key/value as identifiers, not keywords
+        "timestamp","partition","offset",
+    ];
+    if kw.contains(&w.to_ascii_lowercase().as_str()) {
+        spans.push(Span::styled(w.to_uppercase(), Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)));
+    } else if w.chars().all(|c| c.is_ascii_digit()) {
+        spans.push(Span::styled(w.to_string(), Style::default().fg(Color::Cyan)));
+    } else {
+        spans.push(Span::raw(w.to_string()));
+    }
 }
 
 fn draw_results(frame: &mut Frame, area: Rect, app: &AppState) {
