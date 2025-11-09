@@ -6,6 +6,32 @@ use std::collections::BinaryHeap;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::{Duration, interval};
 
+enum HeapKind {
+    Asc(BinaryHeap<Reverse<SortableEnvelope>>),
+    Desc(BinaryHeap<SortableEnvelope>),
+}
+
+impl HeapKind {
+    fn new(desc: bool) -> Self {
+        if desc { HeapKind::Desc(BinaryHeap::new()) } else { HeapKind::Asc(BinaryHeap::new()) }
+    }
+    fn len(&self) -> usize {
+        match self { HeapKind::Asc(h) => h.len(), HeapKind::Desc(h) => h.len() }
+    }
+    fn push(&mut self, env: MessageEnvelope) {
+        match self {
+            HeapKind::Asc(h) => h.push(Reverse(SortableEnvelope(env))),
+            HeapKind::Desc(h) => h.push(SortableEnvelope(env)),
+        }
+    }
+    fn pop(&mut self) -> Option<MessageEnvelope> {
+        match self {
+            HeapKind::Asc(h) => h.pop().map(|Reverse(se)| se.0),
+            HeapKind::Desc(h) => h.pop().map(|se| se.0),
+        }
+    }
+}
+
 /// Receives envelopes from all partitions, maintains a min-heap by timestamp,
 /// and periodically flushes in-order rows to the output sink.
 pub async fn run_merger(
@@ -14,8 +40,9 @@ pub async fn run_merger(
     watermark: usize,
     flush_interval_ms: u64,
     max_messages: Option<usize>,
+    order_desc: bool,
 ) -> Result<()> {
-    let mut heap: BinaryHeap<Reverse<SortableEnvelope>> = BinaryHeap::new();
+    let mut heap = HeapKind::new(order_desc);
     let mut tick = interval(Duration::from_millis(flush_interval_ms));
     let mut emitted: usize = 0;
 
@@ -31,7 +58,7 @@ pub async fn run_merger(
 
             maybe_msg = rx.recv() => {
                 if let Some(env) = maybe_msg {
-                    heap.push(Reverse(SortableEnvelope(env)));
+                    heap.push(env);
                     if heap.len() >= watermark {
                         // flush oldest ~half to keep latency low
                         let target = heap.len() / 2;
@@ -51,14 +78,14 @@ pub async fn run_merger(
 }
 
 fn drain_heap(
-    heap: &mut BinaryHeap<Reverse<SortableEnvelope>>,
+    heap: &mut HeapKind,
     out: &mut TableOutput,
     max_rows: usize,
     emitted: &mut usize,
     max_messages: Option<usize>,
 ) {
     let mut n = 0usize;
-    while let Some(Reverse(SortableEnvelope(env))) = heap.pop() {
+    while let Some(env) = heap.pop() {
         out.push(&env);
         *emitted += 1;
         n += 1;
