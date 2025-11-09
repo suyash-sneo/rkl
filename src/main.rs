@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
         a.keys_only = keys_only;
         if query_ast.is_some() { a.max_messages = None; }
         let q = query_arc.clone();
-        joinset.spawn(async move { spawn_partition_consumer(a, p, offset_spec, txp, q).await });
+        joinset.spawn(async move { spawn_partition_consumer(a, p, offset_spec, txp, q, None).await });
     }
     drop(tx); // merger will know when producers are done
 

@@ -69,3 +69,10 @@ impl Ord for SortableEnvelope {
     }
 }
 
+/// SSL configuration for Kafka connections (PEM contents).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SslConfig {
+    pub ca_pem: Option<String>,
+    pub cert_pem: Option<String>,
+    pub key_pem: Option<String>,
+}

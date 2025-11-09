@@ -1,8 +1,10 @@
-use crate::models::MessageEnvelope;
+use crate::models::{MessageEnvelope, SslConfig};
+use super::env_store::{EnvStore, Environment};
 
 #[derive(Default)]
 pub struct AppState {
     pub input: String,
+    pub input_cursor: usize,
     pub status: String,
     pub rows: Vec<MessageEnvelope>,
     pub keys_only: bool,
@@ -12,12 +14,22 @@ pub struct AppState {
     pub focus: Focus,
     pub selected_row: usize,
     pub selected_col: usize,
+    pub env_store: EnvStore,
+    pub show_env_modal: bool,
+    pub env_editor: Option<EnvEditor>,
 }
 
 impl AppState {
     pub fn new(initial_input: String, host: String) -> Self {
+        let mut env_store = EnvStore::load();
+        if env_store.envs.is_empty() {
+            env_store.envs.push(Environment { name: "Default".to_string(), host: host.clone(), private_key_pem: None, public_key_pem: None, ssl_ca_pem: None });
+            env_store.selected = Some(0);
+            let _ = env_store.save();
+        }
         Self {
-            input: initial_input,
+            input: initial_input.clone(),
+            input_cursor: initial_input.len(),
             status: String::from("Enter a query and press Enter"),
             rows: Vec::new(),
             keys_only: false,
@@ -27,6 +39,9 @@ impl AppState {
             focus: Focus::Host,
             selected_row: 0,
             selected_col: 0,
+            env_store,
+            show_env_modal: false,
+            env_editor: None,
         }
     }
 
@@ -77,4 +92,34 @@ impl AppState {
         let cols = if self.keys_only { 4 } else { 5 };
         if self.selected_col >= cols { self.selected_col = cols.saturating_sub(1); }
     }
+
+    pub fn selected_env(&self) -> Option<&Environment> {
+        self.env_store.selected.and_then(|i| self.env_store.envs.get(i))
+    }
+    pub fn current_ssl_config(&self) -> Option<SslConfig> {
+        self.selected_env().map(|e| SslConfig {
+            ca_pem: e.ssl_ca_pem.clone(),
+            cert_pem: e.public_key_pem.clone(),
+            key_pem: e.private_key_pem.clone(),
+        })
+    }
 }
+
+#[derive(Debug, Clone)]
+pub struct EnvEditor {
+    pub idx: Option<usize>,
+    pub name: String,
+    pub name_cursor: usize,
+    pub host: String,
+    pub host_cursor: usize,
+    pub private_key_pem: String,
+    pub private_key_cursor: usize,
+    pub public_key_pem: String,
+    pub public_key_cursor: usize,
+    pub ssl_ca_pem: String,
+    pub ssl_ca_cursor: usize,
+    pub field_focus: EnvFieldFocus,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum EnvFieldFocus { Name, Host, PrivateKey, PublicKey, Ca, Buttons }

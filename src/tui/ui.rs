@@ -3,9 +3,9 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::*;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, List, ListItem, Clear};
 
-use super::app::{AppState, Focus};
+use super::app::{AppState, Focus, EnvFieldFocus};
 
 pub fn draw(frame: &mut Frame, app: &AppState) {
     let size = frame.size();
@@ -21,26 +21,43 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
         ])
         .split(size);
 
-    draw_host(frame, chunks[0], &app.host, app.focus == Focus::Host);
-    draw_input(frame, chunks[1], &app.input, app.focus == Focus::Query);
+    draw_env_bar(frame, chunks[0], app);
+    draw_input(frame, chunks[1], app);
     draw_status(frame, chunks[2], &app.status);
     draw_table(frame, chunks[3], app);
     draw_footer(frame, chunks[4], app);
+    if app.show_env_modal {
+        let area = centered_rect(80, 80, size);
+        let block = Block::default().title("Environments").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan));
+        frame.render_widget(Clear, area);
+        frame.render_widget(block, area);
+        draw_env_modal(frame, area, app);
+    }
 }
 
-fn draw_input(frame: &mut Frame, area: Rect, input: &str, focused: bool) {
+fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
+    let focused = app.focus == Focus::Query;
     let block = Block::default()
         .borders(Borders::ALL)
         .title(if focused { "Query (Enter to run) [FOCUSED]" } else { "Query (Enter to run)" });
-    let para = Paragraph::new(input.to_string()).block(block);
+    let para = Paragraph::new(app.input.clone()).block(block);
     frame.render_widget(para, area);
+    if focused {
+        let inner_x = area.x.saturating_add(1);
+        let inner_y = area.y.saturating_add(1);
+        let max_w = area.width.saturating_sub(2);
+        let col = (app.input_cursor as u16).min(max_w);
+        frame.set_cursor(inner_x + col, inner_y);
+    }
 }
 
-fn draw_host(frame: &mut Frame, area: Rect, host: &str, focused: bool) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(if focused { "Host (Kafka broker) [FOCUSED]" } else { "Host (Kafka broker)" });
-    let para = Paragraph::new(host.to_string()).block(block);
+fn draw_env_bar(frame: &mut Frame, area: Rect, app: &AppState) {
+    let title = if app.focus == Focus::Host { "Environment [Enter: manage] [FOCUSED]" } else { "Environment [Enter: manage]" };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let name = app.selected_env().map(|e| e.name.clone()).unwrap_or_else(|| "(none)".to_string());
+    let host = app.selected_env().map(|e| e.host.clone()).unwrap_or_default();
+    let content = format!("{name}  —  host: {host}");
+    let para = Paragraph::new(content).block(block);
     frame.render_widget(para, area);
 }
 
@@ -56,11 +73,118 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
     let cols = if app.keys_only { 4 } else { 5 };
     let col = if cols == 0 { 0 } else { app.selected_col + 1 };
     let legend = format!(
-        "Tab: Focus | Enter: Run | Results: arrows/hjkl to navigate, y: copy | q/Ctrl-C: Quit | Row {row}/{total} Col {col}/{cols}"
+        "Tab: Focus | Enter: Run | Results: arrows navigate, F5/C-y copy | Ctrl-Q/Ctrl-C: Quit | Row {row}/{total} Col {col}/{cols}"
     );
     let block = Block::default().borders(Borders::ALL).title("Help");
     let para = Paragraph::new(legend).block(block);
     frame.render_widget(para, area);
+}
+
+fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
+    // Split modal into left list and right editor
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .margin(1)
+        .split(area);
+
+    // Left: environments list
+    let items: Vec<ListItem> = app.env_store.envs.iter().map(|e| ListItem::new(e.name.clone())).collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Environments"))
+        .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::REVERSED));
+    let mut state = ratatui::widgets::ListState::default();
+    if let Some(i) = app.env_store.selected { state.select(Some(i)); }
+    frame.render_stateful_widget(list, cols[0], &mut state);
+
+    // Right: fields editor stacked vertically
+    let ed = app.env_editor.as_ref();
+    let fields = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Min(5),
+            Constraint::Min(5),
+            Constraint::Length(3),
+        ])
+        .split(cols[1]);
+
+    let name_val = ed.map(|e| e.name.clone()).unwrap_or_default();
+    let host_val = ed.map(|e| e.host.clone()).unwrap_or_default();
+    let privk_val = ed.map(|e| e.private_key_pem.clone()).unwrap_or_default();
+    let pubk_val = ed.map(|e| e.public_key_pem.clone()).unwrap_or_default();
+    let ca_val = ed.map(|e| e.ssl_ca_pem.clone()).unwrap_or_default();
+
+    let title_name = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Name)) { "Name [FOCUSED]" } else { "Name" };
+    let title_host = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Host)) { "Host [FOCUSED]" } else { "Host" };
+    let title_pk = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::PrivateKey)) { "Private Key (PEM) [FOCUSED]" } else { "Private Key (PEM)" };
+    let title_cert = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::PublicKey)) { "Public/Certificate (PEM) [FOCUSED]" } else { "Public/Certificate (PEM)" };
+    let title_ca = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Ca)) { "SSL CA (PEM) [FOCUSED]" } else { "SSL CA (PEM)" };
+
+    frame.render_widget(Paragraph::new(name_val.clone()).block(Block::default().borders(Borders::ALL).title(title_name)), fields[0]);
+    frame.render_widget(Paragraph::new(host_val.clone()).block(Block::default().borders(Borders::ALL).title(title_host)), fields[1]);
+    frame.render_widget(Paragraph::new(privk_val.clone()).block(Block::default().borders(Borders::ALL).title(title_pk)), fields[2]);
+    frame.render_widget(Paragraph::new(pubk_val.clone()).block(Block::default().borders(Borders::ALL).title(title_cert)), fields[3]);
+    frame.render_widget(Paragraph::new(ca_val.clone()).block(Block::default().borders(Borders::ALL).title(title_ca)), fields[4]);
+    if let Some(ed) = app.env_editor.as_ref() {
+        let (x, y) = match ed.field_focus {
+            super::app::EnvFieldFocus::Name => caret_pos_in(fields[0], &name_val, ed.name_cursor),
+            super::app::EnvFieldFocus::Host => caret_pos_in(fields[1], &host_val, ed.host_cursor),
+            super::app::EnvFieldFocus::PrivateKey => caret_pos_in(fields[2], &privk_val, ed.private_key_cursor),
+            super::app::EnvFieldFocus::PublicKey => caret_pos_in(fields[3], &pubk_val, ed.public_key_cursor),
+            super::app::EnvFieldFocus::Ca => caret_pos_in(fields[4], &ca_val, ed.ssl_ca_cursor),
+            super::app::EnvFieldFocus::Buttons => (0,0),
+        };
+        if x > 0 || y > 0 { frame.set_cursor(x, y); }
+    }
+    let help = "Enter: select/save | Tab/Shift-Tab: move | Up/Down: select env | n: new | d: delete | s: save | t: test | Esc: close";
+    frame.render_widget(Paragraph::new(help).block(Block::default().borders(Borders::ALL).title("Actions")), fields[5]);
+}
+
+fn caret_pos_in(area: Rect, text: &str, cursor: usize) -> (u16, u16) {
+    let inner_x = area.x.saturating_add(1);
+    let inner_y = area.y.saturating_add(1);
+    let max_w = area.width.saturating_sub(2);
+    let max_h = area.height.saturating_sub(2);
+    let idx = cursor.min(text.len());
+    let mut line = 0u16;
+    let mut col = 0u16;
+    let mut count = 0usize;
+    for (li, l) in text.split('\n').enumerate() {
+        let llen = l.len();
+        if count + llen >= idx {
+            line = li as u16;
+            col = (idx - count) as u16;
+            break;
+        } else {
+            count += llen + 1; // account for newline
+        }
+    }
+    if count >= idx { line = 0; col = idx as u16; }
+    line = line.min(max_h.saturating_sub(1));
+    col = col.min(max_w.saturating_sub(1));
+    (inner_x + col, inner_y + line)
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }
 
 fn draw_table(frame: &mut Frame, area: Rect, app: &AppState) {

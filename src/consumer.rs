@@ -1,5 +1,5 @@
 use crate::args::RunArgs;
-use crate::models::{MessageEnvelope, OffsetSpec};
+use crate::models::{MessageEnvelope, OffsetSpec, SslConfig};
 use crate::query::SelectQuery;
 use anyhow::{Context, Result};
 use rdkafka::config::ClientConfig;
@@ -16,16 +16,27 @@ pub async fn spawn_partition_consumer(
     offset_spec: OffsetSpec,
     tx: Sender<MessageEnvelope>,
     query: Option<std::sync::Arc<SelectQuery>>,
+    ssl: Option<SslConfig>,
 ) -> Result<()> {
     // unique group id (we never commit)
     let group_id = format!("rkl-{}-p{}", uuid::Uuid::new_v4(), partition);
 
-    let consumer: StreamConsumer = ClientConfig::new()
+    let mut cfg = ClientConfig::new();
+    cfg
         .set("bootstrap.servers", &args.broker)
         .set("group.id", group_id)
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
-        .set("enable.partition.eof", "true")
+        .set("enable.partition.eof", "true");
+    if let Some(ssl) = &ssl {
+        if ssl.ca_pem.is_some() || ssl.cert_pem.is_some() || ssl.key_pem.is_some() {
+            cfg.set("security.protocol", "ssl");
+            if let Some(ref s) = ssl.ca_pem { cfg.set("ssl.ca.pem", s); }
+            if let Some(ref s) = ssl.cert_pem { cfg.set("ssl.certificate.pem", s); }
+            if let Some(ref s) = ssl.key_pem { cfg.set("ssl.key.pem", s); }
+        }
+    }
+    let consumer: StreamConsumer = cfg
         .create()
         .context("Failed to create consumer")?;
 
