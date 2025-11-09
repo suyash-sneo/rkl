@@ -6,11 +6,17 @@ A TUI kafka tool that allows you to write SQL-like queries to read data from Kaf
 
 **Installation**
 - Install to `~/.local/bin` (no sudo):
-  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/main/scripts/install.sh | bash`
+  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | bash`
 - Optional: install a specific version:
-  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/main/scripts/install.sh | RKL_VERSION=v0.1.0 bash`
+  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | RKL_VERSION=v0.1.0 bash`
 - Optional: custom install location:
-  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/main/scripts/install.sh | RKL_INSTALL_DIR="$HOME/bin" bash`
+  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | RKL_INSTALL_DIR="$HOME/bin" bash`
+
+**Uninstall**
+- Remove from the default location (`~/.local/bin`):
+  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/uninstall.sh | bash`
+- If you installed to a custom location:
+  - `curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/uninstall.sh | RKL_INSTALL_DIR="$HOME/bin" bash`
 
 # Progress
 
@@ -50,4 +56,3 @@ SELECT key, value FROM random-data WHERE value->data->field3 = false LIMIT 5
 # Tests 
 
 One simple test to validate parsing for a sample query.
-
