@@ -621,6 +621,7 @@ fn selected_cell_text(app: &AppState) -> Option<String> {
     Some(s)
 }
 
+#[allow(dead_code)]
 fn ensure_ca_file_for_env(name_hint: &str, pem: &str) -> Result<String> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir).context("create env dir for CA")?;
@@ -630,6 +631,7 @@ fn ensure_ca_file_for_env(name_hint: &str, pem: &str) -> Result<String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+#[allow(dead_code)]
 fn sanitize(name: &str) -> String {
     name
         .chars()

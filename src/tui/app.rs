@@ -156,5 +156,6 @@ pub struct EnvEditor {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum EnvFieldFocus { Name, Host, PrivateKey, PublicKey, Ca, Conn, Buttons }
 
+#[allow(dead_code)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum CaInputMode { Pem, Location }

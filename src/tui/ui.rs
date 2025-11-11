@@ -47,17 +47,23 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Split inner into gutter and content
+    // Split inner into gutter and content. Gutter width is dynamic to always
+    // preserve a visible gap between line numbers and content, even when
+    // markers like the last-run pointer are shown.
+    let text = &app.input;
+    let lines: Vec<&str> = text.split('\n').collect();
+    let max_lineno_digits = lines.len().max(1).to_string().len() as u16;
+    let marker_max = 2u16; // e.g., "➤▶" can take two cells
+    let gap = 1u16;        // fixed one-space gap to content
+    let gutter_width: u16 = (marker_max + 1 + max_lineno_digits + gap).max(6);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(6), Constraint::Min(1)])
+        .constraints([Constraint::Length(gutter_width), Constraint::Min(1)])
         .split(inner);
     let gutter = cols[0];
     let content = cols[1];
 
     // Compute line starts to style per-line highlights, and find query ranges
-    let text = &app.input;
-    let lines: Vec<&str> = text.split('\n').collect();
     let line_starts: Vec<usize> = {
         let mut v = Vec::with_capacity(lines.len());
         let mut acc = 0usize;
@@ -103,7 +109,8 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
         let is_cur = intersects(lstart, lend, cur_q_start, cur_q_end);
         let is_last = last_range.map(|(ls, le)| intersects(lstart, lend, ls, le)).unwrap_or(false);
         let marker = if is_cur && Some(i) == last_first_line { "➤▶" } else if is_cur { "➤" } else if Some(i) == last_first_line || is_last { "▶" } else { " " };
-        let no = format!("{:>3}", i + 1);
+        // Align line numbers based on max digits to keep layout stable
+        let no = format!("{:>width$}", i + 1, width = max_lineno_digits as usize);
         // Add an extra trailing space after the line number to separate gutter from content
         let mut line = Line::from(vec![
             Span::styled(marker, Style::default().fg(Color::Yellow)),
@@ -292,9 +299,9 @@ fn render_scrolled_field(frame: &mut Frame, area: Rect, title: &str, text: &str,
 
 fn crop_lines(text: &str, vscroll: usize, hscroll: usize, max_w: usize, max_h: usize) -> Vec<Line<'static>> {
     let mut out: Vec<Line> = Vec::new();
-    let mut skipped = 0usize;
+    let mut _skipped = 0usize;
     for (i, line) in text.split('\n').enumerate() {
-        if i < vscroll { skipped += 1; continue; }
+        if i < vscroll { _skipped += 1; continue; }
         if out.len() >= max_h { break; }
         let slice = if line.len() > hscroll { &line[hscroll.min(line.len())..] } else { "" };
         let visible = if slice.len() > max_w { &slice[..max_w] } else { slice };
@@ -588,54 +595,103 @@ fn make_json_cell_and_height(s: &str) -> (Text<'static>, u16) {
 }
 
 fn json_to_highlighted_lines(v: &serde_json::Value) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line> = Vec::new();
-    fn push_indent(buf: &mut std::string::String, n: usize) { for _ in 0..n { buf.push(' '); } }
-    fn walk(v: &serde_json::Value, depth: usize, out: &mut Vec<Line>) {
+    // Pretty-print JSON into multiple lines with Postman-like colors:
+    // - keys: green, strings: yellow, numbers: cyan, booleans: magenta, null: dark gray, punctuation: gray
+    fn indent(depth: usize) -> Span<'static> { Span::raw(" ".repeat(depth * 2)) }
+    fn punct(s: &str) -> Span<'static> { Span::styled(s.to_string(), Style::default().fg(Color::Gray)) }
+    fn string_span(s: &str) -> Span<'static> { Span::styled(format!("\"{}\"", s), Style::default().fg(Color::Yellow)) }
+    fn number_span(n: &serde_json::Number) -> Span<'static> { Span::styled(n.to_string(), Style::default().fg(Color::Cyan)) }
+    fn bool_span(b: bool) -> Span<'static> { Span::styled(b.to_string(), Style::default().fg(Color::Magenta)) }
+    fn null_span() -> Span<'static> { Span::styled("null".to_string(), Style::default().fg(Color::DarkGray)) }
+
+    fn render_scalar(val: &serde_json::Value) -> Vec<Span<'static>> {
+        match val {
+            serde_json::Value::String(s) => vec![string_span(s)],
+            serde_json::Value::Number(n) => vec![number_span(n)],
+            serde_json::Value::Bool(b) => vec![bool_span(*b)],
+            serde_json::Value::Null => vec![null_span()],
+            _ => vec![Span::raw(String::new())],
+        }
+    }
+
+    fn render_value(v: &serde_json::Value, depth: usize, out: &mut Vec<Line<'static>>) {
         match v {
-            serde_json::Value::Null => out.push(Line::from(vec![Span::styled("null", Style::default().fg(Color::DarkGray))])),
-            serde_json::Value::Bool(b) => out.push(Line::from(vec![Span::styled(b.to_string(), Style::default().fg(Color::Magenta))])),
-            serde_json::Value::Number(n) => out.push(Line::from(vec![Span::styled(n.to_string(), Style::default().fg(Color::Cyan))])),
-            serde_json::Value::String(s) => out.push(Line::from(vec![Span::styled(format!("\"{}\"", s), Style::default().fg(Color::Yellow))])),
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) | serde_json::Value::String(_) => {
+                let mut spans = Vec::new();
+                spans.push(indent(depth));
+                spans.extend(render_scalar(v));
+                out.push(Line::from(spans));
+            }
             serde_json::Value::Array(arr) => {
-                out.push(Line::from(vec![Span::styled("[", Style::default().fg(Color::Gray))]));
-                for (i, item) in arr.iter().enumerate() {
-                    let mut buf = std::string::String::new();
-                    push_indent(&mut buf, (depth + 1) * 2);
-                    let mut inner: Vec<Span> = vec![Span::raw(buf)];
-                    let mut tmp: Vec<Line> = Vec::new();
-                    walk(item, depth + 1, &mut tmp);
-                    if let Some(mut line) = tmp.into_iter().next() {
-                        inner.append(&mut line.spans);
+                if arr.is_empty() {
+                    out.push(Line::from(vec![indent(depth), punct("[]")]));
+                } else {
+                    out.push(Line::from(vec![indent(depth), punct("[")]));
+                    for (i, item) in arr.iter().enumerate() {
+                        let before_len = out.len();
+                        render_value(item, depth + 1, out);
+                        // append comma to the last rendered line for this item if not last
+                        if i + 1 != arr.len() {
+                            let idx = out.len().saturating_sub(1);
+                            if let Some(last) = out.get_mut(idx) {
+                                last.spans.push(punct(","));
+                            }
+                        }
+                        // ensure at least one line was added
+                        if out.len() == before_len {
+                            out.push(Line::from(vec![indent(depth + 1), punct("" )]));
+                        }
                     }
-                    if i + 1 != arr.len() { inner.push(Span::styled(",", Style::default().fg(Color::Gray))); }
-                    out.push(Line::from(inner));
+                    out.push(Line::from(vec![indent(depth), punct("]")]));
                 }
-                let mut buf = std::string::String::new(); push_indent(&mut buf, depth * 2);
-                out.push(Line::from(vec![Span::raw(buf), Span::styled("]", Style::default().fg(Color::Gray))]));
             }
             serde_json::Value::Object(map) => {
-                out.push(Line::from(vec![Span::styled("{", Style::default().fg(Color::Gray))]));
-                let len = map.len();
-                for (i, (k, val)) in map.iter().enumerate() {
-                    let mut buf = std::string::String::new(); push_indent(&mut buf, (depth + 1) * 2);
-                    let mut spans = vec![
-                        Span::raw(buf),
-                        Span::styled(format!("\"{}\"", k), Style::default().fg(Color::Green)),
-                        Span::styled(": ", Style::default().fg(Color::Gray)),
-                    ];
-                    let mut tmp: Vec<Line> = Vec::new(); walk(val, depth + 1, &mut tmp);
-                    if let Some(mut first) = tmp.into_iter().next() {
-                        spans.append(&mut first.spans);
+                if map.is_empty() {
+                    out.push(Line::from(vec![indent(depth), punct("{}")]));
+                } else {
+                    out.push(Line::from(vec![indent(depth), punct("{")]));
+                    let len = map.len();
+                    for (i, (k, val)) in map.iter().enumerate() {
+                        match val {
+                            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) | serde_json::Value::String(_) => {
+                                let mut spans = Vec::new();
+                                spans.push(indent(depth + 1));
+                                spans.push(Span::styled(format!("\"{}\"", k), Style::default().fg(Color::Green)));
+                                spans.push(punct(": "));
+                                spans.extend(render_scalar(val));
+                                if i + 1 != len { spans.push(punct(",")); }
+                                out.push(Line::from(spans));
+                            }
+                            _ => {
+                                // complex value: print key on its own line, then nested structure
+                                let mut key_line = Vec::new();
+                                key_line.push(indent(depth + 1));
+                                key_line.push(Span::styled(format!("\"{}\"", k), Style::default().fg(Color::Green)));
+                                key_line.push(punct(":"));
+                                out.push(Line::from(key_line));
+
+                                let before_len = out.len();
+                                render_value(val, depth + 1, out);
+                                if i + 1 != len {
+                                    let idx = out.len().saturating_sub(1);
+                                    if let Some(last) = out.get_mut(idx) {
+                                        last.spans.push(punct(","));
+                                    }
+                                }
+                                if out.len() == before_len {
+                                    out.push(Line::from(vec![indent(depth + 1), punct("")]));
+                                }
+                            }
+                        }
                     }
-                    if i + 1 != len { spans.push(Span::styled(",", Style::default().fg(Color::Gray))); }
-                    out.push(Line::from(spans));
+                    out.push(Line::from(vec![indent(depth), punct("}")]));
                 }
-                let mut buf = std::string::String::new(); push_indent(&mut buf, depth * 2);
-                out.push(Line::from(vec![Span::raw(buf), Span::styled("}", Style::default().fg(Color::Gray))]));
             }
         }
     }
-    walk(v, 0, &mut lines);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    render_value(v, 0, &mut lines);
     lines
 }
 
