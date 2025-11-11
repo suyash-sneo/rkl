@@ -1,0 +1,75 @@
+Community-Centric Copyleft License (CCCL) v2.0
+Copyright (c) 2025 Suyash Raj
+
+Preamble
+This license lets individual developers and small teams use, study, modify, and share the software freely, while ensuring that enterprises who gain commercial benefit contribute improvements or funding back to the community. It is a standalone license inspired by the principles of the GNU General Public License version 3 (GPLv3) but tailored to your requirements.
+
+1. Definitions
+Project – the original work distributed under this license.
+
+Derivative Work – any work based on or incorporating the Project, including modifications, translations, adaptations, or works statically or dynamically linked with the Project.
+
+Distribution – any act of conveying or making available the Project or a Derivative Work to third parties, including through network services.
+
+Small Developer – (a) an individual acting personally, or (b) an entity with fewer than 50 total employees worldwide and less than USD $1,000,000 in gross annual revenue.
+
+Enterprise User – any entity that does not meet the Small Developer definition.
+
+Commercial Deployment – providing the Project or a Derivative Work to third parties in exchange for money, subscription fees, advertising revenue, or other commercial advantage.
+
+2. Grant of Rights
+Subject to the conditions below, every recipient receives a perpetual, worldwide, royalty-free license to:
+
+Use and run the Project.
+
+Study the Project and access its source code.
+
+Modify the Project and create Derivative Works.
+
+Distribute the Project or Derivative Works under this same license.
+
+3. Copyleft Requirements for All Recipients
+If you distribute or commercially deploy the Project or any Derivative Work:
+
+You must provide complete corresponding source code under this license to every recipient.
+
+You must preserve existing copyright notices, attributions, and license text.
+
+You must include a prominent notice stating any significant changes you made and the date of those changes.
+
+You may not impose additional restrictions on the rights granted by this license.
+
+4. Additional Permission for Small Developers
+Small Developers receive an extra permission: they may use, modify, and deploy the Project (including Commercial Deployment) without obligations beyond Section 3.
+
+5. Enterprise Contribution Requirement
+An Enterprise User may use, modify, or deploy the Project only if all of the following are satisfied:
+
+(a) Public Source Releases – Publish any modifications, enhancements, or Derivative Works in a publicly accessible repository under this license within 90 days of first internal use or immediately upon any Distribution or Commercial Deployment.
+
+(b) Attribution – Every release or deployment must provide clear attribution to the Project (including a link to the original repository) and to the Enterprise User’s public repository containing its modifications.
+
+(c) Community Support – For each calendar year with a Commercial Deployment, the Enterprise User must either:
+
+Contribute at least 40 documented developer-hours (code, documentation, design, or testing) back to the Project, or
+
+Provide at least USD $5,000 in sponsorship to the Project or a stewarding nonprofit designated by the licensor.
+A written summary of the contributions or sponsorship must be published alongside the source release.
+
+6. Prohibition on Closed-Source Commercialization
+No party may commercially deploy the Project or any Derivative Work without simultaneously providing all corresponding source code under this license to every recipient. Bundling the Project inside a proprietary or closed-source product is prohibited.
+
+7. Patent Peace
+If you initiate patent litigation alleging that the Project or a Derivative Work infringes a patent, your rights under this license terminate immediately.
+
+8. Termination and Cure
+Failure to meet any condition terminates your rights automatically. Rights may be reinstated at the licensor’s discretion after curing all violations and fulfilling overdue obligations (including sponsorships or contribution reports).
+
+9. Disclaimer of Warranty
+THE PROJECT IS PROVIDED “AS IS,” WITHOUT WARRANTY OF ANY KIND. YOU ASSUME ALL RISKS ASSOCIATED WITH ITS USE.
+
+10. Limitation of Liability
+IN NO EVENT WILL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR DAMAGES OF ANY KIND ARISING FROM OR RELATED TO THIS LICENSE OR THE USE OF THE PROJECT.
+
+11. Severability
+If any provision is held unenforceable, the remaining provisions remain in effect.
