@@ -11,7 +11,7 @@ use args::{Cli, Commands, RunArgs};
 use colored::*;
 use consumer::spawn_partition_consumer;
 use merger::run_merger;
-use models::{MessageEnvelope, OffsetSpec};
+use models::{MessageEnvelope, OffsetSpec, SslConfig};
 use output::TableOutput;
 use query::{parse_query, OrderDir, SelectItem};
 use rdkafka::config::ClientConfig;
@@ -59,12 +59,20 @@ async fn main() -> Result<()> {
     };
 
     // One-time consumer just to fetch metadata / partitions
-    let probe_consumer: StreamConsumer = ClientConfig::new()
+    let mut probe_cfg = ClientConfig::new();
+    probe_cfg
         .set("bootstrap.servers", &args.broker)
         .set("group.id", format!("rkl-probe-{}", uuid::Uuid::new_v4()))
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
-        .set("enable.partition.eof", "true")
+        .set("enable.partition.eof", "true");
+    if args.ssl_ca_pem.is_some() || args.ssl_certificate_pem.is_some() || args.ssl_key_pem.is_some() {
+        probe_cfg.set("security.protocol", "ssl");
+        if let Some(ref s) = args.ssl_ca_pem { probe_cfg.set("ssl.ca.pem", s); }
+        if let Some(ref s) = args.ssl_certificate_pem { probe_cfg.set("ssl.certificate.pem", s); }
+        if let Some(ref s) = args.ssl_key_pem { probe_cfg.set("ssl.key.pem", s); }
+    }
+    let probe_consumer: StreamConsumer = probe_cfg
         .create()
         .context("Failed to create probe consumer")?;
 
@@ -105,7 +113,10 @@ async fn main() -> Result<()> {
         a.keys_only = keys_only;
         if query_ast.is_some() { a.max_messages = None; }
         let q = query_arc.clone();
-        joinset.spawn(async move { spawn_partition_consumer(a, p, offset_spec, txp, q, None).await });
+        let ssl = if args.ssl_ca_pem.is_some() || args.ssl_certificate_pem.is_some() || args.ssl_key_pem.is_some() {
+            Some(SslConfig { ca_pem: args.ssl_ca_pem.clone(), cert_pem: args.ssl_certificate_pem.clone(), key_pem: args.ssl_key_pem.clone() })
+        } else { None };
+        joinset.spawn(async move { spawn_partition_consumer(a, p, offset_spec, txp, q, ssl).await });
     }
     drop(tx); // merger will know when producers are done
 

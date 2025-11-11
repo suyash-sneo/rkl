@@ -56,6 +56,9 @@ Main TUI with:
 Env TUI with:
 1. Left list of envs (basically hosts)
 2. Right side for inputs like hots, private/public key, CA, etc
+ 3. Function key controls: F1 New, F2 Edit, F3 Delete, F4 Save, F5 Test (shows progress/errors at bottom), F6/F7 move between fields, Tab/Shift-Tab move, Up/Down select. Esc closes.
+
+For testing locally with mTLS, see `local-test/README.md`.
 
 
 # Test queries:

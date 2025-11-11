@@ -69,6 +69,18 @@ pub struct RunArgs {
     /// Flush interval in milliseconds (drains heap on tick)
     #[arg(long, default_value_t = 250)]
     pub flush_interval_ms: u64,
+
+    /// SSL: CA PEM inline (librdkafka: ssl.ca.pem)
+    #[arg(long)]
+    pub ssl_ca_pem: Option<String>,
+
+    /// SSL: Certificate PEM inline (librdkafka: ssl.certificate.pem)
+    #[arg(long)]
+    pub ssl_certificate_pem: Option<String>,
+
+    /// SSL: Private key PEM inline (librdkafka: ssl.key.pem)
+    #[arg(long)]
+    pub ssl_key_pem: Option<String>,
 }
 
 impl Cli {
@@ -91,6 +103,9 @@ impl Default for RunArgs {
             channel_capacity: 2048,
             watermark: 256,
             flush_interval_ms: 250,
+            ssl_ca_pem: None,
+            ssl_certificate_pem: None,
+            ssl_key_pem: None,
         }
     }
 }

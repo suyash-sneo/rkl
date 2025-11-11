@@ -20,6 +20,10 @@ use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 
 use super::app::{AppState, TuiEvent, EnvEditor, EnvFieldFocus};
+use super::env_store::config_dir;
+use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use super::env_store::Environment;
 use super::ui::draw;
 
@@ -77,6 +81,14 @@ pub async fn run(args: RunArgs) -> Result<()> {
                 }
                 TuiEvent::Error { run_id, message } => {
                     if Some(run_id) == app.current_run { app.status = format!("Error: {message}"); }
+                }
+                TuiEvent::EnvTestProgress { message } => {
+                    app.env_test_in_progress = true;
+                    app.env_test_message = Some(message);
+                }
+                TuiEvent::EnvTestDone { message } => {
+                    app.env_test_in_progress = false;
+                    app.env_test_message = Some(message);
                 }
             }
         }
@@ -144,44 +156,26 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 }
                             }
                         }
-                        // Only Enter and Ctrl-Enter are used for editor newline/run
+                        // Enter: editor newline; open env modal from host bar
                         (KeyCode::Enter, _) => {
                             if app.show_env_modal {
-                                // Save current editor as env (create or update) and close
+                                // In modal: Enter inserts newline in multiline fields
                                 if let Some(ed) = app.env_editor.as_mut() {
-                                    let new_env = Environment {
-                                        name: ed.name.clone(),
-                                        host: ed.host.clone(),
-                                        private_key_pem: if ed.private_key_pem.trim().is_empty() { None } else { Some(ed.private_key_pem.clone()) },
-                                        public_key_pem: if ed.public_key_pem.trim().is_empty() { None } else { Some(ed.public_key_pem.clone()) },
-                                        ssl_ca_pem: if ed.ssl_ca_pem.trim().is_empty() { None } else { Some(ed.ssl_ca_pem.clone()) },
-                                    };
-                                    if let Some(i) = ed.idx {
-                                        if i < app.env_store.envs.len() {
-                                            app.env_store.envs[i] = new_env.clone();
-                                            app.env_store.selected = Some(i);
-                                        } else {
-                                            app.env_store.envs.push(new_env.clone());
-                                            app.env_store.selected = Some(app.env_store.envs.len() - 1);
-                                        }
-                                    } else {
-                                        app.env_store.envs.push(new_env.clone());
-                                        app.env_store.selected = Some(app.env_store.envs.len() - 1);
+                                    match ed.field_focus {
+                                        EnvFieldFocus::PrivateKey => { ed.private_key_pem.insert(ed.private_key_cursor, '\n'); ed.private_key_cursor+=1; }
+                                        EnvFieldFocus::PublicKey => { ed.public_key_pem.insert(ed.public_key_cursor, '\n'); ed.public_key_cursor+=1; }
+                                        EnvFieldFocus::Ca => { ed.ssl_ca_pem.insert(ed.ssl_ca_cursor, '\n'); ed.ssl_ca_cursor+=1; }
+                                        _ => { /* ignore */ }
                                     }
-                                    let _ = app.env_store.save();
-                                    if let Some(sel) = app.env_store.selected {
-                                        if let Some(e) = app.env_store.envs.get(sel) { app.host = e.host.clone(); }
-                                    }
-                                    app.show_env_modal = false;
                                 }
                             } else if matches!(app.focus, super::app::Focus::Host) {
                                 // Open env modal
-                                let (idx, name, host, privk, pubk, ca) = if let Some(env) = app.selected_env() {
+                                let (idx, name, host, privk, pubk, ca_pem) = if let Some(env) = app.selected_env() {
                                     (app.env_store.selected, env.name.clone(), env.host.clone(), env.private_key_pem.clone().unwrap_or_default(), env.public_key_pem.clone().unwrap_or_default(), env.ssl_ca_pem.clone().unwrap_or_default())
                                 } else {
                                     (None, String::new(), app.host.clone(), String::new(), String::new(), String::new())
                                 };
-                                app.env_editor = Some(EnvEditor { idx, name_cursor: 0, name, host_cursor: 0, host, private_key_cursor: 0, private_key_pem: privk, public_key_cursor: 0, public_key_pem: pubk, ssl_ca_cursor: 0, ssl_ca_pem: ca, field_focus: EnvFieldFocus::Name });
+                                app.env_editor = Some(EnvEditor { idx, name_cursor: 0, name, host_cursor: 0, host, private_key_cursor: 0, private_key_pem: privk, public_key_cursor: 0, public_key_pem: pubk, ssl_ca_cursor: 0, ssl_ca_pem: ca_pem, private_key_vscroll: 0, public_key_vscroll: 0, ca_vscroll: 0, private_key_hscroll: 0, public_key_hscroll: 0, ca_hscroll: 0, field_focus: EnvFieldFocus::Name });
                                 app.show_env_modal = true;
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 // GUI-like: Enter inserts newline in editor, ensure caret stays visible
@@ -201,6 +195,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         EnvFieldFocus::PrivateKey => { if ed.private_key_cursor>0 { ed.private_key_pem.remove(ed.private_key_cursor-1); ed.private_key_cursor-=1; } }
                                         EnvFieldFocus::PublicKey => { if ed.public_key_cursor>0 { ed.public_key_pem.remove(ed.public_key_cursor-1); ed.public_key_cursor-=1; } }
                                         EnvFieldFocus::Ca => { if ed.ssl_ca_cursor>0 { ed.ssl_ca_pem.remove(ed.ssl_ca_cursor-1); ed.ssl_ca_cursor-=1; } }
+                                        EnvFieldFocus::Conn => {}
                                         EnvFieldFocus::Buttons => {}
                                     }
                                 }
@@ -221,6 +216,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         EnvFieldFocus::PrivateKey => { if ed.private_key_cursor<ed.private_key_pem.len() { ed.private_key_pem.remove(ed.private_key_cursor); } }
                                         EnvFieldFocus::PublicKey => { if ed.public_key_cursor<ed.public_key_pem.len() { ed.public_key_pem.remove(ed.public_key_cursor); } }
                                         EnvFieldFocus::Ca => { if ed.ssl_ca_cursor<ed.ssl_ca_pem.len() { ed.ssl_ca_pem.remove(ed.ssl_ca_cursor); } }
+                                        EnvFieldFocus::Conn => {}
                                         EnvFieldFocus::Buttons => {}
                                     }
                                 }
@@ -231,14 +227,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         (KeyCode::Char('\t'), _) | (KeyCode::Tab, _) => {
                             if app.show_env_modal {
                                 if let Some(ed) = app.env_editor.as_mut() {
-                                    ed.field_focus = match ed.field_focus {
-                                        EnvFieldFocus::Name => EnvFieldFocus::Host,
-                                        EnvFieldFocus::Host => EnvFieldFocus::PrivateKey,
-                                        EnvFieldFocus::PrivateKey => EnvFieldFocus::PublicKey,
-                                        EnvFieldFocus::PublicKey => EnvFieldFocus::Ca,
-                                        EnvFieldFocus::Ca => EnvFieldFocus::Buttons,
-                                        EnvFieldFocus::Buttons => EnvFieldFocus::Name,
-                                    };
+                                    ed.field_focus = match ed.field_focus { EnvFieldFocus::Name => EnvFieldFocus::Host, EnvFieldFocus::Host => EnvFieldFocus::PrivateKey, EnvFieldFocus::PrivateKey => EnvFieldFocus::PublicKey, EnvFieldFocus::PublicKey => EnvFieldFocus::Ca, EnvFieldFocus::Ca => EnvFieldFocus::Conn, EnvFieldFocus::Conn => EnvFieldFocus::Buttons, EnvFieldFocus::Buttons => EnvFieldFocus::Name };
                                 }
                             } else {
                                 app.next_focus();
@@ -247,19 +236,12 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         (KeyCode::BackTab, _) => {
                             if app.show_env_modal {
                                 if let Some(ed) = app.env_editor.as_mut() {
-                                    ed.field_focus = match ed.field_focus {
-                                        EnvFieldFocus::Name => EnvFieldFocus::Buttons,
-                                        EnvFieldFocus::Host => EnvFieldFocus::Name,
-                                        EnvFieldFocus::PrivateKey => EnvFieldFocus::Host,
-                                        EnvFieldFocus::PublicKey => EnvFieldFocus::PrivateKey,
-                                        EnvFieldFocus::Ca => EnvFieldFocus::PublicKey,
-                                        EnvFieldFocus::Buttons => EnvFieldFocus::Ca,
-                                    };
+                                    ed.field_focus = match ed.field_focus { EnvFieldFocus::Name => EnvFieldFocus::Buttons, EnvFieldFocus::Host => EnvFieldFocus::Name, EnvFieldFocus::PrivateKey => EnvFieldFocus::Host, EnvFieldFocus::PublicKey => EnvFieldFocus::PrivateKey, EnvFieldFocus::Ca => EnvFieldFocus::PublicKey, EnvFieldFocus::Conn => EnvFieldFocus::Ca, EnvFieldFocus::Buttons => EnvFieldFocus::Conn };
                                 }
                             }
                         }
-                        // Control shortcuts (commands): avoid plain letters
-                        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                        // Save (F4)
+                        (KeyCode::F(4), _) => {
                             if app.show_env_modal {
                                 if let Some(ed) = app.env_editor.as_mut() {
                                     let new_env = Environment {
@@ -277,26 +259,99 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 }
                             }
                         }
-                        (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
-                            if app.show_env_modal { if let Some(ed) = app.env_editor.as_mut() { ed.idx=None; ed.name.clear(); ed.host.clear(); ed.private_key_pem.clear(); ed.public_key_pem.clear(); ed.ssl_ca_pem.clear(); ed.name_cursor=0; ed.host_cursor=0; ed.private_key_cursor=0; ed.public_key_cursor=0; ed.ssl_ca_cursor=0; ed.field_focus=EnvFieldFocus::Name; } }
-                        }
-                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                        // New (F1)
+                        (KeyCode::F(1), _) => { if app.show_env_modal { if let Some(ed) = app.env_editor.as_mut() { ed.idx=None; ed.name.clear(); ed.host.clear(); ed.private_key_pem.clear(); ed.public_key_pem.clear(); ed.ssl_ca_pem.clear(); ed.name_cursor=0; ed.host_cursor=0; ed.private_key_cursor=0; ed.public_key_cursor=0; ed.ssl_ca_cursor=0; ed.private_key_vscroll=0; ed.public_key_vscroll=0; ed.ca_vscroll=0; ed.private_key_hscroll=0; ed.public_key_hscroll=0; ed.ca_hscroll=0; ed.field_focus=EnvFieldFocus::Name; } } }
+                        // Delete (F3)
+                        (KeyCode::F(3), _) => {
                             if app.show_env_modal { if let Some(i) = app.env_store.selected { if i<app.env_store.envs.len() { app.env_store.envs.remove(i); app.env_store.selected = if app.env_store.envs.is_empty() { None } else { Some((i).min(app.env_store.envs.len()-1)) }; let _=app.env_store.save(); } } }
                         }
-                        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-                            if app.show_env_modal { if let Some(ed) = app.env_editor.as_ref() { let host = ed.host.clone(); let ssl = crate::models::SslConfig { ca_pem: if ed.ssl_ca_pem.trim().is_empty(){None}else{Some(ed.ssl_ca_pem.clone())}, cert_pem: if ed.public_key_pem.trim().is_empty(){None}else{Some(ed.public_key_pem.clone())}, key_pem: if ed.private_key_pem.trim().is_empty(){None}else{Some(ed.private_key_pem.clone())} }; match test_connection(&host, ssl).await { Ok(_) => app.status = format!("Connection OK: {}", host), Err(e) => app.status = format!("Connection failed: {}", e) } } }
-                        }
-                        (KeyCode::F(5), _) | (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
-                            if matches!(app.focus, super::app::Focus::Results) { if let Some(s) = selected_cell_text(&app) { match copy_to_clipboard(&s) { Ok(()) => app.status = "Copied to clipboard".to_string(), Err(e) => app.status = format!("Clipboard error: {}", e) } } }
-                        }
-                        (KeyCode::F(6), _) => {
-                            if matches!(app.focus, super::app::Focus::Results) {
-                                if let Some(s) = selected_cell_text(&app) {
-                                    match copy_to_clipboard(&s) { Ok(()) => app.status = "Copied".to_string(), Err(e) => app.status = format!("Clipboard error: {}", e) }
-                                    app.copy_btn_pressed = true; app.copy_btn_deadline = Some(Instant::now() + Duration::from_millis(150));
-                                } else { app.status = "No content to copy".to_string(); }
+                        // F5 is context-sensitive: in env modal -> test connection; in results -> copy cell
+                        (KeyCode::F(5), _) => {
+                            if app.show_env_modal {
+                                if let Some(ed) = app.env_editor.as_ref() {
+                                    let host = ed.host.clone();
+                                    let ssl = crate::models::SslConfig { ca_pem: if ed.ssl_ca_pem.trim().is_empty(){None}else{Some(ed.ssl_ca_pem.clone())}, cert_pem: if ed.public_key_pem.trim().is_empty(){None}else{Some(ed.public_key_pem.clone())}, key_pem: if ed.private_key_pem.trim().is_empty(){None}else{Some(ed.private_key_pem.clone())} };
+                                    // Prefer CA PEM; do not auto-create ssl.ca.location if PEM is provided
+                                    // Start debug log
+                                    let _ = start_test_log(&host, &ssl);
+                                    app.env_test_in_progress = true;
+                                    app.env_test_message = Some(format!("Connecting to {}...", host));
+                                    let txp = tx_evt.clone();
+                                    tokio::spawn(async move {
+                                        let _ = txp.send(TuiEvent::EnvTestProgress { message: format!("Configuring client for {}", host) });
+                                        append_test_log_line(&format!("[step] configure client for host={}", host));
+                                        let mut cfg = ClientConfig::new();
+                                        cfg
+                                            .set("bootstrap.servers", &host)
+                                            .set("group.id", format!("rkl-test-{}", uuid::Uuid::new_v4()))
+                                            .set("enable.auto.commit", "false")
+                                            .set("auto.offset.reset", "earliest")
+                                            .set("enable.partition.eof", "true");
+                                        if ssl.ca_pem.is_some() || ssl.cert_pem.is_some() || ssl.key_pem.is_some() {
+                                            cfg.set("security.protocol", "ssl");
+                                            if let Some(ref s) = ssl.ca_pem { cfg.set("ssl.ca.pem", s); }
+                                            if let Some(ref s) = ssl.cert_pem { cfg.set("ssl.certificate.pem", s); }
+                                            if let Some(ref s) = ssl.key_pem { cfg.set("ssl.key.pem", s); }
+                                            // Use supported debug contexts; omit "ssl" token (not recognized in some builds)
+                                            cfg.set("debug", "security,broker,protocol");
+                                        }
+                                        // Record effective TLS params (redacted)
+                                        append_test_log_line(&format!(
+                                            "[params] security.protocol=ssl, using_ca=pem, ca.pem_len={}, cert.pem_len={}, key.pem_len={}",
+                                            ssl.ca_pem.as_ref().map(|s| s.len()).unwrap_or(0),
+                                            ssl.cert_pem.as_ref().map(|s| s.len()).unwrap_or(0),
+                                            ssl.key_pem.as_ref().map(|s| s.len()).unwrap_or(0)
+                                        ));
+                                        if let Some(ref s) = ssl.ca_pem { append_test_log_line(&format!("[params] ssl.ca.pem head={}.. len={}", &s.chars().take(24).collect::<String>(), s.len())); }
+                                        if let Some(ref s) = ssl.cert_pem { append_test_log_line(&format!("[params] ssl.certificate.pem head={}.. len={}", &s.chars().take(24).collect::<String>(), s.len())); }
+                                        if let Some(ref s) = ssl.key_pem { append_test_log_line(&format!("[params] ssl.key.pem head={}.. len={}", &s.chars().take(24).collect::<String>(), s.len())); }
+                                        let _ = txp.send(TuiEvent::EnvTestProgress { message: "Creating consumer".to_string() });
+                                        append_test_log_line("[step] create consumer");
+                                        let consumer: Result<StreamConsumer, _> = cfg.create();
+                                        match consumer {
+                                            Ok(c) => {
+                                                append_test_log_line("[ok] consumer created");
+                                                let _ = txp.send(TuiEvent::EnvTestProgress { message: "Fetching metadata".to_string() });
+                                                append_test_log_line("[step] fetch metadata (timeout=5s)");
+                                                match c.fetch_metadata(None, Duration::from_secs(5)) {
+                                                    Ok(md) => { append_test_log_line(&format!("[ok] metadata: brokers={}, topics={}", md.brokers().len(), md.topics().len())); let _ = txp.send(TuiEvent::EnvTestDone { message: format!("Connection OK: {}", host) }); },
+                                                    Err(e) => { append_test_log_line(&format!("[err] metadata fetch: {:?}", e)); let _ = txp.send(TuiEvent::EnvTestDone { message: format!("Metadata error: {}", e) }); },
+                                                }
+                                            }
+                                            Err(e) => {
+                                                append_test_log_line(&format!("[err] consumer create: {:?}", e));
+                                                let _ = txp.send(TuiEvent::EnvTestDone { message: format!("Create error: {}", e) });
+                                            }
+                                        }
+                                    });
+                                }
+                            } else if matches!(app.focus, super::app::Focus::Results) {
+                                if let Some(s) = selected_cell_text(&app) { match copy_to_clipboard(&s) { Ok(()) => app.status = "Copied to clipboard".to_string(), Err(e) => app.status = format!("Clipboard error: {}", e) } }
                             }
                         }
+                        // (F8 removed)
+                        // Field navigation via function keys (in modal)
+                        (KeyCode::F(6), _) => { if app.show_env_modal { if let Some(ed) = app.env_editor.as_mut() { ed.field_focus = match ed.field_focus { EnvFieldFocus::Name => EnvFieldFocus::Host, EnvFieldFocus::Host => EnvFieldFocus::PrivateKey, EnvFieldFocus::PrivateKey => EnvFieldFocus::PublicKey, EnvFieldFocus::PublicKey => EnvFieldFocus::Ca, EnvFieldFocus::Ca => EnvFieldFocus::Conn, EnvFieldFocus::Conn => EnvFieldFocus::Buttons, EnvFieldFocus::Buttons => EnvFieldFocus::Name }; } } }
+                        (KeyCode::F(7), _) => { if app.show_env_modal { if let Some(ed) = app.env_editor.as_mut() { ed.field_focus = match ed.field_focus { EnvFieldFocus::Name => EnvFieldFocus::Buttons, EnvFieldFocus::Host => EnvFieldFocus::Name, EnvFieldFocus::PrivateKey => EnvFieldFocus::Host, EnvFieldFocus::PublicKey => EnvFieldFocus::PrivateKey, EnvFieldFocus::Ca => EnvFieldFocus::PublicKey, EnvFieldFocus::Conn => EnvFieldFocus::Ca, EnvFieldFocus::Buttons => EnvFieldFocus::Conn }; } } }
+                        // Toggle mouse selection mode (disable/enable mouse capture)
+                        (KeyCode::F(9), _) => {
+                            if app.mouse_selection_mode {
+                                let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+                                app.mouse_selection_mode = false;
+                                app.status = "Mouse capture enabled".to_string();
+                            } else {
+                                let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+                                app.mouse_selection_mode = true;
+                                app.status = "Mouse selection mode: drag to select/copy; F9 to return".to_string();
+                            }
+                        }
+                        // Edit preselected item (F2)
+                        (KeyCode::F(2), _) => {
+                            if app.show_env_modal {
+                                if let Some(i) = app.env_store.selected { if let Some(e) = app.env_store.envs.get(i) { if let Some(ed) = app.env_editor.as_mut() { ed.idx = Some(i); ed.name = e.name.clone(); ed.host = e.host.clone(); ed.private_key_pem = e.private_key_pem.clone().unwrap_or_default(); ed.public_key_pem = e.public_key_pem.clone().unwrap_or_default(); ed.ssl_ca_pem = e.ssl_ca_pem.clone().unwrap_or_default(); ed.field_focus = EnvFieldFocus::Name; ed.name_cursor = ed.name.len(); ed.host_cursor = ed.host.len(); ed.private_key_cursor = ed.private_key_pem.len(); ed.public_key_cursor = ed.public_key_pem.len(); ed.ssl_ca_cursor = ed.ssl_ca_pem.len(); } } }
+                            }
+                        }
+                        
                         (KeyCode::Char(ch), _) => {
                             if app.show_env_modal {
                                 // Modal text input and commands
@@ -307,6 +362,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         EnvFieldFocus::PrivateKey => { ed.private_key_pem.insert(ed.private_key_cursor, ch); ed.private_key_cursor+=1; }
                                         EnvFieldFocus::PublicKey => { ed.public_key_pem.insert(ed.public_key_cursor, ch); ed.public_key_cursor+=1; }
                                         EnvFieldFocus::Ca => { ed.ssl_ca_pem.insert(ed.ssl_ca_cursor, ch); ed.ssl_ca_cursor+=1; }
+                                        EnvFieldFocus::Conn => {}
                                         EnvFieldFocus::Buttons => {}
                                     }
                                 }
@@ -348,14 +404,18 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             else if matches!(app.focus, super::app::Focus::Query) { move_cursor_down(&mut app); }
                         }
                         (KeyCode::Left, KeyModifiers::SHIFT) => {
-                            if matches!(app.focus, super::app::Focus::Results) {
-                                app.table_hscroll = app.table_hscroll.saturating_sub(2);
-                            }
+                            if app.show_env_modal {
+                                if let Some(ed) = app.env_editor.as_mut() {
+                                    match ed.field_focus { EnvFieldFocus::PrivateKey => { ed.private_key_hscroll = ed.private_key_hscroll.saturating_sub(2); }, EnvFieldFocus::PublicKey => { ed.public_key_hscroll = ed.public_key_hscroll.saturating_sub(2); }, EnvFieldFocus::Ca => { ed.ca_hscroll = ed.ca_hscroll.saturating_sub(2); }, _ => {} }
+                                }
+                            } else if matches!(app.focus, super::app::Focus::Results) { app.table_hscroll = app.table_hscroll.saturating_sub(2); }
                         }
                         (KeyCode::Right, KeyModifiers::SHIFT) => {
-                            if matches!(app.focus, super::app::Focus::Results) {
-                                app.table_hscroll = app.table_hscroll.saturating_add(2);
-                            }
+                            if app.show_env_modal {
+                                if let Some(ed) = app.env_editor.as_mut() {
+                                    match ed.field_focus { EnvFieldFocus::PrivateKey => { ed.private_key_hscroll = ed.private_key_hscroll.saturating_add(2); }, EnvFieldFocus::PublicKey => { ed.public_key_hscroll = ed.public_key_hscroll.saturating_add(2); }, EnvFieldFocus::Ca => { ed.ca_hscroll = ed.ca_hscroll.saturating_add(2); }, _ => {} }
+                                }
+                            } else if matches!(app.focus, super::app::Focus::Results) { app.table_hscroll = app.table_hscroll.saturating_add(2); }
                         }
                         (KeyCode::Left, _) => {
                             if app.show_env_modal {
@@ -366,6 +426,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         EnvFieldFocus::PrivateKey => { if ed.private_key_cursor>0 { ed.private_key_cursor-=1; } }
                                         EnvFieldFocus::PublicKey => { if ed.public_key_cursor>0 { ed.public_key_cursor-=1; } }
                                         EnvFieldFocus::Ca => { if ed.ssl_ca_cursor>0 { ed.ssl_ca_cursor-=1; } }
+                                        EnvFieldFocus::Conn => {}
                                         EnvFieldFocus::Buttons => {}
                                     }
                                 }
@@ -385,6 +446,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         EnvFieldFocus::PrivateKey => { if ed.private_key_cursor<ed.private_key_pem.len(){ ed.private_key_cursor+=1; } }
                                         EnvFieldFocus::PublicKey => { if ed.public_key_cursor<ed.public_key_pem.len(){ ed.public_key_cursor+=1; } }
                                         EnvFieldFocus::Ca => { if ed.ssl_ca_cursor<ed.ssl_ca_pem.len(){ ed.ssl_ca_cursor+=1; } }
+                                        EnvFieldFocus::Conn => {}
                                         EnvFieldFocus::Buttons => {}
                                     }
                                 }
@@ -406,7 +468,18 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     handle_mouse(&mut app, me);
                 }
                 Event::Paste(s) => {
-                    if matches!(app.focus, super::app::Focus::Query) {
+                    if app.show_env_modal {
+                        if let Some(ed) = app.env_editor.as_mut() {
+                            match ed.field_focus {
+                                EnvFieldFocus::PrivateKey => { for ch in s.chars() { ed.private_key_pem.insert(ed.private_key_cursor, ch); ed.private_key_cursor+=1; } }
+                                EnvFieldFocus::PublicKey => { for ch in s.chars() { ed.public_key_pem.insert(ed.public_key_cursor, ch); ed.public_key_cursor+=1; } }
+                                EnvFieldFocus::Ca => { for ch in s.chars() { ed.ssl_ca_pem.insert(ed.ssl_ca_cursor, ch); ed.ssl_ca_cursor+=1; } }
+                                EnvFieldFocus::Name => { for ch in s.chars() { ed.name.insert(ed.name_cursor, ch); ed.name_cursor+=1; } }
+                                EnvFieldFocus::Host => { for ch in s.chars() { ed.host.insert(ed.host_cursor, ch); ed.host_cursor+=1; } }
+                                _ => {}
+                            }
+                        }
+                    } else if matches!(app.focus, super::app::Focus::Query) {
                         for ch in s.chars() { app.input.insert(app.input_cursor, ch); app.input_cursor+=1; }
                         ensure_input_cursor_visible(&mut app);
                     }
@@ -548,6 +621,56 @@ fn selected_cell_text(app: &AppState) -> Option<String> {
     Some(s)
 }
 
+fn ensure_ca_file_for_env(name_hint: &str, pem: &str) -> Result<String> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir).context("create env dir for CA")?;
+    let fname = format!("{}-ca.pem", sanitize(name_hint));
+    let path = dir.join(fname);
+    fs::write(&path, pem).context("write CA pem file")?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+fn sanitize(name: &str) -> String {
+    name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect()
+}
+
+fn logs_dir() -> std::path::PathBuf {
+    std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".rkl").join("logs")).unwrap_or_else(|_| std::path::PathBuf::from(".rkl").join("logs"))
+}
+
+fn append_test_log_line(line: &str) {
+    let dir = logs_dir();
+    if let Err(e) = fs::create_dir_all(&dir) {
+        eprintln!("[rkl] failed to create logs dir {:?}: {}", dir, e);
+        return;
+    }
+    let fpath = dir.join("test-connection.out");
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&fpath) {
+        let ts = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| "".into());
+        let _ = writeln!(f, "{} {}", ts, line);
+    }
+}
+
+fn start_test_log(host: &str, ssl: &crate::models::SslConfig) -> Result<()> {
+    let dir = logs_dir();
+    fs::create_dir_all(&dir).ok();
+    let fpath = dir.join("test-connection.out");
+    // Truncate file at start of each test for clarity
+    let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&fpath).context("open test log file")?;
+    let ts = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| "".into());
+    let _ = writeln!(f, "{} [start] test connection host={} ca_pem_len={} cert_pem_len={} key_pem_len={}",
+        ts,
+        host,
+        ssl.ca_pem.as_ref().map(|s| s.len()).unwrap_or(0),
+        ssl.cert_pem.as_ref().map(|s| s.len()).unwrap_or(0),
+        ssl.key_pem.as_ref().map(|s| s.len()).unwrap_or(0),
+    );
+    Ok(())
+}
+
 
 fn copy_to_clipboard(s: &str) -> Result<()> {
     let mut cb = arboard::Clipboard::new().context("open clipboard")?;
@@ -562,26 +685,10 @@ fn fmt_ts(ms: i64) -> String {
     tm.format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| ms.to_string())
 }
 
-async fn test_connection(host: &str, ssl: crate::models::SslConfig) -> Result<()> {
-    let mut cfg = ClientConfig::new();
-    cfg
-        .set("bootstrap.servers", host)
-        .set("group.id", format!("rkl-test-{}", uuid::Uuid::new_v4()))
-        .set("enable.auto.commit", "false")
-        .set("auto.offset.reset", "earliest")
-        .set("enable.partition.eof", "true");
-    if ssl.ca_pem.is_some() || ssl.cert_pem.is_some() || ssl.key_pem.is_some() {
-        cfg.set("security.protocol", "ssl");
-        if let Some(s) = ssl.ca_pem { cfg.set("ssl.ca.pem", &s); }
-        if let Some(s) = ssl.cert_pem { cfg.set("ssl.certificate.pem", &s); }
-        if let Some(s) = ssl.key_pem { cfg.set("ssl.key.pem", &s); }
-    }
-    let consumer: StreamConsumer = cfg.create().context("create consumer")?;
-    let _ = consumer.fetch_metadata(None, Duration::from_secs(5)).context("fetch metadata")?;
-    Ok(())
-}
+// (Removed unused test_connection)
 
 fn handle_mouse(app: &mut AppState, me: MouseEvent) {
+    if app.mouse_selection_mode { return; }
     // Compute the layout rects like ui.rs to know where the table and json panes are
     let (w, h) = match crossterm::terminal::size() { Ok(x) => x, Err(_) => (0, 0) };
     let root = Rect { x: 0, y: 0, width: w, height: h };
@@ -614,6 +721,71 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
 
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if app.show_env_modal {
+                // Recreate modal layout for hit testing
+                let popup_rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Percentage(10),
+                        Constraint::Percentage(80),
+                        Constraint::Percentage(10),
+                    ])
+                    .split(root);
+                let center_v = popup_rows[1];
+                let popup_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(10),
+                        Constraint::Percentage(80),
+                        Constraint::Percentage(10),
+                    ])
+                    .split(center_v);
+                let modal_area = popup_cols[1];
+                let area = modal_area; // matches centered_rect(80,80)
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+                    .margin(1)
+                    .split(area);
+                let fields = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Min(5),
+                        Constraint::Min(5),
+                        Constraint::Min(5),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                    ])
+                    .split(cols[1]);
+                // Connection [Copy] in title row (approximate: top line of block, right side)
+                let conn = fields[6];
+                if point_in(mx, my, conn) {
+                    // treat top border line as y == conn.y
+                    let inner = Rect { x: conn.x.saturating_add(1), y: conn.y.saturating_add(1), width: conn.width.saturating_sub(2), height: conn.height.saturating_sub(2) };
+                    if mx >= inner.x + inner.width.saturating_sub(8) && my == conn.y {
+                        if let Some(ref s) = app.env_test_message { let _ = copy_to_clipboard(s); }
+                        return;
+                    }
+                }
+                // Copy for large fields
+                let maybe_copy_field = |rect: Rect, content: &str| -> bool {
+                    if point_in(mx, my, rect) {
+                        let inner = Rect { x: rect.x.saturating_add(1), y: rect.y.saturating_add(1), width: rect.width.saturating_sub(2), height: rect.height.saturating_sub(2) };
+                        if mx >= inner.x + inner.width.saturating_sub(8) && my == rect.y {
+                            let _ = copy_to_clipboard(content);
+                            return true;
+                        }
+                    }
+                    false
+                };
+                if let Some(ed) = app.env_editor.as_ref() {
+                    if maybe_copy_field(fields[2], &ed.private_key_pem) { return; }
+                    if maybe_copy_field(fields[3], &ed.public_key_pem) { return; }
+                    if maybe_copy_field(fields[4], &ed.ssl_ca_pem) { return; }
+                }
+            }
             if point_in(mx, my, q_content) {
                 // Position cursor by click
                 let y_rel = my.saturating_sub(q_content.y) as usize;
@@ -677,6 +849,21 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
             }
         }
         MouseEventKind::ScrollUp => {
+            if app.show_env_modal {
+                // Build modal fields again
+                let popup_rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Percentage(10), Constraint::Percentage(80), Constraint::Percentage(10)]).split(root);
+                let center_v = popup_rows[1];
+                let popup_cols = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(10), Constraint::Percentage(80), Constraint::Percentage(10)]).split(center_v);
+                let area = popup_cols[1];
+                let cols2 = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(30), Constraint::Percentage(70)]).margin(1).split(area);
+                let fields = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Min(5), Constraint::Min(5), Constraint::Min(5), Constraint::Length(3), Constraint::Length(3)]).split(cols2[1]);
+                if let Some(ed) = app.env_editor.as_mut() {
+                    if point_in(mx, my, fields[2]) { ed.private_key_vscroll = ed.private_key_vscroll.saturating_sub(1); return; }
+                    if point_in(mx, my, fields[3]) { ed.public_key_vscroll = ed.public_key_vscroll.saturating_sub(1); return; }
+                    if point_in(mx, my, fields[4]) { ed.ca_vscroll = ed.ca_vscroll.saturating_sub(1); return; }
+                }
+                if point_in(mx, my, fields[6]) { app.env_conn_vscroll = app.env_conn_vscroll.saturating_sub(1); return; }
+            }
             if point_in(mx, my, q_content) {
                 app.input_vscroll = app.input_vscroll.saturating_sub(1);
             } else if point_in(mx, my, table_rect) {
@@ -686,6 +873,20 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
             }
         }
         MouseEventKind::ScrollDown => {
+            if app.show_env_modal {
+                let popup_rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Percentage(10), Constraint::Percentage(80), Constraint::Percentage(10)]).split(root);
+                let center_v = popup_rows[1];
+                let popup_cols = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(10), Constraint::Percentage(80), Constraint::Percentage(10)]).split(center_v);
+                let area = popup_cols[1];
+                let cols2 = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(30), Constraint::Percentage(70)]).margin(1).split(area);
+                let fields = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Min(5), Constraint::Min(5), Constraint::Min(5), Constraint::Length(3), Constraint::Length(3)]).split(cols2[1]);
+                if let Some(ed) = app.env_editor.as_mut() {
+                    if point_in(mx, my, fields[2]) { ed.private_key_vscroll = ed.private_key_vscroll.saturating_add(1); return; }
+                    if point_in(mx, my, fields[3]) { ed.public_key_vscroll = ed.public_key_vscroll.saturating_add(1); return; }
+                    if point_in(mx, my, fields[4]) { ed.ca_vscroll = ed.ca_vscroll.saturating_add(1); return; }
+                }
+                if point_in(mx, my, fields[6]) { app.env_conn_vscroll = app.env_conn_vscroll.saturating_add(1); return; }
+            }
             if point_in(mx, my, q_content) {
                 app.input_vscroll = app.input_vscroll.saturating_add(1);
             } else if point_in(mx, my, table_rect) {

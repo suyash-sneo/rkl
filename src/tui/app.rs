@@ -25,6 +25,11 @@ pub struct AppState {
     pub copy_btn_pressed: bool,
     pub copy_btn_deadline: Option<Instant>,
     pub last_run_query_range: Option<(usize, usize)>,
+    // Env test status within the modal
+    pub env_test_in_progress: bool,
+    pub env_test_message: Option<String>,
+    pub env_conn_vscroll: u16,
+    pub mouse_selection_mode: bool,
 }
 
 impl AppState {
@@ -56,6 +61,10 @@ impl AppState {
             copy_btn_pressed: false,
             copy_btn_deadline: None,
             last_run_query_range: None,
+            env_test_in_progress: false,
+            env_test_message: None,
+            env_conn_vscroll: 0,
+            mouse_selection_mode: false,
         }
     }
 
@@ -81,6 +90,8 @@ pub enum TuiEvent {
     Batch { run_id: u64, rows: Vec<MessageEnvelope> },
     Done { run_id: u64 },
     Error { run_id: u64, message: String },
+    EnvTestProgress { message: String },
+    EnvTestDone { message: String },
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -132,8 +143,18 @@ pub struct EnvEditor {
     pub public_key_cursor: usize,
     pub ssl_ca_pem: String,
     pub ssl_ca_cursor: usize,
+    // Scroll positions for multi-line fields
+    pub private_key_vscroll: u16,
+    pub public_key_vscroll: u16,
+    pub ca_vscroll: u16,
+    pub private_key_hscroll: u16,
+    pub public_key_hscroll: u16,
+    pub ca_hscroll: u16,
     pub field_focus: EnvFieldFocus,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum EnvFieldFocus { Name, Host, PrivateKey, PublicKey, Ca, Buttons }
+pub enum EnvFieldFocus { Name, Host, PrivateKey, PublicKey, Ca, Conn, Buttons }
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum CaInputMode { Pem, Location }

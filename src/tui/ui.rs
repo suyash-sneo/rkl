@@ -186,6 +186,7 @@ fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
             Constraint::Min(5),
             Constraint::Min(5),
             Constraint::Length(3),
+            Constraint::Min(5),
         ])
         .split(cols[1]);
 
@@ -193,32 +194,53 @@ fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
     let host_val = ed.map(|e| e.host.clone()).unwrap_or_default();
     let privk_val = ed.map(|e| e.private_key_pem.clone()).unwrap_or_default();
     let pubk_val = ed.map(|e| e.public_key_pem.clone()).unwrap_or_default();
-    let ca_val = ed.map(|e| e.ssl_ca_pem.clone()).unwrap_or_default();
+    let ca_pem_val = ed.map(|e| e.ssl_ca_pem.clone()).unwrap_or_default();
 
     let title_name = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Name)) { "Name [FOCUSED]" } else { "Name" };
     let title_host = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Host)) { "Host [FOCUSED]" } else { "Host" };
-    let title_pk = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::PrivateKey)) { "Private Key (PEM) [FOCUSED]" } else { "Private Key (PEM)" };
-    let title_cert = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::PublicKey)) { "Public/Certificate (PEM) [FOCUSED]" } else { "Public/Certificate (PEM)" };
-    let title_ca = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Ca)) { "SSL CA (PEM) [FOCUSED]" } else { "SSL CA (PEM)" };
+    let title_pk_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::PrivateKey)) { "Private Key (PEM) [FOCUSED]" } else { "Private Key (PEM)" };
+    let title_pk = format!("{}  [Copy]", title_pk_base);
+    let title_cert_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::PublicKey)) { "Public/Certificate (PEM) [FOCUSED]" } else { "Public/Certificate (PEM)" };
+    let title_cert = format!("{}  [Copy]", title_cert_base);
+    let title_ca_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Ca)) { "SSL CA (PEM) [FOCUSED]" } else { "SSL CA (PEM)" };
+    let title_ca = format!("{}  [Copy]", title_ca_base);
 
     frame.render_widget(Paragraph::new(name_val.clone()).block(Block::default().borders(Borders::ALL).title(title_name)), fields[0]);
     frame.render_widget(Paragraph::new(host_val.clone()).block(Block::default().borders(Borders::ALL).title(title_host)), fields[1]);
-    frame.render_widget(Paragraph::new(privk_val.clone()).block(Block::default().borders(Borders::ALL).title(title_pk)), fields[2]);
-    frame.render_widget(Paragraph::new(pubk_val.clone()).block(Block::default().borders(Borders::ALL).title(title_cert)), fields[3]);
-    frame.render_widget(Paragraph::new(ca_val.clone()).block(Block::default().borders(Borders::ALL).title(title_ca)), fields[4]);
+    // Render multi-line fields with manual v/h scroll cropping (no wrapping)
+    render_scrolled_field(frame, fields[2], &title_pk, &privk_val, app.env_editor.as_ref().map(|e| e.private_key_vscroll).unwrap_or(0), app.env_editor.as_ref().map(|e| e.private_key_hscroll).unwrap_or(0));
+    render_scrolled_field(frame, fields[3], &title_cert, &pubk_val, app.env_editor.as_ref().map(|e| e.public_key_vscroll).unwrap_or(0), app.env_editor.as_ref().map(|e| e.public_key_hscroll).unwrap_or(0));
+    render_scrolled_field(frame, fields[4], &title_ca, &ca_pem_val, app.env_editor.as_ref().map(|e| e.ca_vscroll).unwrap_or(0), app.env_editor.as_ref().map(|e| e.ca_hscroll).unwrap_or(0));
     if let Some(ed) = app.env_editor.as_ref() {
         let (x, y) = match ed.field_focus {
             super::app::EnvFieldFocus::Name => caret_pos_in(fields[0], &name_val, ed.name_cursor),
             super::app::EnvFieldFocus::Host => caret_pos_in(fields[1], &host_val, ed.host_cursor),
             super::app::EnvFieldFocus::PrivateKey => caret_pos_in(fields[2], &privk_val, ed.private_key_cursor),
             super::app::EnvFieldFocus::PublicKey => caret_pos_in(fields[3], &pubk_val, ed.public_key_cursor),
-            super::app::EnvFieldFocus::Ca => caret_pos_in(fields[4], &ca_val, ed.ssl_ca_cursor),
+            super::app::EnvFieldFocus::Ca => caret_pos_in_h(fields[4], &ca_pem_val, ed.ssl_ca_cursor, ed.ca_vscroll, ed.ca_hscroll),
+            super::app::EnvFieldFocus::Conn => (0,0),
             super::app::EnvFieldFocus::Buttons => (0,0),
         };
         if x > 0 || y > 0 { frame.set_cursor(x, y); }
     }
-    let help = "Enter: select/save | Tab/Shift-Tab: move | Up/Down: select env | n: new | d: delete | s: save | t: test | Esc: close";
+    let help = "F1 New | F2 Edit | F3 Delete | F4 Save | F5 Test | F6 Next | F7 Prev | F9 Mouse select on/off | Tab/Shift-Tab Move | Up/Down Select | Shift-←/→ H-scroll | Esc Close";
     frame.render_widget(Paragraph::new(help).block(Block::default().borders(Borders::ALL).title("Actions")), fields[5]);
+
+    // Connection status/progress area (scrollable)
+    let status_text = if app.env_test_in_progress {
+        // Simple spinner based on time
+        let ch = match (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() / 250) % 4 {
+            0 => "⠋", 1 => "⠙", 2 => "⠸", _ => "⠴",
+        };
+        let msg = app.env_test_message.as_deref().unwrap_or("Testing connection...");
+        format!("{} {}", ch, msg)
+    } else {
+        app.env_test_message.clone().unwrap_or_else(|| "Ready".to_string())
+    };
+    let conn_title = if matches!(app.env_editor.as_ref().map(|e| e.field_focus), Some(EnvFieldFocus::Conn)) { "Connection [FOCUSED]  [Copy/F9 Select]" } else { "Connection  [Copy/F9 Select]" };
+    let conn_block = Block::default().borders(Borders::ALL).title(conn_title);
+    let conn_para = Paragraph::new(status_text).block(conn_block).scroll((app.env_conn_vscroll, 0));
+    frame.render_widget(conn_para, fields[6]);
 }
 
 fn caret_pos_in(area: Rect, text: &str, cursor: usize) -> (u16, u16) {
@@ -244,6 +266,41 @@ fn caret_pos_in(area: Rect, text: &str, cursor: usize) -> (u16, u16) {
     line = line.min(max_h.saturating_sub(1));
     col = col.min(max_w.saturating_sub(1));
     (inner_x + col, inner_y + line)
+}
+
+fn caret_pos_in_h(area: Rect, text: &str, cursor: usize, vscroll: u16, hscroll: u16) -> (u16, u16) {
+    let inner_x = area.x.saturating_add(1);
+    let inner_y = area.y.saturating_add(1);
+    let max_w = area.width.saturating_sub(2) as usize;
+    let max_h = area.height.saturating_sub(2) as usize;
+    let (line, col) = line_col_at(text, cursor);
+    let vis_line = line.saturating_sub(vscroll as usize);
+    let vis_col = col.saturating_sub(hscroll as usize);
+    let y = inner_y + vis_line.min(max_h.saturating_sub(1)) as u16;
+    let x = inner_x + vis_col.min(max_w.saturating_sub(1)) as u16;
+    (x, y)
+}
+
+fn render_scrolled_field(frame: &mut Frame, area: Rect, title: &str, text: &str, vscroll: u16, hscroll: u16) {
+    let block = Block::default().borders(Borders::ALL).title(title.to_string());
+    frame.render_widget(block.clone(), area);
+    let inner = Rect { x: area.x.saturating_add(1), y: area.y.saturating_add(1), width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
+    let lines: Vec<Line> = crop_lines(text, vscroll as usize, hscroll as usize, inner.width as usize, inner.height as usize);
+    let para = Paragraph::new(Text::from(lines));
+    frame.render_widget(para, inner);
+}
+
+fn crop_lines(text: &str, vscroll: usize, hscroll: usize, max_w: usize, max_h: usize) -> Vec<Line<'static>> {
+    let mut out: Vec<Line> = Vec::new();
+    let mut skipped = 0usize;
+    for (i, line) in text.split('\n').enumerate() {
+        if i < vscroll { skipped += 1; continue; }
+        if out.len() >= max_h { break; }
+        let slice = if line.len() > hscroll { &line[hscroll.min(line.len())..] } else { "" };
+        let visible = if slice.len() > max_w { &slice[..max_w] } else { slice };
+        out.push(Line::from(visible.to_string()));
+    }
+    out
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
