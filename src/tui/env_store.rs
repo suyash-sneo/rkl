@@ -29,7 +29,13 @@ impl EnvStore {
                 if path.is_file() {
                     if let Some(ext) = path.extension() { if ext != "json" { continue; } }
                     if let Ok(s) = fs::read_to_string(&path) {
-                        if let Ok(e) = serde_json::from_str::<Environment>(&s) { envs.push(e); }
+                        if let Ok(mut e) = serde_json::from_str::<Environment>(&s) {
+                            // Decode any encoded newlines ("\n") back to real newlines for editing/usage
+                            e.private_key_pem = e.private_key_pem.map(decode_newlines);
+                            e.public_key_pem = e.public_key_pem.map(decode_newlines);
+                            e.ssl_ca_pem = e.ssl_ca_pem.map(decode_newlines);
+                            envs.push(e);
+                        }
                     }
                 }
             }
@@ -47,7 +53,12 @@ impl EnvStore {
             let fname = format!("{}.json", sanitize(&e.name));
             desired.insert(fname.clone());
             let path = dir.join(fname);
-            let s = serde_json::to_string_pretty(e).context("serialize env")?;
+            // Encode newlines in PEMs so the file contains a single-line string with literal \n
+            let mut e_enc = e.clone();
+            e_enc.private_key_pem = e_enc.private_key_pem.map(encode_newlines);
+            e_enc.public_key_pem = e_enc.public_key_pem.map(encode_newlines);
+            e_enc.ssl_ca_pem = e_enc.ssl_ca_pem.map(encode_newlines);
+            let s = serde_json::to_string_pretty(&e_enc).context("serialize env")?;
             fs::write(path, s).context("write env file")?;
         }
         // remove stale
@@ -73,3 +84,14 @@ pub fn config_dir() -> PathBuf {
 
 fn sanitize(name: &str) -> String { name.chars().map(|c| if is_safe(c) { c } else { '_' }).collect() }
 fn is_safe(c: char) -> bool { c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' }
+
+fn encode_newlines(s: String) -> String {
+    // Ensure result is a single line with literal \n sequences
+    s.replace('\n', "\\n")
+}
+
+fn decode_newlines(s: String) -> String {
+    // Convert literal \n sequences back to newline characters
+    // Note: we only replace unescaped sequences; a naive replace works for our config inputs
+    s.replace("\\n", "\n")
+}

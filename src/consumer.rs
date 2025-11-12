@@ -9,6 +9,7 @@ use rdkafka::topic_partition_list::TopicPartitionList;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
+use std::io::Write as _;
 
 pub async fn spawn_partition_consumer(
     args: RunArgs,
@@ -131,7 +132,15 @@ pub async fn spawn_partition_consumer(
                 }
             }
             Err(e) => {
-                eprintln!("[partition {partition}] error receiving: {e}");
+                // Log errors to ~/.rkl/logs instead of printing over the TUI
+                if let Some(home) = std::env::var_os("HOME") {
+                    let path = std::path::PathBuf::from(home).join(".rkl").join("logs").join("consumer.err.log");
+                    let _ = std::fs::create_dir_all(path.parent().unwrap());
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                        let ts = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| "".into());
+                        let _ = writeln!(f, "{} [partition {}] {}", ts, partition, e);
+                    }
+                }
                 // Keep going; transient errors happen
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }

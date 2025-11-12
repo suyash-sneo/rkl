@@ -18,14 +18,22 @@ use crate::output::OutputSink;
 use crate::query::{parse_query, OrderDir, SelectItem};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::config::RDKafkaLogLevel;
+use rdkafka::client::ClientContext;
+use rdkafka::consumer::ConsumerContext;
 
-use super::app::{AppState, TuiEvent, EnvEditor, EnvFieldFocus};
+use super::app::{AppState, TuiEvent, EnvEditor, EnvFieldFocus, Screen};
 use super::env_store::config_dir;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use super::env_store::Environment;
 use super::ui::draw;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use libc;
+use tui_textarea::{Input as TAInput, TextArea, Key as TAKey};
 
 pub async fn run(args: RunArgs) -> Result<()> {
     // Setup terminal
@@ -77,19 +85,32 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     }
                 }
                 TuiEvent::Done { run_id } => {
-                    if Some(run_id) == app.current_run { app.status = format!("Run {run_id} complete"); }
+                    if Some(run_id) == app.current_run {
+                        app.status = format!("Run {run_id} complete");
+                        if !app.status_buffer.is_empty() { app.status_buffer.push('\n'); }
+                        app.status_buffer.push_str(&format!("✔ Completed run {}", run_id));
+                    }
                 }
                 TuiEvent::Error { run_id, message } => {
-                    if Some(run_id) == app.current_run { app.status = format!("Error: {message}"); }
+                    if Some(run_id) == app.current_run {
+                        app.status = format!("Error: {message}");
+                        if !app.status_buffer.is_empty() { app.status_buffer.push('\n'); }
+                        app.status_buffer.push_str(&format!("✘ Error (run {}): {}", run_id, message));
+                    }
                 }
                 TuiEvent::EnvTestProgress { message } => {
                     app.env_test_in_progress = true;
-                    app.env_test_message = Some(message);
+                    app.env_test_message = Some(message.clone());
+                    if !app.status_buffer.is_empty() { app.status_buffer.push('\n'); }
+                    app.status_buffer.push_str(&format!("[env-test] {}", message));
                 }
                 TuiEvent::EnvTestDone { message } => {
                     app.env_test_in_progress = false;
-                    app.env_test_message = Some(message);
+                    app.env_test_message = Some(message.clone());
+                    if !app.status_buffer.is_empty() { app.status_buffer.push('\n'); }
+                    app.status_buffer.push_str(&format!("[env-test] {}", message));
                 }
+                TuiEvent::Topics(list) => { app.topics = list; }
             }
         }
 
@@ -104,10 +125,27 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     match (code, modifiers) {
                         (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
                         (KeyCode::Char('q'), KeyModifiers::CONTROL) => break Ok(()),
+                        (KeyCode::F(10), _) => { app.show_help = !app.show_help; }
+                        (KeyCode::F(8), _) => { app.screen = Screen::Home; }
+                        (KeyCode::F(2), _) => {
+                            app.screen = Screen::Envs;
+                            if app.env_editor.is_none() {
+                                if let Some(i) = app.env_store.selected { if let Some(e) = app.env_store.envs.get(i).cloned() {
+                                    let mut ta_priv = TextArea::from(e.private_key_pem.unwrap_or_default().lines());
+                                    let mut ta_pub = TextArea::from(e.public_key_pem.unwrap_or_default().lines());
+                                    let mut ta_ca = TextArea::from(e.ssl_ca_pem.unwrap_or_default().lines());
+                                    ta_priv.set_tab_length(0); ta_pub.set_tab_length(0); ta_ca.set_tab_length(0);
+                                    app.env_editor = Some(EnvEditor { idx: Some(i), name: e.name, name_cursor: 0, host: e.host, host_cursor: 0, ta_private: ta_priv, ta_public: ta_pub, ta_ca: ta_ca, ssl_ca_cursor: 0, field_focus: EnvFieldFocus::Name });
+                                } }
+                            }
+                        }
+                        (KeyCode::F(12), _) => { app.screen = Screen::Info; fetch_topics_async(&app, tx_evt.clone()); }
+                        (KeyCode::F(6), _) => { if matches!(app.screen, Screen::Info) { fetch_topics_async(&app, tx_evt.clone()); } }
+                        (KeyCode::F(7), _) => { let txt = if app.status_buffer.is_empty() { app.status.clone() } else { app.status_buffer.clone() }; if !txt.trim().is_empty() { let _ = copy_to_clipboard(&txt); } }
                         // Some macOS terminals send Ctrl-Enter as Ctrl-J (LF) or Ctrl-M (CR)
                         // Ctrl-Enter (and common terminal fallbacks) → run
                         (KeyCode::Char('j'), m) | (KeyCode::Char('m'), m) if m.contains(KeyModifiers::CONTROL) => {
-                            if !app.show_env_modal && matches!(app.focus, super::app::Focus::Query) {
+                            if matches!(app.screen, Screen::Home) && !app.show_env_modal && matches!(app.focus, super::app::Focus::Query) {
                                 let (qs, qe) = find_query_range(&app.input, app.input_cursor);
                                 let input = app.input[qs..qe].trim().to_string();
                                 if input.is_empty() { app.status = "Please enter a query".to_string(); continue; }
@@ -132,7 +170,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             }
                         }
                         (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
-                            if !app.show_env_modal && matches!(app.focus, super::app::Focus::Query) {
+                            if matches!(app.screen, Screen::Home) && !app.show_env_modal && matches!(app.focus, super::app::Focus::Query) {
                                 let (qs, qe) = find_query_range(&app.input, app.input_cursor);
                                 let input = app.input[qs..qe].trim().to_string();
                                 if input.is_empty() { app.status = "Please enter a query".to_string(); continue; }
@@ -156,27 +194,32 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 }
                             }
                         }
-                        // Enter: editor newline; open env modal from host bar
+                        // Enter: editor newline; open env screen from host bar
                         (KeyCode::Enter, _) => {
-                            if app.show_env_modal {
-                                // In modal: Enter inserts newline in multiline fields
+                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
                                 if let Some(ed) = app.env_editor.as_mut() {
                                     match ed.field_focus {
-                                        EnvFieldFocus::PrivateKey => { ed.private_key_pem.insert(ed.private_key_cursor, '\n'); ed.private_key_cursor+=1; }
-                                        EnvFieldFocus::PublicKey => { ed.public_key_pem.insert(ed.public_key_cursor, '\n'); ed.public_key_cursor+=1; }
-                                        EnvFieldFocus::Ca => { ed.ssl_ca_pem.insert(ed.ssl_ca_cursor, '\n'); ed.ssl_ca_cursor+=1; }
-                                        _ => { /* ignore */ }
+                                        EnvFieldFocus::PrivateKey => { ed.ta_private.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::PublicKey => { ed.ta_public.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::Ca => { ed.ta_ca.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::Name => { ed.name.insert(ed.name_cursor, '\n'); ed.name_cursor += 1; }
+                                        EnvFieldFocus::Host => { ed.host.insert(ed.host_cursor, '\n'); ed.host_cursor += 1; }
+                                        _ => {}
                                     }
                                 }
                             } else if matches!(app.focus, super::app::Focus::Host) {
-                                // Open env modal
+                                // Open env screen
                                 let (idx, name, host, privk, pubk, ca_pem) = if let Some(env) = app.selected_env() {
                                     (app.env_store.selected, env.name.clone(), env.host.clone(), env.private_key_pem.clone().unwrap_or_default(), env.public_key_pem.clone().unwrap_or_default(), env.ssl_ca_pem.clone().unwrap_or_default())
                                 } else {
                                     (None, String::new(), app.host.clone(), String::new(), String::new(), String::new())
                                 };
-                                app.env_editor = Some(EnvEditor { idx, name_cursor: 0, name, host_cursor: 0, host, private_key_cursor: 0, private_key_pem: privk, public_key_cursor: 0, public_key_pem: pubk, ssl_ca_cursor: 0, ssl_ca_pem: ca_pem, private_key_vscroll: 0, public_key_vscroll: 0, ca_vscroll: 0, private_key_hscroll: 0, public_key_hscroll: 0, ca_hscroll: 0, field_focus: EnvFieldFocus::Name });
-                                app.show_env_modal = true;
+                                let mut ta_priv = TextArea::from(privk.lines());
+                                let mut ta_pub = TextArea::from(pubk.lines());
+                                let mut ta_ca = TextArea::from(ca_pem.lines());
+                                ta_priv.set_tab_length(0); ta_pub.set_tab_length(0); ta_ca.set_tab_length(0);
+                                app.env_editor = Some(EnvEditor { idx, name_cursor: 0, name, host_cursor: 0, host, ta_private: ta_priv, ta_public: ta_pub, ta_ca: ta_ca, ssl_ca_cursor: 0, field_focus: EnvFieldFocus::Name });
+                                app.screen = Screen::Envs;
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 // GUI-like: Enter inserts newline in editor, ensure caret stays visible
                                 app.input.insert(app.input_cursor, '\n');
@@ -187,16 +230,15 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             }
                         }
                         (KeyCode::Backspace, _) => {
-                            if app.show_env_modal {
+                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
                                 if let Some(ed) = app.env_editor.as_mut() {
                                     match ed.field_focus {
                                         EnvFieldFocus::Name => { if ed.name_cursor>0 { ed.name.remove(ed.name_cursor-1); ed.name_cursor-=1; } }
                                         EnvFieldFocus::Host => { if ed.host_cursor>0 { ed.host.remove(ed.host_cursor-1); ed.host_cursor-=1; } }
-                                        EnvFieldFocus::PrivateKey => { if ed.private_key_cursor>0 { ed.private_key_pem.remove(ed.private_key_cursor-1); ed.private_key_cursor-=1; } }
-                                        EnvFieldFocus::PublicKey => { if ed.public_key_cursor>0 { ed.public_key_pem.remove(ed.public_key_cursor-1); ed.public_key_cursor-=1; } }
-                                        EnvFieldFocus::Ca => { if ed.ssl_ca_cursor>0 { ed.ssl_ca_pem.remove(ed.ssl_ca_cursor-1); ed.ssl_ca_cursor-=1; } }
-                                        EnvFieldFocus::Conn => {}
-                                        EnvFieldFocus::Buttons => {}
+                                        EnvFieldFocus::PrivateKey => { ed.ta_private.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::PublicKey => { ed.ta_public.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::Ca => { ed.ta_ca.input(ta_input_from_key(key)); }
+                                        _ => {}
                                     }
                                 }
                                 continue;
@@ -208,16 +250,15 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             }
                         }
                         (KeyCode::Delete, _) => {
-                            if app.show_env_modal {
+                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
                                 if let Some(ed) = app.env_editor.as_mut() {
                                     match ed.field_focus {
                                         EnvFieldFocus::Name => { if ed.name_cursor<ed.name.len() { ed.name.remove(ed.name_cursor); } }
                                         EnvFieldFocus::Host => { if ed.host_cursor<ed.host.len() { ed.host.remove(ed.host_cursor); } }
-                                        EnvFieldFocus::PrivateKey => { if ed.private_key_cursor<ed.private_key_pem.len() { ed.private_key_pem.remove(ed.private_key_cursor); } }
-                                        EnvFieldFocus::PublicKey => { if ed.public_key_cursor<ed.public_key_pem.len() { ed.public_key_pem.remove(ed.public_key_cursor); } }
-                                        EnvFieldFocus::Ca => { if ed.ssl_ca_cursor<ed.ssl_ca_pem.len() { ed.ssl_ca_pem.remove(ed.ssl_ca_cursor); } }
-                                        EnvFieldFocus::Conn => {}
-                                        EnvFieldFocus::Buttons => {}
+                                        EnvFieldFocus::PrivateKey => { ed.ta_private.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::PublicKey => { ed.ta_public.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::Ca => { ed.ta_ca.input(ta_input_from_key(key)); }
+                                        _ => {}
                                     }
                                 }
                             } else if matches!(app.focus, super::app::Focus::Query) {
@@ -225,7 +266,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             }
                         }
                         (KeyCode::Char('\t'), _) | (KeyCode::Tab, _) => {
-                            if app.show_env_modal {
+                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
                                 if let Some(ed) = app.env_editor.as_mut() {
                                     ed.field_focus = match ed.field_focus { EnvFieldFocus::Name => EnvFieldFocus::Host, EnvFieldFocus::Host => EnvFieldFocus::PrivateKey, EnvFieldFocus::PrivateKey => EnvFieldFocus::PublicKey, EnvFieldFocus::PublicKey => EnvFieldFocus::Ca, EnvFieldFocus::Ca => EnvFieldFocus::Conn, EnvFieldFocus::Conn => EnvFieldFocus::Buttons, EnvFieldFocus::Buttons => EnvFieldFocus::Name };
                                 }
@@ -234,7 +275,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             }
                         }
                         (KeyCode::BackTab, _) => {
-                            if app.show_env_modal {
+                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
                                 if let Some(ed) = app.env_editor.as_mut() {
                                     ed.field_focus = match ed.field_focus { EnvFieldFocus::Name => EnvFieldFocus::Buttons, EnvFieldFocus::Host => EnvFieldFocus::Name, EnvFieldFocus::PrivateKey => EnvFieldFocus::Host, EnvFieldFocus::PublicKey => EnvFieldFocus::PrivateKey, EnvFieldFocus::Ca => EnvFieldFocus::PublicKey, EnvFieldFocus::Conn => EnvFieldFocus::Ca, EnvFieldFocus::Buttons => EnvFieldFocus::Conn };
                                 }
@@ -242,35 +283,44 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         }
                         // Save (F4)
                         (KeyCode::F(4), _) => {
-                            if app.show_env_modal {
+                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
                                 if let Some(ed) = app.env_editor.as_mut() {
-                                    let new_env = Environment {
-                                        name: ed.name.clone(),
-                                        host: ed.host.clone(),
-                                        private_key_pem: if ed.private_key_pem.trim().is_empty() { None } else { Some(ed.private_key_pem.clone()) },
-                                        public_key_pem: if ed.public_key_pem.trim().is_empty() { None } else { Some(ed.public_key_pem.clone()) },
-                                        ssl_ca_pem: if ed.ssl_ca_pem.trim().is_empty() { None } else { Some(ed.ssl_ca_pem.clone()) },
-                                    };
+                                    let pk = ed.ta_private.lines().join("\n");
+                                    let cert = ed.ta_public.lines().join("\n");
+                                    let ca = ed.ta_ca.lines().join("\n");
+                                    let exists_name = app.env_store.envs.iter().enumerate().any(|(i, e)| i != ed.idx.unwrap_or(usize::MAX) && e.name.eq_ignore_ascii_case(&ed.name));
+                                    if ed.name.trim().is_empty() {
+                                        app.status = "Environment name cannot be empty".to_string();
+                                        continue;
+                                    }
+                                    if ed.idx.is_none() && exists_name {
+                                        app.status = "Environment name already exists. Choose a unique name.".to_string();
+                                        continue;
+                                    }
+                                    let new_env = Environment { name: ed.name.clone(), host: ed.host.clone(), private_key_pem: if pk.trim().is_empty() { None } else { Some(pk) }, public_key_pem: if cert.trim().is_empty() { None } else { Some(cert) }, ssl_ca_pem: if ca.trim().is_empty() { None } else { Some(ca) } };
                                     if let Some(i) = ed.idx { if i < app.env_store.envs.len() { app.env_store.envs[i] = new_env.clone(); app.env_store.selected = Some(i); } else { app.env_store.envs.push(new_env.clone()); app.env_store.selected = Some(app.env_store.envs.len()-1); } }
                                     else { app.env_store.envs.push(new_env.clone()); app.env_store.selected = Some(app.env_store.envs.len()-1); }
                                     let _ = app.env_store.save();
                                     if let Some(sel) = app.env_store.selected { if let Some(e) = app.env_store.envs.get(sel) { app.host = e.host.clone(); } }
-                                    app.show_env_modal = false;
+                                    if app.show_env_modal { app.show_env_modal = false; }
                                 }
                             }
                         }
                         // New (F1)
-                        (KeyCode::F(1), _) => { if app.show_env_modal { if let Some(ed) = app.env_editor.as_mut() { ed.idx=None; ed.name.clear(); ed.host.clear(); ed.private_key_pem.clear(); ed.public_key_pem.clear(); ed.ssl_ca_pem.clear(); ed.name_cursor=0; ed.host_cursor=0; ed.private_key_cursor=0; ed.public_key_cursor=0; ed.ssl_ca_cursor=0; ed.private_key_vscroll=0; ed.public_key_vscroll=0; ed.ca_vscroll=0; ed.private_key_hscroll=0; ed.public_key_hscroll=0; ed.ca_hscroll=0; ed.field_focus=EnvFieldFocus::Name; } } }
+                        (KeyCode::F(1), _) => { if matches!(app.screen, Screen::Envs) || app.show_env_modal { if let Some(ed) = app.env_editor.as_mut() { ed.idx=None; ed.name.clear(); ed.host.clear(); ed.ta_private = TextArea::default(); ed.ta_public = TextArea::default(); ed.ta_ca = TextArea::default(); ed.name_cursor=0; ed.host_cursor=0; ed.ssl_ca_cursor=0; ed.field_focus=EnvFieldFocus::Name; } } }
                         // Delete (F3)
                         (KeyCode::F(3), _) => {
-                            if app.show_env_modal { if let Some(i) = app.env_store.selected { if i<app.env_store.envs.len() { app.env_store.envs.remove(i); app.env_store.selected = if app.env_store.envs.is_empty() { None } else { Some((i).min(app.env_store.envs.len()-1)) }; let _=app.env_store.save(); } } }
+                            if matches!(app.screen, Screen::Envs) || app.show_env_modal { if let Some(i) = app.env_store.selected { if i<app.env_store.envs.len() { app.env_store.envs.remove(i); app.env_store.selected = if app.env_store.envs.is_empty() { None } else { Some((i).min(app.env_store.envs.len()-1)) }; let _=app.env_store.save(); } } }
                         }
                         // F5 is context-sensitive: in env modal -> test connection; in results -> copy cell
                         (KeyCode::F(5), _) => {
-                            if app.show_env_modal {
+                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
                                 if let Some(ed) = app.env_editor.as_ref() {
                                     let host = ed.host.clone();
-                                    let ssl = crate::models::SslConfig { ca_pem: if ed.ssl_ca_pem.trim().is_empty(){None}else{Some(ed.ssl_ca_pem.clone())}, cert_pem: if ed.public_key_pem.trim().is_empty(){None}else{Some(ed.public_key_pem.clone())}, key_pem: if ed.private_key_pem.trim().is_empty(){None}else{Some(ed.private_key_pem.clone())} };
+                                    let pk = ed.ta_private.lines().join("\n");
+                                    let cert = ed.ta_public.lines().join("\n");
+                                    let ca = ed.ta_ca.lines().join("\n");
+                                    let ssl = crate::models::SslConfig { ca_pem: if ca.trim().is_empty(){None}else{Some(ca)}, cert_pem: if cert.trim().is_empty(){None}else{Some(cert)}, key_pem: if pk.trim().is_empty(){None}else{Some(pk)} };
                                     // Prefer CA PEM; do not auto-create ssl.ca.location if PEM is provided
                                     // Start debug log
                                     let _ = start_test_log(&host, &ssl);
@@ -278,6 +328,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                     app.env_test_message = Some(format!("Connecting to {}...", host));
                                     let txp = tx_evt.clone();
                                     tokio::spawn(async move {
+                                        // Ensure anything printed by the SSL libs is redirected to log file only.
+                                        #[cfg(unix)]
+                                        let _guard = redirect_stdio_to_file(&logs_dir().join("test-connection.out")).ok();
                                         let _ = txp.send(TuiEvent::EnvTestProgress { message: format!("Configuring client for {}", host) });
                                         append_test_log_line(&format!("[step] configure client for host={}", host));
                                         let mut cfg = ClientConfig::new();
@@ -305,6 +358,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         if let Some(ref s) = ssl.ca_pem { append_test_log_line(&format!("[params] ssl.ca.pem head={}.. len={}", &s.chars().take(24).collect::<String>(), s.len())); }
                                         if let Some(ref s) = ssl.cert_pem { append_test_log_line(&format!("[params] ssl.certificate.pem head={}.. len={}", &s.chars().take(24).collect::<String>(), s.len())); }
                                         if let Some(ref s) = ssl.key_pem { append_test_log_line(&format!("[params] ssl.key.pem head={}.. len={}", &s.chars().take(24).collect::<String>(), s.len())); }
+                                        cfg.set("log_level", "1");
                                         let _ = txp.send(TuiEvent::EnvTestProgress { message: "Creating consumer".to_string() });
                                         append_test_log_line("[step] create consumer");
                                         let consumer: Result<StreamConsumer, _> = cfg.create();
@@ -330,9 +384,6 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             }
                         }
                         // (F8 removed)
-                        // Field navigation via function keys (in modal)
-                        (KeyCode::F(6), _) => { if app.show_env_modal { if let Some(ed) = app.env_editor.as_mut() { ed.field_focus = match ed.field_focus { EnvFieldFocus::Name => EnvFieldFocus::Host, EnvFieldFocus::Host => EnvFieldFocus::PrivateKey, EnvFieldFocus::PrivateKey => EnvFieldFocus::PublicKey, EnvFieldFocus::PublicKey => EnvFieldFocus::Ca, EnvFieldFocus::Ca => EnvFieldFocus::Conn, EnvFieldFocus::Conn => EnvFieldFocus::Buttons, EnvFieldFocus::Buttons => EnvFieldFocus::Name }; } } }
-                        (KeyCode::F(7), _) => { if app.show_env_modal { if let Some(ed) = app.env_editor.as_mut() { ed.field_focus = match ed.field_focus { EnvFieldFocus::Name => EnvFieldFocus::Buttons, EnvFieldFocus::Host => EnvFieldFocus::Name, EnvFieldFocus::PrivateKey => EnvFieldFocus::Host, EnvFieldFocus::PublicKey => EnvFieldFocus::PrivateKey, EnvFieldFocus::Ca => EnvFieldFocus::PublicKey, EnvFieldFocus::Conn => EnvFieldFocus::Ca, EnvFieldFocus::Buttons => EnvFieldFocus::Conn }; } } }
                         // Toggle mouse selection mode (disable/enable mouse capture)
                         (KeyCode::F(9), _) => {
                             if app.mouse_selection_mode {
@@ -345,25 +396,18 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 app.status = "Mouse selection mode: drag to select/copy; F9 to return".to_string();
                             }
                         }
-                        // Edit preselected item (F2)
-                        (KeyCode::F(2), _) => {
-                            if app.show_env_modal {
-                                if let Some(i) = app.env_store.selected { if let Some(e) = app.env_store.envs.get(i) { if let Some(ed) = app.env_editor.as_mut() { ed.idx = Some(i); ed.name = e.name.clone(); ed.host = e.host.clone(); ed.private_key_pem = e.private_key_pem.clone().unwrap_or_default(); ed.public_key_pem = e.public_key_pem.clone().unwrap_or_default(); ed.ssl_ca_pem = e.ssl_ca_pem.clone().unwrap_or_default(); ed.field_focus = EnvFieldFocus::Name; ed.name_cursor = ed.name.len(); ed.host_cursor = ed.host.len(); ed.private_key_cursor = ed.private_key_pem.len(); ed.public_key_cursor = ed.public_key_pem.len(); ed.ssl_ca_cursor = ed.ssl_ca_pem.len(); } } }
-                            }
-                        }
+                        
                         
                         (KeyCode::Char(ch), _) => {
-                            if app.show_env_modal {
-                                // Modal text input and commands
+                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
                                 if let Some(ed) = app.env_editor.as_mut() {
                                     match ed.field_focus {
                                         EnvFieldFocus::Name => { ed.name.insert(ed.name_cursor, ch); ed.name_cursor+=1; }
                                         EnvFieldFocus::Host => { ed.host.insert(ed.host_cursor, ch); ed.host_cursor+=1; }
-                                        EnvFieldFocus::PrivateKey => { ed.private_key_pem.insert(ed.private_key_cursor, ch); ed.private_key_cursor+=1; }
-                                        EnvFieldFocus::PublicKey => { ed.public_key_pem.insert(ed.public_key_cursor, ch); ed.public_key_cursor+=1; }
-                                        EnvFieldFocus::Ca => { ed.ssl_ca_pem.insert(ed.ssl_ca_cursor, ch); ed.ssl_ca_cursor+=1; }
-                                        EnvFieldFocus::Conn => {}
-                                        EnvFieldFocus::Buttons => {}
+                                        EnvFieldFocus::PrivateKey => { ed.ta_private.input(TAInput { key: TAKey::Char(ch), ctrl: false, alt: false, shift: false }); }
+                                        EnvFieldFocus::PublicKey => { ed.ta_public.input(TAInput { key: TAKey::Char(ch), ctrl: false, alt: false, shift: false }); }
+                                        EnvFieldFocus::Ca => { ed.ta_ca.input(TAInput { key: TAKey::Char(ch), ctrl: false, alt: false, shift: false }); }
+                                        _ => {}
                                     }
                                 }
                                 continue;
@@ -386,46 +430,52 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             if app.show_env_modal { app.show_env_modal = false; }
                             else if matches!(app.focus, super::app::Focus::Query) { app.input.clear(); }
                         }
-                        // Navigation: results or env list
+                        // Navigation: results or env list / textareas
                         (KeyCode::Up, _) => {
-                            if app.show_env_modal {
-                                if let Some(sel) = app.env_store.selected { if sel > 0 { app.env_store.selected = Some(sel - 1); } }
-                                else if !app.env_store.envs.is_empty() { app.env_store.selected = Some(0); }
-                                if let Some(i) = app.env_store.selected { if let Some(e) = app.env_store.envs.get(i) { if let Some(ed) = app.env_editor.as_mut() { ed.idx = Some(i); ed.name = e.name.clone(); ed.host = e.host.clone(); ed.private_key_pem = e.private_key_pem.clone().unwrap_or_default(); ed.public_key_pem = e.public_key_pem.clone().unwrap_or_default(); ed.ssl_ca_pem = e.ssl_ca_pem.clone().unwrap_or_default(); } } }
+                            if matches!(app.screen, Screen::Envs) {
+                                if let Some(ed) = app.env_editor.as_mut() {
+                                    match ed.field_focus {
+                                        EnvFieldFocus::PrivateKey => { ed.ta_private.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::PublicKey => { ed.ta_public.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::Ca => { ed.ta_ca.input(ta_input_from_key(key)); }
+                                        _ => {
+                                            if let Some(sel) = app.env_store.selected { if sel > 0 { app.env_store.selected = Some(sel - 1); } }
+                                            else if !app.env_store.envs.is_empty() { app.env_store.selected = Some(0); }
+                                            if let Some(i) = app.env_store.selected { if let Some(e) = app.env_store.envs.get(i) { ed.idx = Some(i); ed.name = e.name.clone(); ed.host = e.host.clone(); ed.ta_private = TextArea::from(e.private_key_pem.clone().unwrap_or_default().lines()); ed.ta_public = TextArea::from(e.public_key_pem.clone().unwrap_or_default().lines()); ed.ta_ca = TextArea::from(e.ssl_ca_pem.clone().unwrap_or_default().lines()); } }
+                                        }
+                                    }
+                                }
                             } else if matches!(app.focus, super::app::Focus::Results) { if app.selected_row > 0 { app.selected_row -= 1; app.json_vscroll = 0; } }
                             else if matches!(app.focus, super::app::Focus::Query) { move_cursor_up(&mut app); }
                         }
                         (KeyCode::Down, _) => {
-                            if app.show_env_modal {
-                                if let Some(sel) = app.env_store.selected { if sel + 1 < app.env_store.envs.len() { app.env_store.selected = Some(sel + 1); } }
-                                else if !app.env_store.envs.is_empty() { app.env_store.selected = Some(0); }
-                                if let Some(i) = app.env_store.selected { if let Some(e) = app.env_store.envs.get(i) { if let Some(ed) = app.env_editor.as_mut() { ed.idx = Some(i); ed.name = e.name.clone(); ed.host = e.host.clone(); ed.private_key_pem = e.private_key_pem.clone().unwrap_or_default(); ed.public_key_pem = e.public_key_pem.clone().unwrap_or_default(); ed.ssl_ca_pem = e.ssl_ca_pem.clone().unwrap_or_default(); } } }
+                            if matches!(app.screen, Screen::Envs) {
+                                if let Some(ed) = app.env_editor.as_mut() {
+                                    match ed.field_focus {
+                                        EnvFieldFocus::PrivateKey => { ed.ta_private.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::PublicKey => { ed.ta_public.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::Ca => { ed.ta_ca.input(ta_input_from_key(key)); }
+                                        _ => {
+                                            if let Some(sel) = app.env_store.selected { if sel + 1 < app.env_store.envs.len() { app.env_store.selected = Some(sel + 1); } }
+                                            else if !app.env_store.envs.is_empty() { app.env_store.selected = Some(0); }
+                                            if let Some(i) = app.env_store.selected { if let Some(e) = app.env_store.envs.get(i) { ed.idx = Some(i); ed.name = e.name.clone(); ed.host = e.host.clone(); ed.ta_private = TextArea::from(e.private_key_pem.clone().unwrap_or_default().lines()); ed.ta_public = TextArea::from(e.public_key_pem.clone().unwrap_or_default().lines()); ed.ta_ca = TextArea::from(e.ssl_ca_pem.clone().unwrap_or_default().lines()); } }
+                                        }
+                                    }
+                                }
                             } else if matches!(app.focus, super::app::Focus::Results) { if app.selected_row + 1 < app.rows.len() { app.selected_row += 1; app.json_vscroll = 0; } }
                             else if matches!(app.focus, super::app::Focus::Query) { move_cursor_down(&mut app); }
                         }
-                        (KeyCode::Left, KeyModifiers::SHIFT) => {
-                            if app.show_env_modal {
-                                if let Some(ed) = app.env_editor.as_mut() {
-                                    match ed.field_focus { EnvFieldFocus::PrivateKey => { ed.private_key_hscroll = ed.private_key_hscroll.saturating_sub(2); }, EnvFieldFocus::PublicKey => { ed.public_key_hscroll = ed.public_key_hscroll.saturating_sub(2); }, EnvFieldFocus::Ca => { ed.ca_hscroll = ed.ca_hscroll.saturating_sub(2); }, _ => {} }
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Results) { app.table_hscroll = app.table_hscroll.saturating_sub(2); }
-                        }
-                        (KeyCode::Right, KeyModifiers::SHIFT) => {
-                            if app.show_env_modal {
-                                if let Some(ed) = app.env_editor.as_mut() {
-                                    match ed.field_focus { EnvFieldFocus::PrivateKey => { ed.private_key_hscroll = ed.private_key_hscroll.saturating_add(2); }, EnvFieldFocus::PublicKey => { ed.public_key_hscroll = ed.public_key_hscroll.saturating_add(2); }, EnvFieldFocus::Ca => { ed.ca_hscroll = ed.ca_hscroll.saturating_add(2); }, _ => {} }
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Results) { app.table_hscroll = app.table_hscroll.saturating_add(2); }
-                        }
+                        (KeyCode::Left, KeyModifiers::SHIFT) => { if matches!(app.focus, super::app::Focus::Results) { app.table_hscroll = app.table_hscroll.saturating_sub(2); } }
+                        (KeyCode::Right, KeyModifiers::SHIFT) => { if matches!(app.focus, super::app::Focus::Results) { app.table_hscroll = app.table_hscroll.saturating_add(2); } }
                         (KeyCode::Left, _) => {
-                            if app.show_env_modal {
+                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
                                 if let Some(ed) = app.env_editor.as_mut() {
                                     match ed.field_focus {
                                         EnvFieldFocus::Name => { if ed.name_cursor>0 { ed.name_cursor-=1; } }
                                         EnvFieldFocus::Host => { if ed.host_cursor>0 { ed.host_cursor-=1; } }
-                                        EnvFieldFocus::PrivateKey => { if ed.private_key_cursor>0 { ed.private_key_cursor-=1; } }
-                                        EnvFieldFocus::PublicKey => { if ed.public_key_cursor>0 { ed.public_key_cursor-=1; } }
-                                        EnvFieldFocus::Ca => { if ed.ssl_ca_cursor>0 { ed.ssl_ca_cursor-=1; } }
+                                        EnvFieldFocus::PrivateKey => { ed.ta_private.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::PublicKey => { ed.ta_public.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::Ca => { ed.ta_ca.input(ta_input_from_key(key)); }
                                         EnvFieldFocus::Conn => {}
                                         EnvFieldFocus::Buttons => {}
                                     }
@@ -438,14 +488,14 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             }
                         }
                         (KeyCode::Right, _) => {
-                            if app.show_env_modal {
+                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
                                 if let Some(ed) = app.env_editor.as_mut() {
                                     match ed.field_focus {
                                         EnvFieldFocus::Name => { if ed.name_cursor<ed.name.len(){ ed.name_cursor+=1; } }
                                         EnvFieldFocus::Host => { if ed.host_cursor<ed.host.len(){ ed.host_cursor+=1; } }
-                                        EnvFieldFocus::PrivateKey => { if ed.private_key_cursor<ed.private_key_pem.len(){ ed.private_key_cursor+=1; } }
-                                        EnvFieldFocus::PublicKey => { if ed.public_key_cursor<ed.public_key_pem.len(){ ed.public_key_cursor+=1; } }
-                                        EnvFieldFocus::Ca => { if ed.ssl_ca_cursor<ed.ssl_ca_pem.len(){ ed.ssl_ca_cursor+=1; } }
+                                        EnvFieldFocus::PrivateKey => { ed.ta_private.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::PublicKey => { ed.ta_public.input(ta_input_from_key(key)); }
+                                        EnvFieldFocus::Ca => { ed.ta_ca.input(ta_input_from_key(key)); }
                                         EnvFieldFocus::Conn => {}
                                         EnvFieldFocus::Buttons => {}
                                     }
@@ -465,15 +515,24 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     }
                 }
                 Event::Mouse(me) => {
+                    // Also route to textareas in Envs screen for scroll/paste-like mouse actions
+                    if matches!(app.screen, Screen::Envs) {
+                        if let Some(ed) = app.env_editor.as_mut() {
+                            let inp = ta_input_from_mouse(me);
+                            ed.ta_private.input(inp.clone());
+                            ed.ta_public.input(inp.clone());
+                            ed.ta_ca.input(inp);
+                        }
+                    }
                     handle_mouse(&mut app, me);
                 }
                 Event::Paste(s) => {
                     if app.show_env_modal {
                         if let Some(ed) = app.env_editor.as_mut() {
                             match ed.field_focus {
-                                EnvFieldFocus::PrivateKey => { for ch in s.chars() { ed.private_key_pem.insert(ed.private_key_cursor, ch); ed.private_key_cursor+=1; } }
-                                EnvFieldFocus::PublicKey => { for ch in s.chars() { ed.public_key_pem.insert(ed.public_key_cursor, ch); ed.public_key_cursor+=1; } }
-                                EnvFieldFocus::Ca => { for ch in s.chars() { ed.ssl_ca_pem.insert(ed.ssl_ca_cursor, ch); ed.ssl_ca_cursor+=1; } }
+                                EnvFieldFocus::PrivateKey => { for ch in s.chars() { ed.ta_private.input(TAInput { key: TAKey::Char(ch), ctrl: false, alt: false, shift: false }); } }
+                                EnvFieldFocus::PublicKey => { for ch in s.chars() { ed.ta_public.input(TAInput { key: TAKey::Char(ch), ctrl: false, alt: false, shift: false }); } }
+                                EnvFieldFocus::Ca => { for ch in s.chars() { ed.ta_ca.input(TAInput { key: TAKey::Char(ch), ctrl: false, alt: false, shift: false }); } }
                                 EnvFieldFocus::Name => { for ch in s.chars() { ed.name.insert(ed.name_cursor, ch); ed.name_cursor+=1; } }
                                 EnvFieldFocus::Host => { for ch in s.chars() { ed.host.insert(ed.host_cursor, ch); ed.host_cursor+=1; } }
                                 _ => {}
@@ -555,8 +614,14 @@ async fn run_pipeline_with_ssl(args: RunArgs, query_text: String, run_id: u64, t
             if let Some(ref s) = ssl.key_pem { cfg.set("ssl.key.pem", s); }
         }
     }
-    let probe_consumer: StreamConsumer = cfg
-        .create()
+    struct QuietContext;
+    impl ClientContext for QuietContext {
+        fn log(&self, _level: RDKafkaLogLevel, _fac: &str, _log_message: &str) {}
+    }
+    impl ConsumerContext for QuietContext {}
+
+    let probe_consumer: StreamConsumer<QuietContext> = cfg
+        .create_with_context(QuietContext)
         .context("Failed to create probe consumer")?;
 
     let metadata = probe_consumer
@@ -645,10 +710,7 @@ fn logs_dir() -> std::path::PathBuf {
 
 fn append_test_log_line(line: &str) {
     let dir = logs_dir();
-    if let Err(e) = fs::create_dir_all(&dir) {
-        eprintln!("[rkl] failed to create logs dir {:?}: {}", dir, e);
-        return;
-    }
+    let _ = fs::create_dir_all(&dir);
     let fpath = dir.join("test-connection.out");
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&fpath) {
         let ts = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| "".into());
@@ -698,18 +760,21 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(8),
-            Constraint::Length(1),
+            Constraint::Length(10),
             Constraint::Fill(1),
             Constraint::Length(3),
         ])
         .split(root);
     let query_area = rows[1];
+    // Split row into editor and status
+    let cols = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(68), Constraint::Percentage(32)]).split(query_area);
+    let status_rect = cols[1];
+    let status_inner = Rect { x: status_rect.x.saturating_add(1), y: status_rect.y.saturating_add(1), width: status_rect.width.saturating_sub(2), height: status_rect.height.saturating_sub(2) };
     // Derive editor inner & content rects (gutter width 6, border 1)
     let q_inner = Rect { x: query_area.x.saturating_add(1), y: query_area.y.saturating_add(1), width: query_area.width.saturating_sub(2), height: query_area.height.saturating_sub(2) };
     let q_cols = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(6), Constraint::Min(1)]).split(q_inner);
     let _q_gutter = q_cols[0]; let q_content = q_cols[1];
-    let results_area = rows[3];
+    let results_area = rows[2];
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
@@ -783,11 +848,28 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
                     false
                 };
                 if let Some(ed) = app.env_editor.as_ref() {
-                    if maybe_copy_field(fields[2], &ed.private_key_pem) { return; }
-                    if maybe_copy_field(fields[3], &ed.public_key_pem) { return; }
-                    if maybe_copy_field(fields[4], &ed.ssl_ca_pem) { return; }
+                    let pk = ed.ta_private.lines().join("\n");
+                    let cert = ed.ta_public.lines().join("\n");
+                    let ca = ed.ta_ca.lines().join("\n");
+                    if maybe_copy_field(fields[2], &pk) { return; }
+                    if maybe_copy_field(fields[3], &cert) { return; }
+                    if maybe_copy_field(fields[4], &ca) { return; }
                 }
             }
+            // Status copy button click
+            {
+                let label = "[ Copy ]";
+                let btn_w = label.chars().count() as u16;
+                if status_inner.width >= btn_w {
+                    let btn_rect = Rect { x: status_inner.x + status_inner.width - btn_w, y: status_inner.y, width: btn_w, height: 1 };
+                    if point_in(mx, my, btn_rect) {
+                        let text = if app.status_buffer.is_empty() { app.status.clone() } else { app.status_buffer.clone() };
+                        if !text.trim().is_empty() { let _ = copy_to_clipboard(&text); app.copy_btn_pressed = true; app.copy_btn_deadline = Some(Instant::now() + Duration::from_millis(150)); }
+                        return;
+                    }
+                }
+            }
+
             if point_in(mx, my, q_content) {
                 // Position cursor by click
                 let y_rel = my.saturating_sub(q_content.y) as usize;
@@ -860,9 +942,11 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
                 let cols2 = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(30), Constraint::Percentage(70)]).margin(1).split(area);
                 let fields = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Min(5), Constraint::Min(5), Constraint::Min(5), Constraint::Length(3), Constraint::Length(3)]).split(cols2[1]);
                 if let Some(ed) = app.env_editor.as_mut() {
-                    if point_in(mx, my, fields[2]) { ed.private_key_vscroll = ed.private_key_vscroll.saturating_sub(1); return; }
-                    if point_in(mx, my, fields[3]) { ed.public_key_vscroll = ed.public_key_vscroll.saturating_sub(1); return; }
-                    if point_in(mx, my, fields[4]) { ed.ca_vscroll = ed.ca_vscroll.saturating_sub(1); return; }
+                    // route scroll to textareas
+                    let inp = ta_input_from_mouse(me);
+                    ed.ta_private.input(inp.clone());
+                    ed.ta_public.input(inp.clone());
+                    ed.ta_ca.input(inp);
                 }
                 if point_in(mx, my, fields[6]) { app.env_conn_vscroll = app.env_conn_vscroll.saturating_sub(1); return; }
             }
@@ -883,9 +967,10 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
                 let cols2 = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(30), Constraint::Percentage(70)]).margin(1).split(area);
                 let fields = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Min(5), Constraint::Min(5), Constraint::Min(5), Constraint::Length(3), Constraint::Length(3)]).split(cols2[1]);
                 if let Some(ed) = app.env_editor.as_mut() {
-                    if point_in(mx, my, fields[2]) { ed.private_key_vscroll = ed.private_key_vscroll.saturating_add(1); return; }
-                    if point_in(mx, my, fields[3]) { ed.public_key_vscroll = ed.public_key_vscroll.saturating_add(1); return; }
-                    if point_in(mx, my, fields[4]) { ed.ca_vscroll = ed.ca_vscroll.saturating_add(1); return; }
+                    let inp = ta_input_from_mouse(me);
+                    ed.ta_private.input(inp.clone());
+                    ed.ta_public.input(inp.clone());
+                    ed.ta_ca.input(inp);
                 }
                 if point_in(mx, my, fields[6]) { app.env_conn_vscroll = app.env_conn_vscroll.saturating_add(1); return; }
             }
@@ -910,6 +995,106 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
         _ => {}
     }
 }
+
+fn fetch_topics_async(app: &AppState, tx: mpsc::UnboundedSender<TuiEvent>) {
+    let host = app.selected_env().map(|e| e.host.clone()).unwrap_or_else(|| app.host.clone());
+    let ssl = app.current_ssl_config();
+    tokio::spawn(async move {
+        let mut cfg = ClientConfig::new();
+        cfg
+            .set("bootstrap.servers", &host)
+            .set("group.id", format!("rkl-list-{}", uuid::Uuid::new_v4()))
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .set("enable.partition.eof", "true");
+        if let Some(ssl) = &ssl {
+            if ssl.ca_pem.is_some() || ssl.cert_pem.is_some() || ssl.key_pem.is_some() {
+                cfg.set("security.protocol", "ssl");
+                if let Some(ref s) = ssl.ca_pem { cfg.set("ssl.ca.pem", s); }
+                if let Some(ref s) = ssl.cert_pem { cfg.set("ssl.certificate.pem", s); }
+                if let Some(ref s) = ssl.key_pem { cfg.set("ssl.key.pem", s); }
+            }
+        }
+        let list = async {
+            struct QuietContext;
+            impl ClientContext for QuietContext {
+                fn log(&self, _level: RDKafkaLogLevel, _fac: &str, _log_message: &str) {}
+            }
+            impl ConsumerContext for QuietContext {}
+            let c: StreamConsumer<QuietContext> = cfg.create_with_context(QuietContext).context("create consumer")?;
+            let md = c.fetch_metadata(None, std::time::Duration::from_secs(10)).context("fetch metadata")?;
+            let mut names: Vec<String> = md.topics().iter().map(|t| t.name().to_string()).collect();
+            names.sort();
+            Ok::<_, anyhow::Error>(names)
+        }.await;
+        match list {
+            Ok(v) => { let _ = tx.send(TuiEvent::Topics(v)); }
+            Err(e) => { let _ = tx.send(TuiEvent::Topics(vec![format!("Error: {}", e)])); }
+        }
+    });
+}
+
+fn ta_input_from_key(key: KeyEvent) -> TAInput {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let tkey = match key.code {
+        KeyCode::Char(c) => TAKey::Char(c),
+        KeyCode::Enter => TAKey::Enter,
+        KeyCode::Backspace => TAKey::Backspace,
+        KeyCode::Delete => TAKey::Delete,
+        KeyCode::Left => TAKey::Left,
+        KeyCode::Right => TAKey::Right,
+        KeyCode::Up => TAKey::Up,
+        KeyCode::Down => TAKey::Down,
+        KeyCode::Home => TAKey::Home,
+        KeyCode::End => TAKey::End,
+        KeyCode::PageUp => TAKey::PageUp,
+        KeyCode::PageDown => TAKey::PageDown,
+        KeyCode::Tab => TAKey::Tab,
+        _ => TAKey::Null,
+    };
+    TAInput { key: tkey, ctrl, alt, shift }
+}
+
+fn ta_input_from_mouse(me: MouseEvent) -> TAInput {
+    let ctrl = me.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = me.modifiers.contains(KeyModifiers::ALT);
+    let shift = me.modifiers.contains(KeyModifiers::SHIFT);
+    let tkey = match me.kind {
+        MouseEventKind::ScrollUp => TAKey::MouseScrollUp,
+        MouseEventKind::ScrollDown => TAKey::MouseScrollDown,
+        _ => TAKey::Null,
+    };
+    TAInput { key: tkey, ctrl, alt, shift }
+}
+
+#[cfg(unix)]
+struct StdioRedirectGuard { orig_out: i32, orig_err: i32 }
+#[cfg(unix)]
+impl Drop for StdioRedirectGuard { fn drop(&mut self) { unsafe {
+    libc::fflush(std::ptr::null_mut());
+    libc::dup2(self.orig_out, libc::STDOUT_FILENO);
+    libc::dup2(self.orig_err, libc::STDERR_FILENO);
+    libc::close(self.orig_out);
+    libc::close(self.orig_err);
+} } }
+
+#[cfg(unix)]
+fn redirect_stdio_to_file(path: &std::path::Path) -> std::io::Result<StdioRedirectGuard> {
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    unsafe {
+        libc::fflush(std::ptr::null_mut());
+        let orig_out = libc::dup(libc::STDOUT_FILENO);
+        let orig_err = libc::dup(libc::STDERR_FILENO);
+        libc::dup2(file.as_raw_fd(), libc::STDOUT_FILENO);
+        libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+        Ok(StdioRedirectGuard { orig_out, orig_err })
+    }
+}
+
+#[cfg(not(unix))]
+fn redirect_stdio_to_file(_path: &std::path::Path) -> std::io::Result<()> { Ok(()) }
 
 fn point_in(x: u16, y: u16, r: Rect) -> bool {
     x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)

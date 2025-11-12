@@ -1,6 +1,7 @@
 use crate::models::{MessageEnvelope, SslConfig};
 use super::env_store::{EnvStore, Environment};
 use std::time::Instant;
+use tui_textarea::TextArea;
 
 #[derive(Default)]
 pub struct AppState {
@@ -8,6 +9,8 @@ pub struct AppState {
     pub input_cursor: usize,
     pub input_vscroll: u16,
     pub status: String,
+    pub status_buffer: String,
+    pub status_vscroll: u16,
     pub rows: Vec<MessageEnvelope>,
     pub keys_only: bool,
     pub current_run: Option<u64>,
@@ -30,6 +33,11 @@ pub struct AppState {
     pub env_test_message: Option<String>,
     pub env_conn_vscroll: u16,
     pub mouse_selection_mode: bool,
+    // Screens
+    pub screen: Screen,
+    pub show_help: bool,
+    // Info screen
+    pub topics: Vec<String>,
 }
 
 impl AppState {
@@ -44,7 +52,9 @@ impl AppState {
             input: initial_input.clone(),
             input_cursor: initial_input.len(),
             input_vscroll: 0,
-            status: String::from("Enter a query and press Enter"),
+            status: String::from("Enter a query and press Ctrl-Enter to run"),
+            status_buffer: String::new(),
+            status_vscroll: 0,
             rows: Vec::new(),
             keys_only: false,
             current_run: None,
@@ -65,6 +75,9 @@ impl AppState {
             env_test_message: None,
             env_conn_vscroll: 0,
             mouse_selection_mode: false,
+            screen: Screen::Home,
+            show_help: false,
+            topics: Vec::new(),
         }
     }
 
@@ -92,6 +105,7 @@ pub enum TuiEvent {
     Error { run_id: u64, message: String },
     EnvTestProgress { message: String },
     EnvTestDone { message: String },
+    Topics(Vec<String>),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -122,10 +136,14 @@ impl AppState {
         self.env_store.selected.and_then(|i| self.env_store.envs.get(i))
     }
     pub fn current_ssl_config(&self) -> Option<SslConfig> {
-        self.selected_env().map(|e| SslConfig {
-            ca_pem: e.ssl_ca_pem.clone(),
-            cert_pem: e.public_key_pem.clone(),
-            key_pem: e.private_key_pem.clone(),
+        self.selected_env().map(|e| {
+            // Ensure we pass actual newlines to librdkafka
+            let decode = |s: &Option<String>| s.as_ref().map(|v| v.replace("\\n", "\n"));
+            SslConfig {
+                ca_pem: decode(&e.ssl_ca_pem),
+                cert_pem: decode(&e.public_key_pem),
+                key_pem: decode(&e.private_key_pem),
+            }
         })
     }
 }
@@ -137,19 +155,10 @@ pub struct EnvEditor {
     pub name_cursor: usize,
     pub host: String,
     pub host_cursor: usize,
-    pub private_key_pem: String,
-    pub private_key_cursor: usize,
-    pub public_key_pem: String,
-    pub public_key_cursor: usize,
-    pub ssl_ca_pem: String,
+    pub ta_private: TextArea<'static>,
+    pub ta_public: TextArea<'static>,
+    pub ta_ca: TextArea<'static>,
     pub ssl_ca_cursor: usize,
-    // Scroll positions for multi-line fields
-    pub private_key_vscroll: u16,
-    pub public_key_vscroll: u16,
-    pub ca_vscroll: u16,
-    pub private_key_hscroll: u16,
-    pub public_key_hscroll: u16,
-    pub ca_hscroll: u16,
     pub field_focus: EnvFieldFocus,
 }
 
@@ -159,3 +168,14 @@ pub enum EnvFieldFocus { Name, Host, PrivateKey, PublicKey, Ca, Conn, Buttons }
 #[allow(dead_code)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum CaInputMode { Pem, Location }
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Screen {
+    Home,
+    Envs,
+    Info,
+}
+
+impl Default for Screen {
+    fn default() -> Self { Screen::Home }
+}

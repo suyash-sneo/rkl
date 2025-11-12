@@ -8,42 +8,69 @@ use ratatui::widgets::{
     Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 
-use super::app::{AppState, Focus, EnvFieldFocus};
+use super::app::{AppState, Focus, EnvFieldFocus, Screen};
 
 pub(super) const COPY_BTN_LABEL: &str = "[ Copy ]";
 
 pub fn draw(frame: &mut Frame, app: &AppState) {
-    let size = frame.size();
+    let size = frame.area();
+    match app.screen {
+        Screen::Home => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),   // env bar
+                    Constraint::Length(10),  // editor + status
+                    Constraint::Fill(1),     // results
+                    Constraint::Length(3),   // footer
+                ])
+                .split(size);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),   // host input
-            Constraint::Length(8),   // query input (taller, multiline)
-            Constraint::Length(1),   // status
-            Constraint::Fill(1),     // table grows to fill available space
-            Constraint::Length(3),   // footer (needs 3: top+content+bottom)
-        ])
-        .split(size);
+            draw_env_bar(frame, chunks[0], app);
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+                .split(chunks[1]);
+            draw_input(frame, cols[0], app);
+            draw_status_panel(frame, cols[1], app);
+            draw_results(frame, chunks[2], app);
+            draw_footer(frame, chunks[3], app);
+        }
+        Screen::Envs => {
+            // Full-screen environments UI
+            let block = Block::default()
+                .title("Environments (F8 Home  F2 Envs  F12 Info  F10 Help)")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan));
+            let area = block.inner(size);
+            frame.render_widget(block, size);
+            draw_env_modal(frame, area, app);
+        }
+        Screen::Info => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Fill(1),
+                    Constraint::Length(3),
+                ])
+                .split(size);
+            draw_env_bar(frame, chunks[0], app);
+            draw_topics(frame, chunks[1], app);
+            draw_footer(frame, chunks[2], app);
+        }
+    }
 
-    draw_env_bar(frame, chunks[0], app);
-    draw_input(frame, chunks[1], app);
-    draw_status(frame, chunks[2], &app.status);
-    draw_results(frame, chunks[3], app);
-    draw_footer(frame, chunks[4], app);
-    if app.show_env_modal {
-        let area = centered_rect(80, 80, size);
-        let block = Block::default().title("Environments").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan));
-        frame.render_widget(Clear, area);
-        frame.render_widget(block, area);
-        draw_env_modal(frame, area, app);
+    if app.show_help {
+        draw_help_overlay(frame, size);
     }
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
     let focused = app.focus == Focus::Query;
-    let title = if focused { "Query (Enter: Newline | Ctrl-Enter: Run current) [FOCUSED]" } else { "Query (Enter: Newline | Ctrl-Enter: Run current)" };
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let title = "Query (Enter newline, Ctrl-Enter run)";
+    let border_style = if focused { Style::default().fg(Color::LightCyan) } else { Style::default().fg(Color::DarkGray) };
+    let block = Block::default().borders(Borders::ALL).title(title).border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -131,14 +158,15 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
     // Position caret
     if focused {
         if let Some((cx, cy)) = caret_pos_multiline(content, text, app.input_cursor, app.input_vscroll) {
-            frame.set_cursor(cx, cy);
+            frame.set_cursor_position(Position::new(cx, cy));
         }
     }
 }
 
 fn draw_env_bar(frame: &mut Frame, area: Rect, app: &AppState) {
-    let title = if app.focus == Focus::Host { "Environment [Enter: manage] [FOCUSED]" } else { "Environment [Enter: manage]" };
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let title = "Environment (F2 to manage)";
+    let border_style = if app.focus == Focus::Host { Style::default().fg(Color::LightCyan) } else { Style::default().fg(Color::DarkGray) };
+    let block = Block::default().borders(Borders::ALL).title(title).border_style(border_style);
     let name = app.selected_env().map(|e| e.name.clone()).unwrap_or_else(|| "(none)".to_string());
     let host = app.selected_env().map(|e| e.host.clone()).unwrap_or_default();
     let content = format!("{name}  —  host: {host}");
@@ -146,10 +174,32 @@ fn draw_env_bar(frame: &mut Frame, area: Rect, app: &AppState) {
     frame.render_widget(para, area);
 }
 
-fn draw_status(frame: &mut Frame, area: Rect, status: &str) {
+fn draw_status_panel(frame: &mut Frame, area: Rect, app: &AppState) {
     let block = Block::default().borders(Borders::ALL).title("Status");
-    let para = Paragraph::new(status.to_string()).block(block);
-    frame.render_widget(para, area);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let text = if app.status_buffer.is_empty() { app.status.clone() } else { app.status_buffer.clone() };
+    let para = Paragraph::new(text.clone()).wrap(Wrap { trim: false }).scroll((app.status_vscroll, 0));
+    frame.render_widget(para, inner);
+
+    // Draw Copy button at top-right of inner area
+    let btn_w = COPY_BTN_LABEL.chars().count() as u16;
+    if inner.width >= btn_w {
+        let btn_x = inner.x + inner.width - btn_w;
+        let btn_rect = Rect { x: btn_x, y: inner.y, width: btn_w, height: 1 };
+        let style = if app.copy_btn_pressed { Style::default().fg(Color::Green).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Yellow) };
+        let btn = Paragraph::new(COPY_BTN_LABEL).style(style);
+        frame.render_widget(btn, btn_rect);
+    }
+
+    // Scrollbar
+    let total_lines = text.lines().count().max(1);
+    let vis = inner.height as usize;
+    if total_lines > vis {
+        let mut vs = ScrollbarState::new(total_lines).position(app.status_vscroll as usize);
+        let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(vbar, inner, &mut vs);
+    }
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -158,7 +208,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
     let cols = if app.keys_only { 4 } else { 5 };
     let col = if cols == 0 { 0 } else { app.selected_col + 1 };
     let legend = format!(
-        "Tab: Focus | Query: Enter newline, Ctrl-Enter run current | Results: arrows, Shift-←/→ h-scroll, Mouse | F5/C-y copy cell | Click [Copy] | Ctrl-Q/Ctrl-C: Quit | Row {row}/{total} Col {col}/{cols}"
+        "F8 Home  F2 Envs  F12 Info  F10 Help | Tab focus | Query: Enter newline, Ctrl-Enter run | Results: arrows, Shift-←/→ h-scroll | F5 copy payload | F7 copy status | Ctrl-Q/Ctrl-C quit | Row {row}/{total} Col {col}/{cols}"
     );
     let block = Block::default().borders(Borders::ALL).title("Help");
     let para = Paragraph::new(legend).block(block);
@@ -199,9 +249,7 @@ fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
 
     let name_val = ed.map(|e| e.name.clone()).unwrap_or_default();
     let host_val = ed.map(|e| e.host.clone()).unwrap_or_default();
-    let privk_val = ed.map(|e| e.private_key_pem.clone()).unwrap_or_default();
-    let pubk_val = ed.map(|e| e.public_key_pem.clone()).unwrap_or_default();
-    let ca_pem_val = ed.map(|e| e.ssl_ca_pem.clone()).unwrap_or_default();
+    // Values are drawn via TextAreas; no pre-rendered strings needed here.
 
     let title_name = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Name)) { "Name [FOCUSED]" } else { "Name" };
     let title_host = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Host)) { "Host [FOCUSED]" } else { "Host" };
@@ -214,21 +262,34 @@ fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
 
     frame.render_widget(Paragraph::new(name_val.clone()).block(Block::default().borders(Borders::ALL).title(title_name)), fields[0]);
     frame.render_widget(Paragraph::new(host_val.clone()).block(Block::default().borders(Borders::ALL).title(title_host)), fields[1]);
-    // Render multi-line fields with manual v/h scroll cropping (no wrapping)
-    render_scrolled_field(frame, fields[2], &title_pk, &privk_val, app.env_editor.as_ref().map(|e| e.private_key_vscroll).unwrap_or(0), app.env_editor.as_ref().map(|e| e.private_key_hscroll).unwrap_or(0));
-    render_scrolled_field(frame, fields[3], &title_cert, &pubk_val, app.env_editor.as_ref().map(|e| e.public_key_vscroll).unwrap_or(0), app.env_editor.as_ref().map(|e| e.public_key_hscroll).unwrap_or(0));
-    render_scrolled_field(frame, fields[4], &title_ca, &ca_pem_val, app.env_editor.as_ref().map(|e| e.ca_vscroll).unwrap_or(0), app.env_editor.as_ref().map(|e| e.ca_hscroll).unwrap_or(0));
+    // Render multi-line fields using tui-textarea
+    if let Some(edm) = app.env_editor.as_ref() {
+        // Draw outer blocks for titles and copy affordance
+        let block_pk = Block::default().borders(Borders::ALL).title(title_pk.clone());
+        let block_pub = Block::default().borders(Borders::ALL).title(title_cert.clone());
+        let block_ca = Block::default().borders(Borders::ALL).title(title_ca.clone());
+        let inner_pk = block_pk.inner(fields[2]);
+        let inner_pub = block_pub.inner(fields[3]);
+        let inner_ca = block_ca.inner(fields[4]);
+        frame.render_widget(block_pk, fields[2]);
+        frame.render_widget(block_pub, fields[3]);
+        frame.render_widget(block_ca, fields[4]);
+        frame.render_widget(&edm.ta_private, inner_pk);
+        frame.render_widget(&edm.ta_public, inner_pub);
+        frame.render_widget(&edm.ta_ca, inner_ca);
+    }
     if let Some(ed) = app.env_editor.as_ref() {
         let (x, y) = match ed.field_focus {
             super::app::EnvFieldFocus::Name => caret_pos_in(fields[0], &name_val, ed.name_cursor),
             super::app::EnvFieldFocus::Host => caret_pos_in(fields[1], &host_val, ed.host_cursor),
-            super::app::EnvFieldFocus::PrivateKey => caret_pos_in(fields[2], &privk_val, ed.private_key_cursor),
-            super::app::EnvFieldFocus::PublicKey => caret_pos_in(fields[3], &pubk_val, ed.public_key_cursor),
-            super::app::EnvFieldFocus::Ca => caret_pos_in_h(fields[4], &ca_pem_val, ed.ssl_ca_cursor, ed.ca_vscroll, ed.ca_hscroll),
+            // TextArea draws its own cursor; we skip frame.set_cursor for these
+            super::app::EnvFieldFocus::PrivateKey => (0,0),
+            super::app::EnvFieldFocus::PublicKey => (0,0),
+            super::app::EnvFieldFocus::Ca => (0,0),
             super::app::EnvFieldFocus::Conn => (0,0),
             super::app::EnvFieldFocus::Buttons => (0,0),
         };
-        if x > 0 || y > 0 { frame.set_cursor(x, y); }
+        if x > 0 || y > 0 { frame.set_cursor_position(Position::new(x, y)); }
     }
     let help = "F1 New | F2 Edit | F3 Delete | F4 Save | F5 Test | F6 Next | F7 Prev | F9 Mouse select on/off | Tab/Shift-Tab Move | Up/Down Select | Shift-←/→ H-scroll | Esc Close";
     frame.render_widget(Paragraph::new(help).block(Block::default().borders(Borders::ALL).title("Actions")), fields[5]);
@@ -275,40 +336,7 @@ fn caret_pos_in(area: Rect, text: &str, cursor: usize) -> (u16, u16) {
     (inner_x + col, inner_y + line)
 }
 
-fn caret_pos_in_h(area: Rect, text: &str, cursor: usize, vscroll: u16, hscroll: u16) -> (u16, u16) {
-    let inner_x = area.x.saturating_add(1);
-    let inner_y = area.y.saturating_add(1);
-    let max_w = area.width.saturating_sub(2) as usize;
-    let max_h = area.height.saturating_sub(2) as usize;
-    let (line, col) = line_col_at(text, cursor);
-    let vis_line = line.saturating_sub(vscroll as usize);
-    let vis_col = col.saturating_sub(hscroll as usize);
-    let y = inner_y + vis_line.min(max_h.saturating_sub(1)) as u16;
-    let x = inner_x + vis_col.min(max_w.saturating_sub(1)) as u16;
-    (x, y)
-}
-
-fn render_scrolled_field(frame: &mut Frame, area: Rect, title: &str, text: &str, vscroll: u16, hscroll: u16) {
-    let block = Block::default().borders(Borders::ALL).title(title.to_string());
-    frame.render_widget(block.clone(), area);
-    let inner = Rect { x: area.x.saturating_add(1), y: area.y.saturating_add(1), width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
-    let lines: Vec<Line> = crop_lines(text, vscroll as usize, hscroll as usize, inner.width as usize, inner.height as usize);
-    let para = Paragraph::new(Text::from(lines));
-    frame.render_widget(para, inner);
-}
-
-fn crop_lines(text: &str, vscroll: usize, hscroll: usize, max_w: usize, max_h: usize) -> Vec<Line<'static>> {
-    let mut out: Vec<Line> = Vec::new();
-    let mut _skipped = 0usize;
-    for (i, line) in text.split('\n').enumerate() {
-        if i < vscroll { _skipped += 1; continue; }
-        if out.len() >= max_h { break; }
-        let slice = if line.len() > hscroll { &line[hscroll.min(line.len())..] } else { "" };
-        let visible = if slice.len() > max_w { &slice[..max_w] } else { slice };
-        out.push(Line::from(visible.to_string()));
-    }
-    out
-}
+// Removed unused manual scrolled-field helpers in favor of tui-textarea
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
@@ -454,6 +482,34 @@ fn draw_results(frame: &mut Frame, area: Rect, app: &AppState) {
     draw_json_detail(frame, cols[1], app);
 }
 
+fn draw_topics(frame: &mut Frame, area: Rect, app: &AppState) {
+    let items: Vec<ListItem> = if app.topics.is_empty() {
+        vec![ListItem::new("No topics loaded. Press F6 to refresh.")]
+    } else {
+        app.topics.iter().map(|t| ListItem::new(t.clone())).collect()
+    };
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Topics"));
+    frame.render_widget(list, area);
+}
+
+fn draw_help_overlay(frame: &mut Frame, area: Rect) {
+    let popup = centered_rect(70, 70, area);
+    frame.render_widget(Clear, popup);
+    let help = vec![
+        Line::from("F8 Home  F2 Envs  F12 Info  F10 Help"),
+        Line::from("Ctrl-Q/Ctrl-C Quit"),
+        Line::from("Home: Ctrl-Enter run; arrows move; F5 copy payload; F7 copy status; Shift-←/→ h-scroll"),
+        Line::from("Envs: F4 Save  F3 Delete  F1 New  F5 Test  Up/Down select  Tab next field"),
+        Line::from("Info: F6 Refresh topics"),
+    ];
+    let block = Block::default().borders(Borders::ALL).title("Help").border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let para = Paragraph::new(Text::from(help)).wrap(Wrap { trim: false });
+    frame.render_widget(para, inner);
+}
+
 fn draw_table(frame: &mut Frame, area: Rect, app: &AppState) {
     let headers = if app.keys_only {
         vec![
@@ -499,8 +555,11 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &AppState) {
 
     let table = Table::new(rows, constraints)
         .header(Row::new(headers).style(Style::default().add_modifier(Modifier::BOLD)))
-        .block(Block::default().borders(Borders::ALL).title(match app.focus { Focus::Results => "Results [FOCUSED]", _ => "Results" }))
-        .highlight_style(Style::default())
+        .block({
+            let border_style = if app.focus == Focus::Results { Style::default().fg(Color::LightCyan) } else { Style::default().fg(Color::DarkGray) };
+            Block::default().borders(Borders::ALL).title("Results").border_style(border_style)
+        })
+        .row_highlight_style(Style::default())
         .column_spacing(1);
 
     let mut state = TableState::default();
