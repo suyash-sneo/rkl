@@ -7,9 +7,9 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::topic_partition_list::TopicPartitionList;
 use serde_json::Value;
+use std::io::Write as _;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
-use std::io::Write as _;
 
 pub async fn spawn_partition_consumer(
     args: RunArgs,
@@ -23,8 +23,7 @@ pub async fn spawn_partition_consumer(
     let group_id = format!("rkl-{}-p{}", uuid::Uuid::new_v4(), partition);
 
     let mut cfg = ClientConfig::new();
-    cfg
-        .set("bootstrap.servers", &args.broker)
+    cfg.set("bootstrap.servers", &args.broker)
         .set("group.id", group_id)
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
@@ -32,14 +31,18 @@ pub async fn spawn_partition_consumer(
     if let Some(ssl) = &ssl {
         if ssl.ca_pem.is_some() || ssl.cert_pem.is_some() || ssl.key_pem.is_some() {
             cfg.set("security.protocol", "ssl");
-            if let Some(ref s) = ssl.ca_pem { cfg.set("ssl.ca.pem", s); }
-            if let Some(ref s) = ssl.cert_pem { cfg.set("ssl.certificate.pem", s); }
-            if let Some(ref s) = ssl.key_pem { cfg.set("ssl.key.pem", s); }
+            if let Some(ref s) = ssl.ca_pem {
+                cfg.set("ssl.ca.pem", s);
+            }
+            if let Some(ref s) = ssl.cert_pem {
+                cfg.set("ssl.certificate.pem", s);
+            }
+            if let Some(ref s) = ssl.key_pem {
+                cfg.set("ssl.key.pem", s);
+            }
         }
     }
-    let consumer: StreamConsumer = cfg
-        .create()
-        .context("Failed to create consumer")?;
+    let consumer: StreamConsumer = cfg.create().context("Failed to create consumer")?;
 
     // Manual assignment to this specific partition + offset
     let mut tpl = TopicPartitionList::new();
@@ -83,7 +86,12 @@ pub async fn spawn_partition_consumer(
                 // Apply query WHERE if provided; else fallback to simple --search
                 let matches = if let Some(ref q) = query {
                     if let Some(ref expr) = q.r#where {
-                        expr.matches(&key, &payload_json, msg.timestamp().to_millis().unwrap_or(0))
+                        expr.matches(
+                            &key,
+                            &payload_json,
+                            payload_str.as_deref(),
+                            msg.timestamp().to_millis().unwrap_or(0),
+                        )
                     } else {
                         true
                     }
@@ -134,10 +142,19 @@ pub async fn spawn_partition_consumer(
             Err(e) => {
                 // Log errors to ~/.rkl/logs instead of printing over the TUI
                 if let Some(home) = std::env::var_os("HOME") {
-                    let path = std::path::PathBuf::from(home).join(".rkl").join("logs").join("consumer.err.log");
+                    let path = std::path::PathBuf::from(home)
+                        .join(".rkl")
+                        .join("logs")
+                        .join("consumer.err.log");
                     let _ = std::fs::create_dir_all(path.parent().unwrap());
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                        let ts = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| "".into());
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        let ts = time::OffsetDateTime::now_utc()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_else(|_| "".into());
                         let _ = writeln!(f, "{} [partition {}] {}", ts, partition, e);
                     }
                 }

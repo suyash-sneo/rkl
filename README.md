@@ -61,15 +61,41 @@ Env TUI with:
 For testing locally with mTLS, see `local-test/README.md`.
 
 
-# Test queries:
+# Query examples
 
-```rkl
-SELECT key, value FROM random-data LIMIT 5
+These examples exercise the WHERE clause features (parentheses, AND/OR precedence, =, !=/<> and CONTAINS) against the realistic payloads produced by `local-test/producer.py` into the `random-data` topic. Each message looks roughly like:
+
+```
+{
+  "meta": { "id": "<uuid>", "timestamp": <ms>, "service": "auth|orders|billing|catalog|search", "env": "prod|staging", "region": "us-east-1|eu-west-1|ap-south-1" },
+  "request": { "method": "GET|POST|PUT|DELETE", "path": "/api/v1/..." },
+  "response": { "status": <int>, "duration_ms": <int>, "size_bytes": <int>, "msg": "ok|...error..." },
+  "user": { "id": "<uuid>", "role": "admin|customer|service", "country": "US|DE|IN|GB|BR" },
+  "event": { "type": "login|purchase|logout|password_reset|view", "success": <bool> }
+}
 ```
 
-```rkl
-SELECT key, value FROM random-data WHERE value->data->field3 = false LIMIT 5
-```
+- Basic listing
+  - `SELECT key, value FROM random-data LIMIT 5`
+
+- JSON path equality/inequality
+  - `SELECT key, value FROM random-data WHERE value->request->method = 'PUT'`
+  - `SELECT key, value FROM random-data WHERE value->request->method != 'GET'`
+  - `SELECT key, value FROM random-data WHERE value->response->status <> 200`
+  - `SELECT key, value FROM random-data WHERE value->event->type = 'purchase' AND value->event->success = true`
+
+- CONTAINS on key/value and nested fields (case-sensitive substring)
+  - `SELECT key, value FROM random-data WHERE key CONTAINS 'auth-prod'`  -- keys look like `service-env-region:<user8>`
+  - `SELECT key, value FROM random-data WHERE value CONTAINS 'error'`
+  - `SELECT key, value FROM random-data WHERE value->response->msg CONTAINS 'error'`
+
+- Parentheses and precedence (AND > OR)
+  - `SELECT key, value FROM random-data WHERE (value->meta->service = 'orders' OR value->meta->service = 'billing') AND value->request->method <> 'GET'`
+  - `SELECT key, value FROM random-data WHERE value->response->msg CONTAINS 'error' OR (value->event->type = 'purchase' AND value->response->status = 200)`
+
+- ORDER/LIMIT examples
+  - `SELECT key FROM random-data ORDER BY timestamp DESC LIMIT 20`
+  - `SELECT key, value FROM random-data WHERE value->response->status >= 500 ORDER BY timestamp ASC LIMIT 10`  (note: ORDER BY timestamp only; comparison shown for illustration)
 
 # Tests 
 

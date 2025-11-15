@@ -4,11 +4,11 @@ use ratatui::prelude::*;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Table, TableState, List, ListItem, Clear,
-    Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table, TableState, Wrap,
 };
 
-use super::app::{AppState, Focus, EnvFieldFocus, Screen};
+use super::app::{AppState, EnvFieldFocus, Focus, Screen};
 
 pub(super) const COPY_BTN_LABEL: &str = "[ Copy ]";
 
@@ -19,10 +19,10 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),   // env bar
-                    Constraint::Length(10),  // editor + status
-                    Constraint::Fill(1),     // results
-                    Constraint::Length(3),   // footer
+                    Constraint::Length(3),  // env bar
+                    Constraint::Length(10), // editor + status
+                    Constraint::Fill(1),    // results
+                    Constraint::Length(3),  // footer
                 ])
                 .split(size);
 
@@ -69,8 +69,15 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
 fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
     let focused = app.focus == Focus::Query;
     let title = "Query (Enter newline, Ctrl-Enter run)";
-    let border_style = if focused { Style::default().fg(Color::LightCyan) } else { Style::default().fg(Color::DarkGray) };
-    let block = Block::default().borders(Borders::ALL).title(title).border_style(border_style);
+    let border_style = if focused {
+        Style::default().fg(Color::LightCyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -81,7 +88,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
     let lines: Vec<&str> = text.split('\n').collect();
     let max_lineno_digits = lines.len().max(1).to_string().len() as u16;
     let marker_max = 2u16; // e.g., "➤▶" can take two cells
-    let gap = 1u16;        // fixed one-space gap to content
+    let gap = 1u16; // fixed one-space gap to content
     let gutter_width: u16 = (marker_max + 1 + max_lineno_digits + gap).max(6);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -97,7 +104,9 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
         for (i, l) in lines.iter().enumerate() {
             v.push(acc);
             acc += l.len();
-            if i + 1 < lines.len() { acc += 1; } // newline
+            if i + 1 < lines.len() {
+                acc += 1;
+            } // newline
         }
         v
     };
@@ -134,8 +143,18 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
     for (i, &lstart) in line_starts.iter().enumerate() {
         let lend = lstart + lines[i].len();
         let is_cur = intersects(lstart, lend, cur_q_start, cur_q_end);
-        let is_last = last_range.map(|(ls, le)| intersects(lstart, lend, ls, le)).unwrap_or(false);
-        let marker = if is_cur && Some(i) == last_first_line { "➤▶" } else if is_cur { "➤" } else if Some(i) == last_first_line || is_last { "▶" } else { " " };
+        let is_last = last_range
+            .map(|(ls, le)| intersects(lstart, lend, ls, le))
+            .unwrap_or(false);
+        let marker = if is_cur && Some(i) == last_first_line {
+            "➤▶"
+        } else if is_cur {
+            "➤"
+        } else if Some(i) == last_first_line || is_last {
+            "▶"
+        } else {
+            " "
+        };
         // Align line numbers based on max digits to keep layout stable
         let no = format!("{:>width$}", i + 1, width = max_lineno_digits as usize);
         // Add an extra trailing space after the line number to separate gutter from content
@@ -157,7 +176,9 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
 
     // Position caret
     if focused {
-        if let Some((cx, cy)) = caret_pos_multiline(content, text, app.input_cursor, app.input_vscroll) {
+        if let Some((cx, cy)) =
+            caret_pos_multiline(content, text, app.input_cursor, app.input_vscroll)
+        {
             frame.set_cursor_position(Position::new(cx, cy));
         }
     }
@@ -165,10 +186,23 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
 
 fn draw_env_bar(frame: &mut Frame, area: Rect, app: &AppState) {
     let title = "Environment (F2 to manage)";
-    let border_style = if app.focus == Focus::Host { Style::default().fg(Color::LightCyan) } else { Style::default().fg(Color::DarkGray) };
-    let block = Block::default().borders(Borders::ALL).title(title).border_style(border_style);
-    let name = app.selected_env().map(|e| e.name.clone()).unwrap_or_else(|| "(none)".to_string());
-    let host = app.selected_env().map(|e| e.host.clone()).unwrap_or_default();
+    let border_style = if app.focus == Focus::Host {
+        Style::default().fg(Color::LightCyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style);
+    let name = app
+        .selected_env()
+        .map(|e| e.name.clone())
+        .unwrap_or_else(|| "(none)".to_string());
+    let host = app
+        .selected_env()
+        .map(|e| e.host.clone())
+        .unwrap_or_default();
     let content = format!("{name}  —  host: {host}");
     let para = Paragraph::new(content).block(block);
     frame.render_widget(para, area);
@@ -178,16 +212,33 @@ fn draw_status_panel(frame: &mut Frame, area: Rect, app: &AppState) {
     let block = Block::default().borders(Borders::ALL).title("Status");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let text = if app.status_buffer.is_empty() { app.status.clone() } else { app.status_buffer.clone() };
-    let para = Paragraph::new(text.clone()).wrap(Wrap { trim: false }).scroll((app.status_vscroll, 0));
+    let text = if app.status_buffer.is_empty() {
+        app.status.clone()
+    } else {
+        app.status_buffer.clone()
+    };
+    let para = Paragraph::new(text.clone())
+        .wrap(Wrap { trim: false })
+        .scroll((app.status_vscroll, 0));
     frame.render_widget(para, inner);
 
     // Draw Copy button at top-right of inner area
     let btn_w = COPY_BTN_LABEL.chars().count() as u16;
     if inner.width >= btn_w {
         let btn_x = inner.x + inner.width - btn_w;
-        let btn_rect = Rect { x: btn_x, y: inner.y, width: btn_w, height: 1 };
-        let style = if app.copy_btn_pressed { Style::default().fg(Color::Green).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Yellow) };
+        let btn_rect = Rect {
+            x: btn_x,
+            y: inner.y,
+            width: btn_w,
+            height: 1,
+        };
+        let style = if app.copy_btn_pressed {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
         let btn = Paragraph::new(COPY_BTN_LABEL).style(style);
         frame.render_widget(btn, btn_rect);
     }
@@ -224,12 +275,23 @@ fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
         .split(area);
 
     // Left: environments list
-    let items: Vec<ListItem> = app.env_store.envs.iter().map(|e| ListItem::new(e.name.clone())).collect();
+    let items: Vec<ListItem> = app
+        .env_store
+        .envs
+        .iter()
+        .map(|e| ListItem::new(e.name.clone()))
+        .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("Environments"))
-        .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::REVERSED));
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        );
     let mut state = ratatui::widgets::ListState::default();
-    if let Some(i) = app.env_store.selected { state.select(Some(i)); }
+    if let Some(i) = app.env_store.selected {
+        state.select(Some(i));
+    }
     frame.render_stateful_widget(list, cols[0], &mut state);
 
     // Right: fields editor stacked vertically
@@ -251,23 +313,57 @@ fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
     let host_val = ed.map(|e| e.host.clone()).unwrap_or_default();
     // Values are drawn via TextAreas; no pre-rendered strings needed here.
 
-    let title_name = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Name)) { "Name [FOCUSED]" } else { "Name" };
-    let title_host = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Host)) { "Host [FOCUSED]" } else { "Host" };
-    let title_pk_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::PrivateKey)) { "Private Key (PEM) [FOCUSED]" } else { "Private Key (PEM)" };
+    let title_name = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Name)) {
+        "Name [FOCUSED]"
+    } else {
+        "Name"
+    };
+    let title_host = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Host)) {
+        "Host [FOCUSED]"
+    } else {
+        "Host"
+    };
+    let title_pk_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::PrivateKey)) {
+        "Private Key (PEM) [FOCUSED]"
+    } else {
+        "Private Key (PEM)"
+    };
     let title_pk = format!("{}  [Copy]", title_pk_base);
-    let title_cert_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::PublicKey)) { "Public/Certificate (PEM) [FOCUSED]" } else { "Public/Certificate (PEM)" };
+    let title_cert_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::PublicKey)) {
+        "Public/Certificate (PEM) [FOCUSED]"
+    } else {
+        "Public/Certificate (PEM)"
+    };
     let title_cert = format!("{}  [Copy]", title_cert_base);
-    let title_ca_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Ca)) { "SSL CA (PEM) [FOCUSED]" } else { "SSL CA (PEM)" };
+    let title_ca_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Ca)) {
+        "SSL CA (PEM) [FOCUSED]"
+    } else {
+        "SSL CA (PEM)"
+    };
     let title_ca = format!("{}  [Copy]", title_ca_base);
 
-    frame.render_widget(Paragraph::new(name_val.clone()).block(Block::default().borders(Borders::ALL).title(title_name)), fields[0]);
-    frame.render_widget(Paragraph::new(host_val.clone()).block(Block::default().borders(Borders::ALL).title(title_host)), fields[1]);
+    frame.render_widget(
+        Paragraph::new(name_val.clone())
+            .block(Block::default().borders(Borders::ALL).title(title_name)),
+        fields[0],
+    );
+    frame.render_widget(
+        Paragraph::new(host_val.clone())
+            .block(Block::default().borders(Borders::ALL).title(title_host)),
+        fields[1],
+    );
     // Render multi-line fields using tui-textarea
     if let Some(edm) = app.env_editor.as_ref() {
         // Draw outer blocks for titles and copy affordance
-        let block_pk = Block::default().borders(Borders::ALL).title(title_pk.clone());
-        let block_pub = Block::default().borders(Borders::ALL).title(title_cert.clone());
-        let block_ca = Block::default().borders(Borders::ALL).title(title_ca.clone());
+        let block_pk = Block::default()
+            .borders(Borders::ALL)
+            .title(title_pk.clone());
+        let block_pub = Block::default()
+            .borders(Borders::ALL)
+            .title(title_cert.clone());
+        let block_ca = Block::default()
+            .borders(Borders::ALL)
+            .title(title_ca.clone());
         let inner_pk = block_pk.inner(fields[2]);
         let inner_pub = block_pub.inner(fields[3]);
         let inner_ca = block_ca.inner(fields[4]);
@@ -283,31 +379,59 @@ fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
             super::app::EnvFieldFocus::Name => caret_pos_in(fields[0], &name_val, ed.name_cursor),
             super::app::EnvFieldFocus::Host => caret_pos_in(fields[1], &host_val, ed.host_cursor),
             // TextArea draws its own cursor; we skip frame.set_cursor for these
-            super::app::EnvFieldFocus::PrivateKey => (0,0),
-            super::app::EnvFieldFocus::PublicKey => (0,0),
-            super::app::EnvFieldFocus::Ca => (0,0),
-            super::app::EnvFieldFocus::Conn => (0,0),
-            super::app::EnvFieldFocus::Buttons => (0,0),
+            super::app::EnvFieldFocus::PrivateKey => (0, 0),
+            super::app::EnvFieldFocus::PublicKey => (0, 0),
+            super::app::EnvFieldFocus::Ca => (0, 0),
+            super::app::EnvFieldFocus::Conn => (0, 0),
+            super::app::EnvFieldFocus::Buttons => (0, 0),
         };
-        if x > 0 || y > 0 { frame.set_cursor_position(Position::new(x, y)); }
+        if x > 0 || y > 0 {
+            frame.set_cursor_position(Position::new(x, y));
+        }
     }
     let help = "F1 New | F2 Edit | F3 Delete | F4 Save | F5 Test | F6 Next | F7 Prev | F9 Mouse select on/off | Tab/Shift-Tab Move | Up/Down Select | Shift-←/→ H-scroll | Esc Close";
-    frame.render_widget(Paragraph::new(help).block(Block::default().borders(Borders::ALL).title("Actions")), fields[5]);
+    frame.render_widget(
+        Paragraph::new(help).block(Block::default().borders(Borders::ALL).title("Actions")),
+        fields[5],
+    );
 
     // Connection status/progress area (scrollable)
     let status_text = if app.env_test_in_progress {
         // Simple spinner based on time
-        let ch = match (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() / 250) % 4 {
-            0 => "⠋", 1 => "⠙", 2 => "⠸", _ => "⠴",
+        let ch = match (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            / 250)
+            % 4
+        {
+            0 => "⠋",
+            1 => "⠙",
+            2 => "⠸",
+            _ => "⠴",
         };
-        let msg = app.env_test_message.as_deref().unwrap_or("Testing connection...");
+        let msg = app
+            .env_test_message
+            .as_deref()
+            .unwrap_or("Testing connection...");
         format!("{} {}", ch, msg)
     } else {
-        app.env_test_message.clone().unwrap_or_else(|| "Ready".to_string())
+        app.env_test_message
+            .clone()
+            .unwrap_or_else(|| "Ready".to_string())
     };
-    let conn_title = if matches!(app.env_editor.as_ref().map(|e| e.field_focus), Some(EnvFieldFocus::Conn)) { "Connection [FOCUSED]  [Copy/F9 Select]" } else { "Connection  [Copy/F9 Select]" };
+    let conn_title = if matches!(
+        app.env_editor.as_ref().map(|e| e.field_focus),
+        Some(EnvFieldFocus::Conn)
+    ) {
+        "Connection [FOCUSED]  [Copy/F9 Select]"
+    } else {
+        "Connection  [Copy/F9 Select]"
+    };
     let conn_block = Block::default().borders(Borders::ALL).title(conn_title);
-    let conn_para = Paragraph::new(status_text).block(conn_block).scroll((app.env_conn_vscroll, 0));
+    let conn_para = Paragraph::new(status_text)
+        .block(conn_block)
+        .scroll((app.env_conn_vscroll, 0));
     frame.render_widget(conn_para, fields[6]);
 }
 
@@ -330,7 +454,10 @@ fn caret_pos_in(area: Rect, text: &str, cursor: usize) -> (u16, u16) {
             count += llen + 1; // account for newline
         }
     }
-    if count >= idx { line = 0; col = idx as u16; }
+    if count >= idx {
+        line = 0;
+        col = idx as u16;
+    }
     line = line.min(max_h.saturating_sub(1));
     col = col.min(max_w.saturating_sub(1));
     (inner_x + col, inner_y + line)
@@ -362,7 +489,9 @@ fn caret_pos_multiline(area: Rect, text: &str, cursor: usize, vscroll: u16) -> O
     let inner_x = area.x.saturating_add(0);
     let inner_y = area.y.saturating_add(0);
     let max_w = area.width;
-    if max_w == 0 { return None; }
+    if max_w == 0 {
+        return None;
+    }
     let (line, col) = line_col_at(text, cursor);
     // With wrapping, we need to account for col overflow into visual lines
     let wrap_w = max_w as usize;
@@ -401,16 +530,28 @@ fn find_query_range(s: &str, cursor: usize) -> (usize, usize) {
     while i > 0 {
         i -= 1;
         let b = bytes[i];
-        if b == b';' { start = i + 1; break; }
-        if b == b'\n' && i > 0 && bytes[i - 1] == b'\n' { start = i + 1; break; }
+        if b == b';' {
+            start = i + 1;
+            break;
+        }
+        if b == b'\n' && i > 0 && bytes[i - 1] == b'\n' {
+            start = i + 1;
+            break;
+        }
     }
     // next boundary
     let mut end = bytes.len();
     i = cur;
     while i < bytes.len() {
         let b = bytes[i];
-        if b == b';' { end = i + 1; break; }
-        if b == b'\n' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' { end = i; break; }
+        if b == b';' {
+            end = i + 1;
+            break;
+        }
+        if b == b'\n' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+            end = i;
+            break;
+        }
         i += 1;
     }
     (start, end)
@@ -427,7 +568,11 @@ fn byte_index_to_line(line_starts: &[usize], byte_idx: usize) -> usize {
     let mut hi = line_starts.len();
     while lo + 1 < hi {
         let mid = (lo + hi) / 2;
-        if line_starts[mid] <= byte_idx { lo = mid; } else { hi = mid; }
+        if line_starts[mid] <= byte_idx {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
     }
     lo
 }
@@ -440,32 +585,69 @@ fn highlight_sql_line(s: &str) -> Vec<Span<'static>> {
     for ch in s.chars() {
         match ch {
             '\'' | '"' => {
-                if !word.is_empty() { push_word(&mut spans, &word); word.clear(); }
+                if !word.is_empty() {
+                    push_word(&mut spans, &word);
+                    word.clear();
+                }
                 in_string = !in_string;
-                spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
             }
-            c if c.is_alphanumeric() || c == '_' => { word.push(c); }
+            c if c.is_alphanumeric() || c == '_' => {
+                word.push(c);
+            }
             _ => {
-                if !word.is_empty() { push_word(&mut spans, &word); word.clear(); }
-                let color = if in_string { Color::Yellow } else { Color::Gray };
+                if !word.is_empty() {
+                    push_word(&mut spans, &word);
+                    word.clear();
+                }
+                let color = if in_string {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                };
                 spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
             }
         }
     }
-    if !word.is_empty() { push_word(&mut spans, &word); }
+    if !word.is_empty() {
+        push_word(&mut spans, &word);
+    }
     spans
 }
 
 fn push_word(spans: &mut Vec<Span<'static>>, w: &str) {
     let kw = [
-        "select","from","where","and","or","limit","order","by","asc","desc",
+        "select",
+        "from",
+        "where",
+        "and",
+        "or",
+        "limit",
+        "order",
+        "by",
+        "asc",
+        "desc",
+        "contains",
         // note: treat Kafka columns like key/value as identifiers, not keywords
-        "timestamp","partition","offset",
+        "timestamp",
+        "partition",
+        "offset",
     ];
     if kw.contains(&w.to_ascii_lowercase().as_str()) {
-        spans.push(Span::styled(w.to_uppercase(), Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(
+            w.to_uppercase(),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ));
     } else if w.chars().all(|c| c.is_ascii_digit()) {
-        spans.push(Span::styled(w.to_string(), Style::default().fg(Color::Cyan)));
+        spans.push(Span::styled(
+            w.to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
     } else {
         spans.push(Span::raw(w.to_string()));
     }
@@ -486,10 +668,12 @@ fn draw_topics(frame: &mut Frame, area: Rect, app: &AppState) {
     let items: Vec<ListItem> = if app.topics.is_empty() {
         vec![ListItem::new("No topics loaded. Press F6 to refresh.")]
     } else {
-        app.topics.iter().map(|t| ListItem::new(t.clone())).collect()
+        app.topics
+            .iter()
+            .map(|t| ListItem::new(t.clone()))
+            .collect()
     };
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Topics"));
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Topics"));
     frame.render_widget(list, area);
 }
 
@@ -499,11 +683,16 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     let help = vec![
         Line::from("F8 Home  F2 Envs  F12 Info  F10 Help"),
         Line::from("Ctrl-Q/Ctrl-C Quit"),
-        Line::from("Home: Ctrl-Enter run; arrows move; F5 copy payload; F7 copy status; Shift-←/→ h-scroll"),
+        Line::from(
+            "Home: Ctrl-Enter run; arrows move; F5 copy payload; F7 copy status; Shift-←/→ h-scroll",
+        ),
         Line::from("Envs: F4 Save  F3 Delete  F1 New  F5 Test  Up/Down select  Tab next field"),
         Line::from("Info: F6 Refresh topics"),
     ];
-    let block = Block::default().borders(Borders::ALL).title("Help").border_style(Style::default().fg(Color::Yellow));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Help")
+        .border_style(Style::default().fg(Color::Yellow));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let para = Paragraph::new(Text::from(help)).wrap(Wrap { trim: false });
@@ -556,8 +745,15 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &AppState) {
     let table = Table::new(rows, constraints)
         .header(Row::new(headers).style(Style::default().add_modifier(Modifier::BOLD)))
         .block({
-            let border_style = if app.focus == Focus::Results { Style::default().fg(Color::LightCyan) } else { Style::default().fg(Color::DarkGray) };
-            Block::default().borders(Borders::ALL).title("Results").border_style(border_style)
+            let border_style = if app.focus == Focus::Results {
+                Style::default().fg(Color::LightCyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Results")
+                .border_style(border_style)
         })
         .row_highlight_style(Style::default())
         .column_spacing(1);
@@ -579,7 +775,9 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &AppState) {
     // Horizontal scrollbar for table (approximate by preview width)
     let content_w_estimate = estimate_table_content_width(app);
     let visible_w = area.width.saturating_sub(2) as usize; // minus borders
-    let h_content = content_w_estimate.saturating_sub(visible_w).saturating_add(1);
+    let h_content = content_w_estimate
+        .saturating_sub(visible_w)
+        .saturating_add(1);
     if h_content > 1 {
         let mut hs = ScrollbarState::new(h_content).position(app.table_hscroll.min(h_content - 1));
         let hbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom);
@@ -597,10 +795,19 @@ fn make_row(idx: usize, env: &MessageEnvelope, app: &AppState) -> Row<'static> {
     let selected = idx == app.selected_row;
     if keys_only {
         let row = Row::new(vec![
-            style_cell(Cell::from(env.partition.to_string()), selected && app.selected_col == 0),
-            style_cell(Cell::from(env.offset.to_string()), selected && app.selected_col == 1),
+            style_cell(
+                Cell::from(env.partition.to_string()),
+                selected && app.selected_col == 0,
+            ),
+            style_cell(
+                Cell::from(env.offset.to_string()),
+                selected && app.selected_col == 1,
+            ),
             style_cell(Cell::from(ts), selected && app.selected_col == 2),
-            style_cell(Cell::from(env.key.clone()), selected && app.selected_col == 3),
+            style_cell(
+                Cell::from(env.key.clone()),
+                selected && app.selected_col == 3,
+            ),
         ])
         .height(1);
         row
@@ -611,10 +818,19 @@ fn make_row(idx: usize, env: &MessageEnvelope, app: &AppState) -> Row<'static> {
         let hscroll = app.table_hscroll;
         let preview = apply_hscroll(&preview, hscroll);
         let row = Row::new(vec![
-            style_cell(Cell::from(env.partition.to_string()), selected && app.selected_col == 0),
-            style_cell(Cell::from(env.offset.to_string()), selected && app.selected_col == 1),
+            style_cell(
+                Cell::from(env.partition.to_string()),
+                selected && app.selected_col == 0,
+            ),
+            style_cell(
+                Cell::from(env.offset.to_string()),
+                selected && app.selected_col == 1,
+            ),
             style_cell(Cell::from(ts), selected && app.selected_col == 2),
-            style_cell(Cell::from(env.key.clone()), selected && app.selected_col == 3),
+            style_cell(
+                Cell::from(env.key.clone()),
+                selected && app.selected_col == 3,
+            ),
             style_cell(Cell::from(preview), selected && app.selected_col == 4),
         ])
         .height(1);
@@ -635,8 +851,10 @@ fn fmt_ts(ms: i64) -> String {
     }
     // Keep short human readable format
     let secs = ms / 1000;
-    let tm = time::OffsetDateTime::from_unix_timestamp(secs as i64).unwrap_or_else(|_| time::OffsetDateTime::UNIX_EPOCH);
-    tm.format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| ms.to_string())
+    let tm = time::OffsetDateTime::from_unix_timestamp(secs as i64)
+        .unwrap_or_else(|_| time::OffsetDateTime::UNIX_EPOCH);
+    tm.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| ms.to_string())
 }
 
 #[allow(dead_code)]
@@ -656,12 +874,24 @@ fn make_json_cell_and_height(s: &str) -> (Text<'static>, u16) {
 fn json_to_highlighted_lines(v: &serde_json::Value) -> Vec<Line<'static>> {
     // Pretty-print JSON into multiple lines with Postman-like colors:
     // - keys: green, strings: yellow, numbers: cyan, booleans: magenta, null: dark gray, punctuation: gray
-    fn indent(depth: usize) -> Span<'static> { Span::raw(" ".repeat(depth * 2)) }
-    fn punct(s: &str) -> Span<'static> { Span::styled(s.to_string(), Style::default().fg(Color::Gray)) }
-    fn string_span(s: &str) -> Span<'static> { Span::styled(format!("\"{}\"", s), Style::default().fg(Color::Yellow)) }
-    fn number_span(n: &serde_json::Number) -> Span<'static> { Span::styled(n.to_string(), Style::default().fg(Color::Cyan)) }
-    fn bool_span(b: bool) -> Span<'static> { Span::styled(b.to_string(), Style::default().fg(Color::Magenta)) }
-    fn null_span() -> Span<'static> { Span::styled("null".to_string(), Style::default().fg(Color::DarkGray)) }
+    fn indent(depth: usize) -> Span<'static> {
+        Span::raw(" ".repeat(depth * 2))
+    }
+    fn punct(s: &str) -> Span<'static> {
+        Span::styled(s.to_string(), Style::default().fg(Color::Gray))
+    }
+    fn string_span(s: &str) -> Span<'static> {
+        Span::styled(format!("\"{}\"", s), Style::default().fg(Color::Yellow))
+    }
+    fn number_span(n: &serde_json::Number) -> Span<'static> {
+        Span::styled(n.to_string(), Style::default().fg(Color::Cyan))
+    }
+    fn bool_span(b: bool) -> Span<'static> {
+        Span::styled(b.to_string(), Style::default().fg(Color::Magenta))
+    }
+    fn null_span() -> Span<'static> {
+        Span::styled("null".to_string(), Style::default().fg(Color::DarkGray))
+    }
 
     fn render_scalar(val: &serde_json::Value) -> Vec<Span<'static>> {
         match val {
@@ -675,7 +905,10 @@ fn json_to_highlighted_lines(v: &serde_json::Value) -> Vec<Line<'static>> {
 
     fn render_value(v: &serde_json::Value, depth: usize, out: &mut Vec<Line<'static>>) {
         match v {
-            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) | serde_json::Value::String(_) => {
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => {
                 let mut spans = Vec::new();
                 spans.push(indent(depth));
                 spans.extend(render_scalar(v));
@@ -698,7 +931,7 @@ fn json_to_highlighted_lines(v: &serde_json::Value) -> Vec<Line<'static>> {
                         }
                         // ensure at least one line was added
                         if out.len() == before_len {
-                            out.push(Line::from(vec![indent(depth + 1), punct("" )]));
+                            out.push(Line::from(vec![indent(depth + 1), punct("")]));
                         }
                     }
                     out.push(Line::from(vec![indent(depth), punct("]")]));
@@ -712,20 +945,31 @@ fn json_to_highlighted_lines(v: &serde_json::Value) -> Vec<Line<'static>> {
                     let len = map.len();
                     for (i, (k, val)) in map.iter().enumerate() {
                         match val {
-                            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) | serde_json::Value::String(_) => {
+                            serde_json::Value::Null
+                            | serde_json::Value::Bool(_)
+                            | serde_json::Value::Number(_)
+                            | serde_json::Value::String(_) => {
                                 let mut spans = Vec::new();
                                 spans.push(indent(depth + 1));
-                                spans.push(Span::styled(format!("\"{}\"", k), Style::default().fg(Color::Green)));
+                                spans.push(Span::styled(
+                                    format!("\"{}\"", k),
+                                    Style::default().fg(Color::Green),
+                                ));
                                 spans.push(punct(": "));
                                 spans.extend(render_scalar(val));
-                                if i + 1 != len { spans.push(punct(",")); }
+                                if i + 1 != len {
+                                    spans.push(punct(","));
+                                }
                                 out.push(Line::from(spans));
                             }
                             _ => {
                                 // complex value: print key on its own line, then nested structure
                                 let mut key_line = Vec::new();
                                 key_line.push(indent(depth + 1));
-                                key_line.push(Span::styled(format!("\"{}\"", k), Style::default().fg(Color::Green)));
+                                key_line.push(Span::styled(
+                                    format!("\"{}\"", k),
+                                    Style::default().fg(Color::Green),
+                                ));
                                 key_line.push(punct(":"));
                                 out.push(Line::from(key_line));
 
@@ -765,7 +1009,9 @@ fn json_preview_minified(s: &str) -> String {
 }
 
 fn apply_hscroll(s: &str, offset: usize) -> String {
-    if offset == 0 { return s.to_string(); }
+    if offset == 0 {
+        return s.to_string();
+    }
     s.chars().skip(offset).collect()
 }
 
@@ -810,13 +1056,21 @@ fn draw_json_detail(frame: &mut Frame, area: Rect, app: &AppState) {
     // Draw Copy button at top-right of inner area
     let btn_w = COPY_BTN_LABEL.chars().count() as u16;
     if inner_area.width > btn_w {
-        let btn_rect = Rect { x: inner_area.x + inner_area.width - btn_w, y: inner_area.y, width: btn_w, height: 1 };
+        let btn_rect = Rect {
+            x: inner_area.x + inner_area.width - btn_w,
+            y: inner_area.y,
+            width: btn_w,
+            height: 1,
+        };
         let style = if app.copy_btn_pressed {
             // pressed look
             Style::default().fg(Color::Black).bg(Color::LightYellow)
         } else {
             // raised look
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         };
         let btn = Paragraph::new(COPY_BTN_LABEL).style(style);
         frame.render_widget(btn, btn_rect);
@@ -832,7 +1086,8 @@ fn draw_json_detail(frame: &mut Frame, area: Rect, app: &AppState) {
         None => 0,
     };
     if content_len > 0 {
-        let mut vs = ScrollbarState::new(content_len).position(app.json_vscroll.min((content_len.saturating_sub(1)) as u16) as usize);
+        let mut vs = ScrollbarState::new(content_len)
+            .position(app.json_vscroll.min((content_len.saturating_sub(1)) as u16) as usize);
         let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(vbar, area, &mut vs);
     }
