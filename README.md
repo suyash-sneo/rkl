@@ -60,6 +60,18 @@ Env TUI with:
 
 For testing locally with mTLS, see `local-test/README.md`.
 
+### Query editor shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl-Enter` | Run the SELECT statement under the cursor |
+| `Ctrl/Alt + Left` | Move to the previous word boundary |
+| `Ctrl/Alt + Right` | Move to the next word boundary |
+| `Ctrl/Alt + Backspace` | Delete the word to the left of the cursor |
+| `Ctrl/Alt + Delete` | Delete the word to the right of the cursor |
+| `Ctrl + Home` | Jump to the start of the query buffer |
+| `Ctrl + End` | Jump to the end of the query buffer |
+
 
 # Query examples
 

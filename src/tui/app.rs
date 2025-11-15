@@ -1,5 +1,5 @@
-use crate::models::{MessageEnvelope, SslConfig};
 use super::env_store::{EnvStore, Environment};
+use crate::models::{MessageEnvelope, SslConfig};
 use std::time::Instant;
 use tui_textarea::TextArea;
 
@@ -44,7 +44,13 @@ impl AppState {
     pub fn new(initial_input: String, host: String) -> Self {
         let mut env_store = EnvStore::load();
         if env_store.envs.is_empty() {
-            env_store.envs.push(Environment { name: "Default".to_string(), host: host.clone(), private_key_pem: None, public_key_pem: None, ssl_ca_pem: None });
+            env_store.envs.push(Environment {
+                name: "Default".to_string(),
+                host: host.clone(),
+                private_key_pem: None,
+                public_key_pem: None,
+                ssl_ca_pem: None,
+            });
             env_store.selected = Some(0);
             let _ = env_store.save();
         }
@@ -100,25 +106,47 @@ impl AppState {
 
 #[derive(Debug)]
 pub enum TuiEvent {
-    Batch { run_id: u64, rows: Vec<MessageEnvelope> },
-    Done { run_id: u64 },
-    Error { run_id: u64, message: String },
-    EnvTestProgress { message: String },
-    EnvTestDone { message: String },
+    Batch {
+        run_id: u64,
+        rows: Vec<MessageEnvelope>,
+    },
+    Done {
+        run_id: u64,
+    },
+    Error {
+        run_id: u64,
+        message: String,
+    },
+    EnvTestProgress {
+        message: String,
+    },
+    EnvTestDone {
+        message: String,
+    },
     Topics(Vec<String>),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum Focus { Host, Query, Results }
+pub enum Focus {
+    Host,
+    Query,
+    Results,
+}
 
 impl AppState {
     pub fn next_focus(&mut self) {
-        self.focus = match self.focus { Focus::Host => Focus::Query, Focus::Query => Focus::Results, Focus::Results => Focus::Host };
+        self.focus = match self.focus {
+            Focus::Host => Focus::Query,
+            Focus::Query => Focus::Results,
+            Focus::Results => Focus::Host,
+        };
     }
 }
 
 impl Default for Focus {
-    fn default() -> Self { Focus::Host }
+    fn default() -> Self {
+        Focus::Host
+    }
 }
 
 impl AppState {
@@ -129,11 +157,15 @@ impl AppState {
             self.selected_row = self.rows.len().saturating_sub(1);
         }
         let cols = if self.keys_only { 4 } else { 5 };
-        if self.selected_col >= cols { self.selected_col = cols.saturating_sub(1); }
+        if self.selected_col >= cols {
+            self.selected_col = cols.saturating_sub(1);
+        }
     }
 
     pub fn selected_env(&self) -> Option<&Environment> {
-        self.env_store.selected.and_then(|i| self.env_store.envs.get(i))
+        self.env_store
+            .selected
+            .and_then(|i| self.env_store.envs.get(i))
     }
     pub fn current_ssl_config(&self) -> Option<SslConfig> {
         self.selected_env().map(|e| {
@@ -163,11 +195,22 @@ pub struct EnvEditor {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum EnvFieldFocus { Name, Host, PrivateKey, PublicKey, Ca, Conn, Buttons }
+pub enum EnvFieldFocus {
+    Name,
+    Host,
+    PrivateKey,
+    PublicKey,
+    Ca,
+    Conn,
+    Buttons,
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum CaInputMode { Pem, Location }
+pub enum CaInputMode {
+    Pem,
+    Location,
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Screen {
@@ -177,5 +220,7 @@ pub enum Screen {
 }
 
 impl Default for Screen {
-    fn default() -> Self { Screen::Home }
+    fn default() -> Self {
+        Screen::Home
+    }
 }

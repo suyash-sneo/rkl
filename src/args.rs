@@ -84,7 +84,9 @@ pub struct RunArgs {
 }
 
 impl Cli {
-    pub fn parse_cli() -> Self { Self::parse() }
+    pub fn parse_cli() -> Self {
+        Self::parse()
+    }
 }
 
 impl Default for RunArgs {

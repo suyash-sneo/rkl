@@ -27,7 +27,11 @@ impl EnvStore {
             for ent in entries.flatten() {
                 let path = ent.path();
                 if path.is_file() {
-                    if let Some(ext) = path.extension() { if ext != "json" { continue; } }
+                    if let Some(ext) = path.extension() {
+                        if ext != "json" {
+                            continue;
+                        }
+                    }
                     if let Ok(s) = fs::read_to_string(&path) {
                         if let Ok(mut e) = serde_json::from_str::<Environment>(&s) {
                             // Decode any encoded newlines ("\n") back to real newlines for editing/usage
@@ -79,11 +83,19 @@ impl EnvStore {
 }
 
 pub fn config_dir() -> PathBuf {
-    std::env::var("HOME").map(|h| PathBuf::from(h).join(".rkl").join("envs")).unwrap_or_else(|_| PathBuf::from(".rkl").join("envs"))
+    std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".rkl").join("envs"))
+        .unwrap_or_else(|_| PathBuf::from(".rkl").join("envs"))
 }
 
-fn sanitize(name: &str) -> String { name.chars().map(|c| if is_safe(c) { c } else { '_' }).collect() }
-fn is_safe(c: char) -> bool { c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' }
+fn sanitize(name: &str) -> String {
+    name.chars()
+        .map(|c| if is_safe(c) { c } else { '_' })
+        .collect()
+}
+fn is_safe(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
+}
 
 fn encode_newlines(s: String) -> String {
     // Ensure result is a single line with literal \n sequences

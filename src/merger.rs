@@ -13,10 +13,17 @@ enum HeapKind {
 
 impl HeapKind {
     fn new(desc: bool) -> Self {
-        if desc { HeapKind::Desc(BinaryHeap::new()) } else { HeapKind::Asc(BinaryHeap::new()) }
+        if desc {
+            HeapKind::Desc(BinaryHeap::new())
+        } else {
+            HeapKind::Asc(BinaryHeap::new())
+        }
     }
     fn len(&self) -> usize {
-        match self { HeapKind::Asc(h) => h.len(), HeapKind::Desc(h) => h.len() }
+        match self {
+            HeapKind::Asc(h) => h.len(),
+            HeapKind::Desc(h) => h.len(),
+        }
     }
     fn push(&mut self, env: MessageEnvelope) {
         match self {

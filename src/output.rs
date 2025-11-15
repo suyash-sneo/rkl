@@ -47,7 +47,6 @@ impl TableOutput {
             rows_buffered: 0,
         }
     }
-
 }
 
 impl OutputSink for TableOutput {

@@ -9,6 +9,7 @@ use ratatui::widgets::{
 };
 
 use super::app::{AppState, EnvFieldFocus, Focus, Screen};
+use super::query_bounds::find_query_range;
 
 pub(super) const COPY_BTN_LABEL: &str = "[ Copy ]";
 
@@ -68,7 +69,7 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
     let focused = app.focus == Focus::Query;
-    let title = "Query (Enter newline, Ctrl-Enter run)";
+    let title = "Query (Ctrl-Enter runs current SELECT; ';' ends)";
     let border_style = if focused {
         Style::default().fg(Color::LightCyan)
     } else {
@@ -259,7 +260,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
     let cols = if app.keys_only { 4 } else { 5 };
     let col = if cols == 0 { 0 } else { app.selected_col + 1 };
     let legend = format!(
-        "F8 Home  F2 Envs  F12 Info  F10 Help | Tab focus | Query: Enter newline, Ctrl-Enter run | Results: arrows, Shift-←/→ h-scroll | F5 copy payload | F7 copy status | Ctrl-Q/Ctrl-C quit | Row {row}/{total} Col {col}/{cols}"
+        "F8 Home  F2 Envs  F12 Info  F10 Help | Tab focus | Query: Enter newline, Ctrl-Enter run, Ctrl/Alt+←/→ move word, Ctrl/Alt+Backspace/Delete delete word, Ctrl+Home/End doc | Results: arrows, Shift-←/→ h-scroll | F5 copy payload | F7 copy status | Ctrl-Q/Ctrl-C quit | Row {row}/{total} Col {col}/{cols}"
     );
     let block = Block::default().borders(Borders::ALL).title("Help");
     let para = Paragraph::new(legend).block(block);
@@ -521,42 +522,6 @@ fn line_col_at(text: &str, cursor: usize) -> (usize, usize) {
     (line, col)
 }
 
-fn find_query_range(s: &str, cursor: usize) -> (usize, usize) {
-    let bytes = s.as_bytes();
-    let cur = cursor.min(bytes.len());
-    // prev boundary
-    let mut start = 0usize;
-    let mut i = cur;
-    while i > 0 {
-        i -= 1;
-        let b = bytes[i];
-        if b == b';' {
-            start = i + 1;
-            break;
-        }
-        if b == b'\n' && i > 0 && bytes[i - 1] == b'\n' {
-            start = i + 1;
-            break;
-        }
-    }
-    // next boundary
-    let mut end = bytes.len();
-    i = cur;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b';' {
-            end = i + 1;
-            break;
-        }
-        if b == b'\n' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-            end = i;
-            break;
-        }
-        i += 1;
-    }
-    (start, end)
-}
-
 fn intersects(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
     // [a_start, a_end) intersects [b_start, b_end)
     a_start < b_end && b_start < a_end
@@ -684,7 +649,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("F8 Home  F2 Envs  F12 Info  F10 Help"),
         Line::from("Ctrl-Q/Ctrl-C Quit"),
         Line::from(
-            "Home: Ctrl-Enter run; arrows move; F5 copy payload; F7 copy status; Shift-←/→ h-scroll",
+            "Home: Ctrl-Enter run; Ctrl/Alt+←/→ move word; Ctrl/Alt+Backspace/Delete delete word; Ctrl+Home/End doc; arrows move; F5 copy payload; F7 copy status; Shift-←/→ h-scroll",
         ),
         Line::from("Envs: F4 Save  F3 Delete  F1 New  F5 Test  Up/Down select  Tab next field"),
         Line::from("Info: F6 Refresh topics"),
