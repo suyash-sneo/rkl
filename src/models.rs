@@ -35,7 +35,7 @@ pub struct MessageEnvelope {
     pub offset: i64,
     pub timestamp_ms: i64, // 0 if unknown
     pub key: String,
-    pub value: Option<String>, // None if keys_only
+    pub value: Option<String>, // None if the Value column is omitted
 }
 
 /// Wrapper that gives us total ordering by (timestamp, partition, offset)

@@ -1,7 +1,25 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectItem {
+    Partition,
+    Offset,
+    Timestamp,
     Key,
     Value,
+}
+
+impl SelectItem {
+    pub fn standard(include_value: bool) -> Vec<SelectItem> {
+        let mut cols = vec![
+            SelectItem::Partition,
+            SelectItem::Offset,
+            SelectItem::Timestamp,
+            SelectItem::Key,
+        ];
+        if include_value {
+            cols.push(SelectItem::Value);
+        }
+        cols
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

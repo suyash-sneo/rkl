@@ -227,11 +227,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 }
                                 match parse_query(&query) {
                                     Ok(ast) => {
-                                        let keys_only = !ast
-                                            .select
-                                            .iter()
-                                            .any(|i| matches!(i, SelectItem::Value));
-                                        app.keys_only = keys_only;
+                                        let columns = ast.select.clone();
+                                        app.selected_columns = columns;
+                                        app.table_hscroll = 0;
                                         app.clear_rows();
                                         run_counter += 1;
                                         app.current_run = Some(run_counter);
@@ -277,11 +275,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 }
                                 match parse_query(&query) {
                                     Ok(ast) => {
-                                        let keys_only = !ast
-                                            .select
-                                            .iter()
-                                            .any(|i| matches!(i, SelectItem::Value));
-                                        app.keys_only = keys_only;
+                                        let columns = ast.select.clone();
+                                        app.selected_columns = columns;
+                                        app.table_hscroll = 0;
                                         app.clear_rows();
                                         run_counter += 1;
                                         app.current_run = Some(run_counter);
@@ -1036,8 +1032,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                     }
                                 }
                             } else if matches!(app.focus, super::app::Focus::Results) {
-                                let cols = if app.keys_only { 4 } else { 5 };
-                                if app.selected_col + 1 < cols {
+                                let cols = app.selected_columns.len();
+                                if cols > 0 && app.selected_col + 1 < cols {
                                     app.selected_col += 1;
                                 }
                                 app.json_vscroll = 0;
@@ -1339,22 +1335,36 @@ fn selected_cell_text(app: &AppState) -> Option<String> {
     if app.rows.is_empty() {
         return None;
     }
-    let idx = app.selected_row.min(app.rows.len() - 1);
-    let env = &app.rows[idx];
-    let col = app.selected_col;
-    let cols = if app.keys_only { 4 } else { 5 };
-    if col >= cols {
+    if app.selected_columns.is_empty() {
         return None;
     }
-    let s = match col {
-        0 => env.partition.to_string(),
-        1 => env.offset.to_string(),
-        2 => fmt_ts(env.timestamp_ms),
-        3 => env.key.clone(),
-        4 => env.value.as_deref().unwrap_or("null").to_string(),
-        _ => return None,
-    };
-    Some(s)
+    let idx = app.selected_row.min(app.rows.len() - 1);
+    let env = &app.rows[idx];
+    let col_idx = app
+        .selected_col
+        .min(app.selected_columns.len().saturating_sub(1));
+    let col = app.selected_columns[col_idx];
+    Some(runner_column_text(env, col))
+}
+
+fn runner_column_text(env: &MessageEnvelope, col: SelectItem) -> String {
+    match col {
+        SelectItem::Partition => env.partition.to_string(),
+        SelectItem::Offset => env.offset.to_string(),
+        SelectItem::Timestamp => fmt_ts(env.timestamp_ms),
+        SelectItem::Key => env.key.clone(),
+        SelectItem::Value => env.value.as_deref().unwrap_or("null").to_string(),
+    }
+}
+
+fn runner_column_width_hint(col: SelectItem) -> usize {
+    match col {
+        SelectItem::Partition => 10,
+        SelectItem::Offset => 12,
+        SelectItem::Timestamp => 26,
+        SelectItem::Key => 30,
+        SelectItem::Value => usize::MAX,
+    }
 }
 
 #[allow(dead_code)]
@@ -1668,26 +1678,35 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
                 let inner_x = table_rect.x.saturating_add(1);
                 if mx >= inner_x {
                     let mut x_rel = (mx - inner_x) as usize;
-                    // Partition (10)
                     let mut col = 0usize;
-                    let mut widths = vec![10usize, 12, 26, 30];
-                    if !app.keys_only {
-                        widths.push(usize::MAX);
-                    }
-                    for (i, w) in widths.iter().enumerate() {
-                        if i + 1 == widths.len() && *w == usize::MAX {
-                            col = i;
-                            break;
+                    let widths: Vec<usize> = app
+                        .selected_columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let mut w = runner_column_width_hint(*c);
+                            if i + 1 < app.selected_columns.len() {
+                                w = w.saturating_add(1);
+                            }
+                            w
+                        })
+                        .collect();
+                    if !widths.is_empty() {
+                        for (i, w) in widths.iter().enumerate() {
+                            if *w == usize::MAX {
+                                col = i;
+                                break;
+                            }
+                            if x_rel < *w {
+                                col = i;
+                                break;
+                            } else {
+                                x_rel = x_rel.saturating_sub(*w);
+                            }
                         }
-                        if x_rel < *w {
-                            col = i;
-                            break;
-                        } else {
-                            x_rel = x_rel.saturating_sub(*w + 1);
+                        if col >= widths.len() {
+                            col = widths.len() - 1;
                         }
-                    }
-                    let max_cols = if app.keys_only { 4 } else { 5 };
-                    if col < max_cols {
                         if app.selected_col != col {
                             app.selected_col = col;
                             app.json_vscroll = 0;

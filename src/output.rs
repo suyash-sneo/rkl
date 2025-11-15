@@ -1,4 +1,5 @@
 use crate::models::MessageEnvelope;
+use crate::query::SelectItem;
 use comfy_table::{Attribute, Cell, ContentArrangement, Table, presets::UTF8_FULL};
 use time::{OffsetDateTime, format_description::well_known::Iso8601};
 
@@ -11,13 +12,13 @@ pub trait OutputSink {
 pub struct TableOutput {
     table: Table,
     no_color: bool,
-    keys_only: bool,
+    columns: Vec<SelectItem>,
     max_cell_width: usize, // used as an approximate table width hint
     rows_buffered: usize,
 }
 
 impl TableOutput {
-    pub fn new(no_color: bool, keys_only: bool, max_cell_width: usize) -> Self {
+    pub fn new(no_color: bool, columns: Vec<SelectItem>, max_cell_width: usize) -> Self {
         let mut table = Table::new();
         table
             .load_preset(UTF8_FULL)
@@ -28,21 +29,12 @@ impl TableOutput {
             table.set_width((max_cell_width * 2) as u16);
         }
 
-        let mut header = vec![
-            hdr("Partition", no_color),
-            hdr("Offset", no_color),
-            hdr("Timestamp", no_color),
-            hdr("Key", no_color),
-        ];
-        if !keys_only {
-            header.push(hdr("Value (JSON / Text)", no_color));
-        }
-        table.set_header(header);
+        table.set_header(make_header(&columns, no_color));
 
         Self {
             table,
             no_color,
-            keys_only,
+            columns,
             max_cell_width,
             rows_buffered: 0,
         }
@@ -51,19 +43,17 @@ impl TableOutput {
 
 impl OutputSink for TableOutput {
     fn push(&mut self, env: &MessageEnvelope) {
-        let ts_str = fmt_ts(env.timestamp_ms);
-        let mut row = vec![
-            cell(env.partition, self.no_color),
-            cell(env.offset, self.no_color),
-            cell(ts_str, self.no_color),
-            cell(&env.key, self.no_color),
-        ];
-
-        if !self.keys_only {
-            let v = env.value.as_deref().unwrap_or("null");
-            row.push(cell(v, self.no_color));
-        }
-
+        let row = self
+            .columns
+            .iter()
+            .map(|col| match col {
+                SelectItem::Partition => cell(env.partition, self.no_color),
+                SelectItem::Offset => cell(env.offset, self.no_color),
+                SelectItem::Timestamp => cell(fmt_ts(env.timestamp_ms), self.no_color),
+                SelectItem::Key => cell(&env.key, self.no_color),
+                SelectItem::Value => cell(env.value.as_deref().unwrap_or("null"), self.no_color),
+            })
+            .collect::<Vec<_>>();
         self.table.add_row(row);
         self.rows_buffered += 1;
     }
@@ -75,7 +65,6 @@ impl OutputSink for TableOutput {
         println!("{}", self.table);
 
         // Recreate table with same header so each block prints a header
-        let header = self.table.header().cloned();
         self.table = Table::new();
         self.table
             .load_preset(UTF8_FULL)
@@ -84,9 +73,8 @@ impl OutputSink for TableOutput {
         if self.max_cell_width > 0 {
             self.table.set_width((self.max_cell_width * 2) as u16);
         }
-        if let Some(h) = header {
-            self.table.set_header(h);
-        }
+        self.table
+            .set_header(make_header(&self.columns, self.no_color));
         self.rows_buffered = 0;
     }
 }
@@ -119,4 +107,20 @@ fn hdr(text: &str, _no_color: bool) -> Cell {
 
 fn cell<T: std::fmt::Display>(v: T, _no_color: bool) -> Cell {
     Cell::new(v)
+}
+
+fn make_header(columns: &[SelectItem], no_color: bool) -> Vec<Cell> {
+    columns
+        .iter()
+        .map(|col| {
+            let label = match col {
+                SelectItem::Partition => "Partition",
+                SelectItem::Offset => "Offset",
+                SelectItem::Timestamp => "Timestamp",
+                SelectItem::Key => "Key",
+                SelectItem::Value => "Value (JSON / Text)",
+            };
+            hdr(label, no_color)
+        })
+        .collect()
 }

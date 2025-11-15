@@ -1,5 +1,6 @@
 use super::env_store::{EnvStore, Environment};
 use crate::models::{MessageEnvelope, SslConfig};
+use crate::query::SelectItem;
 use std::time::Instant;
 use tui_textarea::TextArea;
 
@@ -12,7 +13,7 @@ pub struct AppState {
     pub status_buffer: String,
     pub status_vscroll: u16,
     pub rows: Vec<MessageEnvelope>,
-    pub keys_only: bool,
+    pub selected_columns: Vec<SelectItem>,
     pub current_run: Option<u64>,
     pub max_rows_in_memory: usize,
     pub host: String,
@@ -62,7 +63,7 @@ impl AppState {
             status_buffer: String::new(),
             status_vscroll: 0,
             rows: Vec::new(),
-            keys_only: false,
+            selected_columns: SelectItem::standard(true),
             current_run: None,
             max_rows_in_memory: 2000,
             host,
@@ -156,7 +157,7 @@ impl AppState {
         } else if self.selected_row >= self.rows.len() {
             self.selected_row = self.rows.len().saturating_sub(1);
         }
-        let cols = if self.keys_only { 4 } else { 5 };
+        let cols = self.selected_columns.len().max(1);
         if self.selected_col >= cols {
             self.selected_col = cols.saturating_sub(1);
         }

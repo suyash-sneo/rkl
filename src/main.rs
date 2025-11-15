@@ -48,10 +48,10 @@ async fn main() -> Result<()> {
                 "{}",
                 format!("Connecting to Kafka broker: {}", args.broker).cyan()
             );
-            let (query_ast, topic, keys_only, max_messages, order_desc) =
+            let (query_ast, topic, columns, max_messages, order_desc) =
                 if let Some(ref q) = args.query {
                     let ast = parse_query(q).context("Failed to parse --query")?;
-                    let keys_only = !ast.select.iter().any(|i| matches!(i, SelectItem::Value));
+                    let columns = ast.select.clone();
                     let max_messages = ast.limit.or(args.max_messages);
                     let order_desc = ast
                         .order
@@ -61,15 +61,18 @@ async fn main() -> Result<()> {
                     println!("{}", format!("Using query: {}", q).cyan());
                     println!("{}", format!("Topic: {}", ast.from).cyan());
                     let topic_name = ast.from.clone();
-                    (Some(ast), topic_name, keys_only, max_messages, order_desc)
+                    (Some(ast), topic_name, columns, max_messages, order_desc)
                 } else {
                     let topic_value = args
                         .topic
                         .clone()
                         .expect("topic is required unless --query is provided");
                     println!("{}", format!("Topic: {}", topic_value).cyan());
-                    (None, topic_value, args.keys_only, args.max_messages, false)
+                    let columns = SelectItem::standard(!args.keys_only);
+                    (None, topic_value, columns, args.max_messages, false)
                 };
+
+            let keys_only = !columns.iter().any(|c| matches!(c, SelectItem::Value));
 
             // One-time consumer just to fetch metadata / partitions
             let mut probe_cfg = ClientConfig::new();
@@ -157,7 +160,8 @@ async fn main() -> Result<()> {
             drop(tx); // merger will know when producers are done
 
             // Output sink (table)
-            let mut table_out = TableOutput::new(args.no_color, keys_only, args.max_cell_width);
+            let mut table_out =
+                TableOutput::new(args.no_color, columns.clone(), args.max_cell_width);
 
             // Merge + print
             run_merger(
@@ -243,25 +247,28 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
     // Run the same pipeline as the Run subcommand and log errors
     let res = async {
         // One-time consumer just to fetch metadata / partitions
-        let (query_ast, topic, keys_only, max_messages, order_desc) =
-            if let Some(ref q) = args.query {
-                let ast = parse_query(q).context("Failed to parse --query")?;
-                let keys_only = !ast.select.iter().any(|i| matches!(i, SelectItem::Value));
-                let max_messages = ast.limit.or(args.max_messages);
-                let order_desc = ast
-                    .order
-                    .as_ref()
-                    .map(|o| matches!(o.dir, OrderDir::Desc))
-                    .unwrap_or(false);
-                let topic_name = ast.from.clone();
-                (Some(ast), topic_name, keys_only, max_messages, order_desc)
-            } else {
-                let topic_value = args
-                    .topic
-                    .clone()
-                    .context("topic is required unless --query is provided")?;
-                (None, topic_value, args.keys_only, args.max_messages, false)
-            };
+        let (query_ast, topic, columns, max_messages, order_desc) = if let Some(ref q) = args.query
+        {
+            let ast = parse_query(q).context("Failed to parse --query")?;
+            let columns = ast.select.clone();
+            let max_messages = ast.limit.or(args.max_messages);
+            let order_desc = ast
+                .order
+                .as_ref()
+                .map(|o| matches!(o.dir, OrderDir::Desc))
+                .unwrap_or(false);
+            let topic_name = ast.from.clone();
+            (Some(ast), topic_name, columns, max_messages, order_desc)
+        } else {
+            let topic_value = args
+                .topic
+                .clone()
+                .context("topic is required unless --query is provided")?;
+            let columns = SelectItem::standard(!args.keys_only);
+            (None, topic_value, columns, args.max_messages, false)
+        };
+
+        let keys_only = !columns.iter().any(|c| matches!(c, SelectItem::Value));
 
         let mut probe_cfg = ClientConfig::new();
         probe_cfg
@@ -336,7 +343,7 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
             );
         }
         drop(tx);
-        let mut table_out = TableOutput::new(args.no_color, keys_only, args.max_cell_width);
+        let mut table_out = TableOutput::new(args.no_color, columns.clone(), args.max_cell_width);
         run_merger(
             rx,
             &mut table_out,

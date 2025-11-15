@@ -186,7 +186,13 @@ impl<'a> Parser<'a> {
         let mut items = Vec::new();
         loop {
             self.skip_ws();
-            if self.try_consume_word_case("key") {
+            if self.try_consume_word_case("partition") {
+                items.push(SelectItem::Partition);
+            } else if self.try_consume_word_case("offset") {
+                items.push(SelectItem::Offset);
+            } else if self.try_consume_word_case("timestamp") {
+                items.push(SelectItem::Timestamp);
+            } else if self.try_consume_word_case("key") {
                 items.push(SelectItem::Key);
             } else if self.try_consume_word_case("value") {
                 items.push(SelectItem::Value);
@@ -518,6 +524,21 @@ mod tests {
             })
         ));
         assert_eq!(ast.limit, Some(10));
+    }
+
+    #[test]
+    fn parses_extended_columns() {
+        let q = "SELECT partition, OFFSET, Timestamp, key FROM foo";
+        let ast = parse_query(q).expect("parse ok");
+        assert_eq!(
+            ast.select,
+            vec![
+                SelectItem::Partition,
+                SelectItem::Offset,
+                SelectItem::Timestamp,
+                SelectItem::Key,
+            ]
+        );
     }
 
     fn where_expr(query: &str) -> Expr {

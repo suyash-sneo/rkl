@@ -1,4 +1,5 @@
 use crate::models::MessageEnvelope;
+use crate::query::SelectItem;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::*;
 use ratatui::style::{Color, Modifier, Style};
@@ -257,7 +258,7 @@ fn draw_status_panel(frame: &mut Frame, area: Rect, app: &AppState) {
 fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
     let total = app.rows.len();
     let row = if total == 0 { 0 } else { app.selected_row + 1 };
-    let cols = if app.keys_only { 4 } else { 5 };
+    let cols = app.selected_columns.len();
     let col = if cols == 0 { 0 } else { app.selected_col + 1 };
     let legend = format!(
         "F8 Home  F2 Envs  F12 Info  F10 Help | Tab focus | Query: Enter newline, Ctrl-Enter run, Ctrl/Alt+←/→ move word, Ctrl/Alt+Backspace/Delete delete word, Ctrl+Home/End doc | Results: arrows, Shift-←/→ h-scroll | F5 copy payload | F7 copy status | Ctrl-Q/Ctrl-C quit | Row {row}/{total} Col {col}/{cols}"
@@ -665,22 +666,11 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
 }
 
 fn draw_table(frame: &mut Frame, area: Rect, app: &AppState) {
-    let headers = if app.keys_only {
-        vec![
-            Cell::from(header_span("Partition")),
-            Cell::from(header_span("Offset")),
-            Cell::from(header_span("Timestamp")),
-            Cell::from(header_span("Key")),
-        ]
-    } else {
-        vec![
-            Cell::from(header_span("Partition")),
-            Cell::from(header_span("Offset")),
-            Cell::from(header_span("Timestamp")),
-            Cell::from(header_span("Key")),
-            Cell::from(header_span("Value")),
-        ]
-    };
+    let headers: Vec<Cell> = app
+        .selected_columns
+        .iter()
+        .map(|col| Cell::from(header_span(column_label(col))))
+        .collect();
 
     // Create single-line rows with truncated previews; full JSON moves to right pane
     let rows: Vec<Row> = app
@@ -690,22 +680,13 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &AppState) {
         .map(|(i, env)| make_row(i, env, app))
         .collect();
 
-    let constraints = if app.keys_only {
-        vec![
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Length(26),
-            Constraint::Percentage(100),
-        ]
+    let mut constraints: Vec<Constraint> =
+        app.selected_columns.iter().map(column_constraint).collect();
+    if let Some(last) = constraints.last_mut() {
+        *last = Constraint::Percentage(100);
     } else {
-        vec![
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Length(26),
-            Constraint::Length(30),
-            Constraint::Percentage(100),
-        ]
-    };
+        constraints.push(Constraint::Percentage(100));
+    }
 
     let table = Table::new(rows, constraints)
         .header(Row::new(headers).style(Style::default().add_modifier(Modifier::BOLD)))
@@ -738,15 +719,18 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &AppState) {
     }
 
     // Horizontal scrollbar for table (approximate by preview width)
-    let content_w_estimate = estimate_table_content_width(app);
-    let visible_w = area.width.saturating_sub(2) as usize; // minus borders
-    let h_content = content_w_estimate
-        .saturating_sub(visible_w)
-        .saturating_add(1);
-    if h_content > 1 {
-        let mut hs = ScrollbarState::new(h_content).position(app.table_hscroll.min(h_content - 1));
-        let hbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom);
-        frame.render_stateful_widget(hbar, area, &mut hs);
+    if has_value_column(app) {
+        let content_w_estimate = estimate_table_content_width(app);
+        let visible_w = area.width.saturating_sub(2) as usize; // minus borders
+        let h_content = content_w_estimate
+            .saturating_sub(visible_w)
+            .saturating_add(1);
+        if h_content > 1 {
+            let mut hs =
+                ScrollbarState::new(h_content).position(app.table_hscroll.min(h_content - 1));
+            let hbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom);
+            frame.render_stateful_widget(hbar, area, &mut hs);
+        }
     }
 }
 
@@ -754,53 +738,44 @@ fn header_span(text: &str) -> Span<'_> {
     Span::styled(text, Style::default().add_modifier(Modifier::BOLD))
 }
 
-fn make_row(idx: usize, env: &MessageEnvelope, app: &AppState) -> Row<'static> {
-    let ts = fmt_ts(env.timestamp_ms);
-    let keys_only = app.keys_only;
-    let selected = idx == app.selected_row;
-    if keys_only {
-        let row = Row::new(vec![
-            style_cell(
-                Cell::from(env.partition.to_string()),
-                selected && app.selected_col == 0,
-            ),
-            style_cell(
-                Cell::from(env.offset.to_string()),
-                selected && app.selected_col == 1,
-            ),
-            style_cell(Cell::from(ts), selected && app.selected_col == 2),
-            style_cell(
-                Cell::from(env.key.clone()),
-                selected && app.selected_col == 3,
-            ),
-        ])
-        .height(1);
-        row
-    } else {
-        // For the table, render a one-line minified preview of the value with hscroll
-        let raw_value = env.value.as_deref().unwrap_or("null");
-        let preview = json_preview_minified(raw_value);
-        let hscroll = app.table_hscroll;
-        let preview = apply_hscroll(&preview, hscroll);
-        let row = Row::new(vec![
-            style_cell(
-                Cell::from(env.partition.to_string()),
-                selected && app.selected_col == 0,
-            ),
-            style_cell(
-                Cell::from(env.offset.to_string()),
-                selected && app.selected_col == 1,
-            ),
-            style_cell(Cell::from(ts), selected && app.selected_col == 2),
-            style_cell(
-                Cell::from(env.key.clone()),
-                selected && app.selected_col == 3,
-            ),
-            style_cell(Cell::from(preview), selected && app.selected_col == 4),
-        ])
-        .height(1);
-        row
+fn column_label(col: &SelectItem) -> &'static str {
+    match col {
+        SelectItem::Partition => "Partition",
+        SelectItem::Offset => "Offset",
+        SelectItem::Timestamp => "Timestamp",
+        SelectItem::Key => "Key",
+        SelectItem::Value => "Value",
     }
+}
+
+fn column_constraint(col: &SelectItem) -> Constraint {
+    match col {
+        SelectItem::Partition => Constraint::Length(10),
+        SelectItem::Offset => Constraint::Length(12),
+        SelectItem::Timestamp => Constraint::Length(26),
+        SelectItem::Key => Constraint::Length(30),
+        SelectItem::Value => Constraint::Length(30),
+    }
+}
+
+fn make_row(idx: usize, env: &MessageEnvelope, app: &AppState) -> Row<'static> {
+    let selected_row = idx == app.selected_row;
+    let mut cells = Vec::new();
+    for (col_idx, col) in app.selected_columns.iter().enumerate() {
+        let text = match col {
+            SelectItem::Value => {
+                let raw_value = env.value.as_deref().unwrap_or("null");
+                let preview = json_preview_minified(raw_value);
+                apply_hscroll(&preview, app.table_hscroll)
+            }
+            _ => column_raw_text(env, *col),
+        };
+        cells.push(style_cell(
+            Cell::from(text),
+            selected_row && app.selected_col == col_idx,
+        ));
+    }
+    Row::new(cells).height(1)
 }
 
 fn style_cell(mut cell: Cell<'static>, selected: bool) -> Cell<'static> {
@@ -980,12 +955,46 @@ fn apply_hscroll(s: &str, offset: usize) -> String {
     s.chars().skip(offset).collect()
 }
 
+fn column_raw_text(env: &MessageEnvelope, col: SelectItem) -> String {
+    match col {
+        SelectItem::Partition => env.partition.to_string(),
+        SelectItem::Offset => env.offset.to_string(),
+        SelectItem::Timestamp => fmt_ts(env.timestamp_ms),
+        SelectItem::Key => env.key.clone(),
+        SelectItem::Value => env.value.as_deref().unwrap_or("null").to_string(),
+    }
+}
+
+fn column_width_hint(col: SelectItem) -> usize {
+    match col {
+        SelectItem::Partition => 10,
+        SelectItem::Offset => 12,
+        SelectItem::Timestamp => 26,
+        SelectItem::Key => 30,
+        SelectItem::Value => 40,
+    }
+}
+
+fn has_value_column(app: &AppState) -> bool {
+    app.selected_columns
+        .iter()
+        .any(|c| matches!(c, SelectItem::Value))
+}
+
 fn estimate_table_content_width(app: &AppState) -> usize {
     // Approximate widths of fixed columns + spacing + average key/value preview length
-    let fixed: usize = 10 + 1 + 12 + 1 + 26 + 1 + 30 + 1; // partition+sp+offset+sp+ts+sp+key+sp
-    if app.keys_only {
-        // no value column
-        return fixed.saturating_sub(1); // last spacing unnecessary
+    let mut fixed = 0usize;
+    for (idx, col) in app.selected_columns.iter().enumerate() {
+        if idx > 0 {
+            fixed = fixed.saturating_add(1);
+        }
+        match col {
+            SelectItem::Value => {}
+            _ => fixed = fixed.saturating_add(column_width_hint(*col)),
+        }
+    }
+    if !has_value_column(app) {
+        return fixed;
     }
     let mut max_preview = 0usize;
     for env in &app.rows {
@@ -1059,28 +1068,17 @@ fn draw_json_detail(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn selected_cell_for_detail(app: &AppState) -> (String, Option<String>) {
-    if app.rows.is_empty() {
+    if app.rows.is_empty() || app.selected_columns.is_empty() {
         return ("none".to_string(), None);
     }
     let idx = app.selected_row.min(app.rows.len() - 1);
     let env = &app.rows[idx];
-    let (title, s) = if app.keys_only {
-        match app.selected_col.min(3) {
-            0 => ("Partition", env.partition.to_string()),
-            1 => ("Offset", env.offset.to_string()),
-            2 => ("Timestamp", fmt_ts(env.timestamp_ms)),
-            3 => ("Key", env.key.clone()),
-            _ => ("", String::new()),
-        }
-    } else {
-        match app.selected_col.min(4) {
-            0 => ("Partition", env.partition.to_string()),
-            1 => ("Offset", env.offset.to_string()),
-            2 => ("Timestamp", fmt_ts(env.timestamp_ms)),
-            3 => ("Key", env.key.clone()),
-            4 => ("Value", env.value.as_deref().unwrap_or("null").to_string()),
-            _ => ("", String::new()),
-        }
-    };
-    (title.to_string(), Some(s))
+    let col_idx = app
+        .selected_col
+        .min(app.selected_columns.len().saturating_sub(1));
+    let col = app.selected_columns[col_idx];
+    (
+        column_label(&col).to_string(),
+        Some(column_raw_text(env, col)),
+    )
 }
