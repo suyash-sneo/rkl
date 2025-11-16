@@ -33,11 +33,7 @@ impl EnvStore {
                         }
                     }
                     if let Ok(s) = fs::read_to_string(&path) {
-                        if let Ok(mut e) = serde_json::from_str::<Environment>(&s) {
-                            // Decode any encoded newlines ("\n") back to real newlines for editing/usage
-                            e.private_key_pem = e.private_key_pem.map(decode_newlines);
-                            e.public_key_pem = e.public_key_pem.map(decode_newlines);
-                            e.ssl_ca_pem = e.ssl_ca_pem.map(decode_newlines);
+                        if let Ok(e) = serde_json::from_str::<Environment>(&s) {
                             envs.push(e);
                         }
                     }
@@ -102,6 +98,7 @@ fn encode_newlines(s: String) -> String {
     s.replace('\n', "\\n")
 }
 
+#[allow(dead_code)]
 fn decode_newlines(s: String) -> String {
     // Convert literal \n sequences back to newline characters
     // Note: we only replace unescaped sequences; a naive replace works for our config inputs

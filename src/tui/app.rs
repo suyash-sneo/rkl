@@ -191,6 +191,7 @@ pub struct EnvEditor {
     pub ta_private: TextArea<'static>,
     pub ta_public: TextArea<'static>,
     pub ta_ca: TextArea<'static>,
+    #[allow(dead_code)]
     pub ssl_ca_cursor: usize,
     pub field_focus: EnvFieldFocus,
 }

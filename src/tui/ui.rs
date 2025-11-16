@@ -315,34 +315,36 @@ fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
     let host_val = ed.map(|e| e.host.clone()).unwrap_or_default();
     // Values are drawn via TextAreas; no pre-rendered strings needed here.
 
-    let title_name = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Name)) {
+    let title_name_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Name)) {
         "Name [FOCUSED]"
     } else {
         "Name"
     };
-    let title_host = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Host)) {
+    let title_name = format!("{title_name_base}  [Copy] [Paste]");
+    let title_host_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Host)) {
         "Host [FOCUSED]"
     } else {
         "Host"
     };
+    let title_host = format!("{title_host_base}  [Copy] [Paste]");
     let title_pk_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::PrivateKey)) {
         "Private Key (PEM) [FOCUSED]"
     } else {
         "Private Key (PEM)"
     };
-    let title_pk = format!("{}  [Copy]", title_pk_base);
+    let title_pk = format!("{}  [Copy] [Paste] [Clear]", title_pk_base);
     let title_cert_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::PublicKey)) {
         "Public/Certificate (PEM) [FOCUSED]"
     } else {
         "Public/Certificate (PEM)"
     };
-    let title_cert = format!("{}  [Copy]", title_cert_base);
+    let title_cert = format!("{}  [Copy] [Paste] [Clear]", title_cert_base);
     let title_ca_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Ca)) {
         "SSL CA (PEM) [FOCUSED]"
     } else {
         "SSL CA (PEM)"
     };
-    let title_ca = format!("{}  [Copy]", title_ca_base);
+    let title_ca = format!("{}  [Copy] [Paste] [Clear]", title_ca_base);
 
     frame.render_widget(
         Paragraph::new(name_val.clone())
@@ -426,9 +428,9 @@ fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
         app.env_editor.as_ref().map(|e| e.field_focus),
         Some(EnvFieldFocus::Conn)
     ) {
-        "Connection [FOCUSED]  [Copy/F9 Select]"
+        "Connection [FOCUSED]  [Copy] [Paste/F9 Select]"
     } else {
-        "Connection  [Copy/F9 Select]"
+        "Connection  [Copy] [Paste/F9 Select]"
     };
     let conn_block = Block::default().borders(Borders::ALL).title(conn_title);
     let conn_para = Paragraph::new(status_text)
