@@ -34,7 +34,7 @@ use super::app::{
 use super::env_store::Environment;
 use super::env_store::config_dir;
 use super::query_bounds::{find_query_range, strip_trailing_semicolon};
-use super::ui::draw;
+use super::ui::{draw, help_content_line_count};
 
 const ENV_COPY_LABEL: &str = "[Copy]";
 const ENV_PASTE_LABEL: &str = "[Paste]";
@@ -189,11 +189,31 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     let KeyEvent {
                         code, modifiers, ..
                     } = key;
+                    if app.show_help {
+                        match code {
+                            KeyCode::Esc | KeyCode::F(10) => {
+                                app.show_help = false;
+                            }
+                            KeyCode::Up => scroll_help(&mut app, -1),
+                            KeyCode::Down => scroll_help(&mut app, 1),
+                            KeyCode::PageUp => scroll_help(&mut app, -10),
+                            KeyCode::PageDown => scroll_help(&mut app, 10),
+                            KeyCode::Home => app.help_vscroll = 0,
+                            KeyCode::End => jump_help_to_end(&mut app),
+                            _ => {}
+                        }
+                        continue;
+                    }
                     match (code, modifiers) {
                         (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
                         (KeyCode::Char('q'), KeyModifiers::CONTROL) => break Ok(()),
                         (KeyCode::F(10), _) => {
-                            app.show_help = !app.show_help;
+                            if app.show_help {
+                                app.show_help = false;
+                            } else {
+                                app.show_help = true;
+                                app.help_vscroll = 0;
+                            }
                         }
                         (KeyCode::F(8), _) => {
                             app.screen = Screen::Home;
@@ -1204,6 +1224,14 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     }
                 }
                 Event::Mouse(me) => {
+                    if app.show_help {
+                        match me.kind {
+                            MouseEventKind::ScrollUp => scroll_help(&mut app, -3),
+                            MouseEventKind::ScrollDown => scroll_help(&mut app, 3),
+                            _ => {}
+                        }
+                        continue;
+                    }
                     // Also route to textareas in Envs screen for scroll/paste-like mouse actions
                     if matches!(app.screen, Screen::Envs) {
                         if let Some(ed) = app.env_editor.as_mut() {
@@ -2028,6 +2056,27 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
         }
         _ => {}
     }
+}
+
+fn scroll_help(app: &mut AppState, delta: i32) {
+    let mut next = app.help_vscroll as i32 + delta;
+    if next < 0 {
+        next = 0;
+    }
+    let max = help_max_scroll() as i32;
+    if next > max {
+        next = max;
+    }
+    app.help_vscroll = next as u32;
+}
+
+fn jump_help_to_end(app: &mut AppState) {
+    app.help_vscroll = help_max_scroll();
+}
+
+fn help_max_scroll() -> u32 {
+    let total_lines = help_content_line_count();
+    total_lines.saturating_sub(1) as u32
 }
 
 fn fetch_topics_async(app: &AppState, tx: mpsc::UnboundedSender<TuiEvent>) {

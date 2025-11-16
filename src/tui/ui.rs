@@ -64,7 +64,7 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
     }
 
     if app.show_help {
-        draw_help_overlay(frame, size);
+        draw_help_overlay(frame, size, app);
     }
 }
 
@@ -344,36 +344,22 @@ fn draw_status_panel(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
-    let (row, total) = match app.results_mode {
-        ResultsMode::Messages => {
-            let total = app.rows.len();
-            let row = if total == 0 { 0 } else { app.selected_row + 1 };
-            (row, total)
-        }
-        ResultsMode::TopicList => {
-            let total = app.topics_with_partitions.len();
-            let row = if total == 0 { 0 } else { app.selected_row + 1 };
-            (row, total)
-        }
-    };
-    let (col, cols) = if matches!(app.results_mode, ResultsMode::Messages) {
-        let cols = app.selected_columns.len();
-        let col = if cols == 0 { 0 } else { app.selected_col + 1 };
-        (col, cols)
-    } else {
-        (0, 0)
-    };
-    let legend = format!(
-        "F8 Home  F2 Envs  F12 Info  F10 Help | Tab focus | Query: Enter newline, Ctrl-Enter run, Ctrl/Alt+←/→ move word, Ctrl/Alt+Backspace/Delete delete word, Ctrl+Home/End doc, Right/Ctrl-Y accept autocomplete, Ctrl-N/P navigate | Results: arrows, Shift-←/→ h-scroll | F5 copy payload | F7 copy status | Ctrl-Q/Ctrl-C quit | Row {row}/{total}{}",
-        if matches!(app.results_mode, ResultsMode::Messages) {
-            format!(" Col {col}/{cols}")
-        } else {
-            String::new()
-        }
-    );
+    let legend = footer_legend(app);
     let block = Block::default().borders(Borders::ALL).title("Help");
     let para = Paragraph::new(legend).block(block);
     frame.render_widget(para, area);
+}
+
+fn footer_legend(app: &AppState) -> String {
+    match app.screen {
+        Screen::Home => match app.focus {
+            Focus::Query => "Tab focus | Query: Enter newline, Ctrl-Enter run, Right accept autocomplete, Ctrl-N/P navigate autocomplete | F10 Help | Ctrl-Q/C quit".to_string(),
+            Focus::Results => "Tab focus | Results: arrows select, Shift-←/→ h-scroll, F5 copy value, F7 copy status | F10 Help | Ctrl-Q/C quit".to_string(),
+            Focus::Host => "Tab focus | Host: Enter open envs, F2 Envs | F10 Help | Ctrl-Q/C quit".to_string(),
+        },
+        Screen::Envs => "F4 Save, F5 Test, Tab move, Up/Down select, Esc Close | F10 Help".to_string(),
+        Screen::Info => "F6 Refresh, F8 Home | F10 Help | Ctrl-Q/C quit".to_string(),
+    }
 }
 
 fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -813,26 +799,130 @@ fn draw_topics(frame: &mut Frame, area: Rect, app: &AppState) {
     frame.render_widget(list, area);
 }
 
-fn draw_help_overlay(frame: &mut Frame, area: Rect) {
+fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &AppState) {
     let popup = centered_rect(70, 70, area);
     frame.render_widget(Clear, popup);
-    let help = vec![
-        Line::from("F8 Home  F2 Envs  F12 Info  F10 Help"),
-        Line::from("Ctrl-Q/Ctrl-C Quit"),
-        Line::from(
-            "Home: Ctrl-Enter run; Ctrl/Alt+←/→ move word; Ctrl/Alt+Backspace/Delete delete word; Ctrl+Home/End doc; arrows move; F5 copy payload; F7 copy status; Shift-←/→ h-scroll",
-        ),
-        Line::from("Envs: F4 Save  F3 Delete  F1 New  F5 Test  Up/Down select  Tab next field"),
-        Line::from("Info: F6 Refresh topics"),
-    ];
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Help")
         .border_style(Style::default().fg(Color::Yellow));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let para = Paragraph::new(Text::from(help)).wrap(Wrap { trim: false });
+
+    let lines = build_help_lines();
+    let total_lines = lines.len();
+    let visible = inner.height.max(1) as usize;
+    let max_scroll = total_lines.saturating_sub(visible);
+    let requested = app.help_vscroll as usize;
+    let scroll = requested.min(max_scroll);
+    let scroll_u16 = scroll.min(u16::MAX as usize) as u16;
+
+    let para = Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_u16, 0));
     frame.render_widget(para, inner);
+
+    if total_lines > visible {
+        let mut vs = ScrollbarState::new(total_lines).position(scroll);
+        let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(vbar, inner, &mut vs);
+    }
+}
+
+pub fn help_content_line_count() -> usize {
+    build_help_lines().len()
+}
+
+fn build_help_lines() -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(heading_line("Global"));
+    lines.push(Line::from("- F8 Home, F2 Envs, F12 Info, F10 Help"));
+    lines.push(Line::from("- Ctrl-Q/C quit"));
+    lines.push(Line::from(""));
+
+    lines.push(heading_line("Home - Host bar"));
+    lines.push(Line::from("- Tab focus; Enter open envs; F2 Envs for full screen"));
+    lines.push(Line::from(""));
+
+    lines.push(heading_line("Home - Query"));
+    lines.push(Line::from("- Ctrl-Enter run current SELECT; Enter newline"));
+    lines.push(Line::from(
+        "- Right accept autocomplete; Ctrl-N/P navigate autocomplete",
+    ));
+    lines.push(Line::from(
+        "- Ctrl/Alt+Left/Right move word; Ctrl/Alt+Backspace/Delete delete word",
+    ));
+    lines.push(Line::from(
+        "- Ctrl+Home/End jump buffer; PageUp/PageDown scroll editor",
+    ));
+    lines.push(Line::from(""));
+
+    lines.push(heading_line("Home - Results"));
+    lines.push(Line::from(
+        "- Arrows move selection; PageUp/PageDown step; Home/End jump",
+    ));
+    lines.push(Line::from(
+        "- Shift-Left/Right horizontal scroll; F5 copy value; F7 copy status",
+    ));
+    lines.push(Line::from("- Mouse wheel scroll supported"));
+    lines.push(Line::from(""));
+
+    lines.push(heading_line("Environments"));
+    lines.push(Line::from("- F1 New, F2 Edit, F3 Delete"));
+    lines.push(Line::from("- F4 Save, F5 Test, Tab/Shift-Tab move fields"));
+    lines.push(Line::from("- Up/Down select; F9 toggle mouse select; Esc close"));
+    lines.push(Line::from("- Text areas accept typing and paste"));
+    lines.push(Line::from(""));
+
+    lines.push(heading_line("Info screen"));
+    lines.push(Line::from("- F6 Refresh topics"));
+    lines.push(Line::from(""));
+
+    lines.push(heading_line("Query syntax"));
+    lines.push(Line::from(
+        "- SELECT columns FROM topic [WHERE expr] [ORDER BY timestamp ASC|DESC] [LIMIT n]",
+    ));
+    lines.push(Line::from("- JSON path via value->field->subfield"));
+    lines.push(Line::from("- Operators: =, !=, <>, CONTAINS"));
+    lines.push(Line::from(""));
+
+    lines.push(heading_line("Examples"));
+    lines.push(Line::from("  SELECT key, value FROM my_topic LIMIT 10;"));
+    lines.push(Line::from(
+        "  SELECT key FROM t WHERE value->response->msg CONTAINS 'error';",
+    ));
+    lines.push(Line::from(
+        "  SELECT key, value FROM random-data WHERE value->event->type = 'purchase' AND value->response->status = 200;",
+    ));
+    lines.push(Line::from(
+        "  SELECT key FROM t WHERE (key = 'a' OR key = 'b') AND value->foo CONTAINS 'x' ORDER BY timestamp DESC LIMIT 100;",
+    ));
+    lines.push(Line::from("- Special command: LIST topics;"));
+    lines.push(Line::from(""));
+
+    lines.push(heading_line("Autocomplete"));
+    lines.push(Line::from(
+        "- Triggered after typing FROM and a space in a SELECT",
+    ));
+    lines.push(Line::from("- Fuzzy-matched suggestions for topics"));
+    lines.push(Line::from("- Right accepts; Ctrl-N/Ctrl-P move; Esc dismiss"));
+    lines.push(Line::from(""));
+
+    lines.push(heading_line("Help navigation"));
+    lines.push(Line::from(
+        "- Scroll with Up/Down or PageUp/PageDown; Home/End jump",
+    ));
+
+    lines
+}
+
+fn heading_line(text: &'static str) -> Line<'static> {
+    Line::from(vec![Span::styled(
+        text,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )])
 }
 
 fn draw_table(frame: &mut Frame, area: Rect, app: &AppState) {

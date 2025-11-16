@@ -39,6 +39,7 @@ pub struct AppState {
     // Screens
     pub screen: Screen,
     pub show_help: bool,
+    pub help_vscroll: u32,
     // Info screen
     pub topics: Vec<String>,
     pub autocomplete: Option<AutoCompleteState>,
@@ -92,6 +93,7 @@ impl AppState {
             mouse_selection_mode: false,
             screen: Screen::Home,
             show_help: false,
+            help_vscroll: 0,
             topics: Vec::new(),
             autocomplete: None,
             topics_last_fetched_at: None,

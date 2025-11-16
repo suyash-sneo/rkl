@@ -1,136 +1,121 @@
 # RKL
 
-A TUI kafka tool that allows you to write SQL-like queries to read data from Kafka topics.
+RKL is a terminal UI for exploring Kafka topics with an SQL-like experience. It pairs a query editor, results table, JSON payload viewer, and environment manager so you can inspect data quickly without writing ad-hoc consumers.
 
 ![RKL TUI Screenshot](/assets/rkl-screenshot.png?raw=true)
 
-# Instructions
+## Features
 
-## Installation
-Install latest (no sudo):
+- SQL-inspired query engine (`SELECT`, `WHERE`, `ORDER BY timestamp`, `LIMIT`) with JSON-path filtering via `value->field->subfield`.
+- Real-time results table with horizontal scrolling plus a right-side JSON pane for the focused record.
+- Topic inspection with the `LIST topics;` command and an Info screen (F12) that caches broker metadata.
+- Fuzzy topic autocomplete triggered after `FROM`, accepted with Right arrow, and navigated with `Ctrl-N`/`Ctrl-P`.
+- Environment manager for hosts, credentials, and PEM-encoded CA/cert/key material with a built-in connectivity test.
+- Dedicated CLI mode for one-shot queries (`rkl run ...`) when you need to script output or run inside CI.
+
+## Quickstart
+
+1. Install the binary with one of the scripts below (no sudo required).
+2. Launch `rkl` to open the Home screen, tab into the Query editor, and press `Ctrl-Enter` to run your `SELECT`.
+3. Switch environments with `F2` or Enter on the host bar, and use `LIST topics;` or the sample queries below to explore data.
+
+Install latest:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | bash
 ```
 
 Install a specific version:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | RKL_VERSION=v0.1.0 bash
 ```
 
 Custom install location:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | RKL_INSTALL_DIR="$HOME/bin" bash
 ```
 
-## Uninstall
-Default location (`~/.local/bin`):
+Uninstall (default path `~/.local/bin`):
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/uninstall.sh | bash
 ```
 
 Uninstall from a custom location:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/uninstall.sh | RKL_INSTALL_DIR="$HOME/bin" bash
 ```
 
-# Progress
+## Query Language
 
-## Query Parsing
+- Syntax: `SELECT columns FROM topic [WHERE expr] [ORDER BY timestamp ASC|DESC] [LIMIT n]`.
+- Filter JSON by walking nested fields with `value->meta->service`, `value->response->status`, etc. `key` and raw `value` also support comparisons.
+- Operators: `=`, `!=`, `<>`, `CONTAINS`, `AND`, `OR`, and parentheses for grouping. `timestamp` is the only sortable column.
+- End queries with `;` to separate multiple statements; the editor highlights the current query under the cursor.
 
-Simple parser is built which can parse
-1. SELECT accepts any combination (and ordering) of the columns `PARTITION`, `OFFSET`, `TIMESTAMP`, `KEY`, and `VALUE` (case-insensitive). The output table only shows the columns you request
-2. FROM is the topic name
-3. WHERE takes multiple conditions (`=`, `!=`, `<>`, `CONTAINS`). These conditions can be grouped/combined with `AND`, `OR`, `()`
-4. ORDER BY takes timestamp only but can be followed by ASC/DESC
-5. LIMIT takes a number
-6. It's recommended to end queries with `;`
+Examples:
 
-## TUI
-
-Main TUI with: 
-1. Envs window
-2. Query editor (with highlighting for current and last-run query) plus SQL syntax highlighting
-3. Output with table-like results
-4. Side output-pane for full data under the cursor
-5. Help footer
-
-Env TUI with:
-1. Left list of envs (basically hosts)
-2. Right side for inputs like hots, private/public key, CA, etc
- 3. Function key controls: F1 New, F2 Edit, F3 Delete, F4 Save, F5 Test (shows progress/errors at bottom), F6/F7 move between fields, Tab/Shift-Tab move, Up/Down select. Esc closes.
-
-For testing locally with mTLS, see `local-test/README.md`.
-
-### Query editor shortcuts
-
-| Shortcut | Action |
-| --- | --- |
-| `Ctrl-Enter` | Run the SELECT statement under the cursor |
-| `Ctrl/Alt + Left` | Move to the previous word boundary |
-| `Ctrl/Alt + Right` | Move to the next word boundary |
-| `Ctrl/Alt + Backspace` | Delete the word to the left of the cursor |
-| `Ctrl/Alt + Delete` | Delete the word to the right of the cursor |
-| `Ctrl + Home` | Jump to the start of the query buffer |
-| `Ctrl + End` | Jump to the end of the query buffer |
-
-
-# Query examples
-
-These examples exercise the WHERE clause features (parentheses, AND/OR precedence, =, !=/<> and CONTAINS) against the realistic payloads produced by `local-test/producer.py` into the `random-data` topic. Each message looks roughly like:
-
-```json
-{
-    "meta": {
-        "id": "<uuid>",
-        "timestamp": <ms>,
-        "service": "auth|orders|billing|catalog|search",
-        "env": "prod|staging",
-        "region": "us-east-1|eu-west-1|ap-south-1"
-    },
-    "request": {
-        "method": "GET|POST|PUT|DELETE",
-        "path": "/api/v1/..."
-    },
-    "response": {
-        "status": <int>,
-        "duration_ms": <int>,
-        "size_bytes": <int>,
-        "msg": "ok|...error..."
-    },
-    "user": {
-        "id": "<uuid>",
-        "role": "admin|customer|service",
-        "country": "US|DE|IN|GB|BR"
-    },
-    "event": {
-        "type": "login|purchase|logout|password_reset|view",
-        "success": <bool>
-    }
-}
+```sql
+SELECT key, value FROM random-data LIMIT 5;
+SELECT key FROM random-data WHERE value->response->msg CONTAINS 'error';
+SELECT key, value FROM random-data WHERE value->event->type = 'purchase' AND value->response->status = 200;
+SELECT key FROM random-data WHERE (key = 'a' OR key = 'b') AND value->foo CONTAINS 'x' ORDER BY timestamp DESC LIMIT 100;
 ```
 
-- Basic listing
-  - `SELECT key, value FROM random-data LIMIT 5`
+For realistic payloads to experiment with, see `local-test/README.md`.
 
-- JSON path equality/inequality
-  - `SELECT key, value FROM random-data WHERE value->request->method = 'PUT';`
-  - `SELECT key, value FROM random-data WHERE value->request->method != 'GET';`
-  - `SELECT key, value FROM random-data WHERE value->response->status <> 200;`
-  - `SELECT key, value FROM random-data WHERE value->event->type = 'purchase' AND value->event->success = true;`
+## Commands (LIST topics)
 
-- CONTAINS on key/value and nested fields (case-sensitive substring)
-  - `SELECT key, value FROM random-data WHERE key CONTAINS 'auth-prod';`  -- keys look like `service-env-region:<user8>`
-  - `SELECT key, value FROM random-data WHERE value CONTAINS 'error';`
-  - `SELECT key, value FROM random-data WHERE value->response->msg CONTAINS 'error';`
+`LIST topics;` runs against the currently selected environment and switches the results view into topic-list mode. Use the arrow keys or mouse wheel to inspect partitions, `F5` to copy the selected value, and `Tab` to return to the query editor for the next command.
 
-- Parentheses and precedence (AND > OR)
-  - `SELECT key, value FROM random-data WHERE (value->meta->service = 'orders' OR value->meta->service = 'billing') AND value->request->method <> 'GET';`
-  - `SELECT key, value FROM random-data WHERE value->response->msg CONTAINS 'error' OR (value->event->type = 'purchase' AND value->response->status = 200);`
+## Autocomplete
 
-- ORDER/LIMIT examples
-  - `SELECT key FROM random-data ORDER BY timestamp DESC LIMIT 20;`
-  - `SELECT key, value FROM random-data WHERE value->response->status >= 500 ORDER BY timestamp ASC LIMIT 10;`  (note: ORDER BY timestamp only; comparison shown for illustration)
+- Trigger: type `FROM ` inside a valid `SELECT` statement.
+- Suggestions are fuzzy-matched against the cached topic list; refresh the list from the Info screen with `F6`.
+- Right arrow accepts the highlighted topic, `Ctrl-N`/`Ctrl-P` move through the list, and `Esc` dismisses the popup.
 
-# Tests 
+## TUI controls (concise)
 
-One simple test to validate parsing for a sample query.
+- `Tab` cycles focus between Host bar, Query editor, and Results. The footer displays context-aware hints for each focus.
+- `Ctrl-Enter` runs the current `SELECT`. Plain `Enter` inserts a newline.
+- `Right` accepts autocomplete suggestions, while `Ctrl-N`/`Ctrl-P` navigate within them.
+- `Shift-Left/Right` horizontally scrolls the results table; `F5` copies the value column and `F7` copies the status panel.
+- `F2` opens the Environments screen, `F8` jumps Home, `F12` opens the Info screen, and `F10` toggles the full help dialog.
+- `Ctrl-Q`/`Ctrl-C` exits at any time.
+
+## Environments & SSL
+
+- Press `F2` or hit `Enter` on the Host bar to open the Environments manager. The left list stores named hosts; the right pane contains fields for broker URL plus optional PEM fields for private key, certificate, and CA.
+- Create (`F1`), edit (`F2`), delete (`F3`), and save (`F4`) environments. Use `F5` to test connectivity with the currently edited credentials before returning to the Home screen.
+- Fields accept pasted PEM blobs, and `F9` toggles mouse-selection mode for easier copying.
+- For end-to-end TLS experiments (including mTLS), try the docker-compose scenario documented in `local-test/README.md`.
+
+## CLI usage
+
+RKL ships with a one-shot CLI that shares the same query parser as the TUI. Either run `rkl run --help` directly or set `RKL_MODE=cli` to make the CLI the default mode.
+
+```sh
+# Run a SELECT and print a table once
+RKL_MODE=cli rkl run --broker localhost:9092 --query "SELECT key, value FROM random-data LIMIT 20;"
+
+# Use --topic/--search when you just need a key/value grep
+rkl run --broker localhost:9092 --topic random-data --search error --max-messages 50
+```
+
+CLI flags mirror the environment fields (including `--ssl-ca-pem`, `--ssl-certificate-pem`, and `--ssl-key-pem`) so you can reuse the same credentials outside of the TUI.
+
+## Build
+
+- `cargo build --release` produces the optimized binary in `target/release/rkl`.
+- `cargo test` and `cargo clippy` keep the parser and helper crates healthy.
+- `cargo run --bin rkl` launches the binary from source; set `RKL_MODE` as needed for TUI vs CLI.
+
+## Troubleshooting
+
+- **SSL or SASL handshake errors**: confirm the CA, certificate, and private key PEMs belong to the selected broker; use `F5 Test` inside the Environments screen to validate before running queries.
+- **Metadata timeouts or empty topic lists**: verify the broker address, firewall rules, and authentication; run `LIST topics;` after pressing `F6` (Info screen) to refresh metadata.
+- **Queries returning no rows**: remove `LIMIT`, double-check `WHERE` clauses (case-sensitive `CONTAINS`), and ensure the timestamp ordering matches your expectation.
+- **CLI output wrapping oddly**: tweak `--max-cell-width` or supply `--no-color` when piping into other tools.
