@@ -3049,18 +3049,51 @@ fn build_topic_suggestions(topics: &[String], filter: &str) -> Vec<String> {
         return list;
     }
     let matcher = SkimMatcherV2::default();
+    let filter_chars: Vec<char> = filter.chars().map(|c| c.to_ascii_lowercase()).collect();
     let mut scored = Vec::new();
     for name in topics {
         if let Some(score) = matcher.fuzzy_match(name, filter) {
-            scored.push((score, name));
+            let distance = levenshtein_casefold(&filter_chars, name);
+            scored.push((distance, score, name));
         }
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    scored.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(b.1.cmp(&a.1))
+            .then_with(|| a.2.cmp(b.2))
+    });
     scored
         .into_iter()
-        .map(|(_, name)| name.clone())
+        .map(|(_, _, name)| name.clone())
         .take(MAX_SUGGESTIONS)
         .collect()
+}
+
+fn levenshtein_casefold(filter_chars: &[char], candidate: &str) -> usize {
+    let rhs: Vec<char> = candidate.chars().map(|c| c.to_ascii_lowercase()).collect();
+    levenshtein_chars(filter_chars, &rhs)
+}
+
+fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=a.len()).collect();
+    let mut curr = vec![0usize; a.len() + 1];
+    for (i, bc) in b.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, ac) in a.iter().enumerate() {
+            let cost = if ac == bc { 0 } else { 1 };
+            curr[j + 1] = (curr[j] + 1)
+                .min(prev[j + 1] + 1)
+                .min(prev[j] + cost);
+        }
+        prev.copy_from_slice(&curr);
+    }
+    prev[a.len()]
 }
 
 fn try_accept_autocomplete(app: &mut AppState) -> bool {

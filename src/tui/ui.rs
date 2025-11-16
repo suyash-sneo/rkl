@@ -188,7 +188,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
     if let Some(ac) = app.autocomplete.as_ref() {
         if ac.active && content.width > 0 && content.height > 2 {
             let max_visible = 6usize;
-            let base_width = content.width.min(40);
+            let base_width = content.width.min(80);
             let available_height = content.height.saturating_sub(2);
             if base_width > 0 && available_height > 0 {
                 let slots = max_visible.min(available_height as usize).max(1);
