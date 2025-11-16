@@ -5,11 +5,11 @@ use ratatui::prelude::*;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Table, TableState, Wrap,
+    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 
-use super::app::{AppState, EnvFieldFocus, Focus, Screen};
+use super::app::{AppState, EnvFieldFocus, Focus, ResultsMode, Screen};
 use super::query_bounds::find_query_range;
 
 pub(super) const COPY_BTN_LABEL: &str = "[ Copy ]";
@@ -184,6 +184,94 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
             frame.set_cursor_position(Position::new(cx, cy));
         }
     }
+
+    if let Some(ac) = app.autocomplete.as_ref() {
+        if ac.active && content.width > 0 && content.height > 2 {
+            let max_visible = 6usize;
+            let base_width = content.width.min(40);
+            let available_height = content.height.saturating_sub(2);
+            if base_width > 0 && available_height > 0 {
+                let slots = max_visible.min(available_height as usize).max(1);
+                let popup_width = base_width.max(10).min(content.width);
+                let total = ac.suggestions.len();
+                let window_len = slots.min(total.max(1));
+                let (mut items, selection): (Vec<ListItem>, Option<usize>) = if total == 0 {
+                    (
+                        vec![ListItem::new(if app.topics.is_empty() {
+                            "Loading topics..."
+                        } else {
+                            "No matches"
+                        })],
+                        None,
+                    )
+                } else {
+                    let start = if total <= window_len {
+                        0
+                    } else {
+                        ac.selected
+                            .saturating_sub(window_len.saturating_sub(1))
+                            .min(total - window_len)
+                    };
+                    let end = (start + window_len).min(total);
+                    let sel = Some(ac.selected.saturating_sub(start));
+                    (
+                        ac.suggestions[start..end]
+                            .iter()
+                            .map(|s| ListItem::new(s.clone()))
+                            .collect(),
+                        sel,
+                    )
+                };
+                while items.len() < slots {
+                    items.push(ListItem::new(""));
+                }
+                let popup_height = slots as u16 + 2;
+                let mut popup = Rect {
+                    x: content.x.saturating_add(1),
+                    y: content.y.saturating_add(1),
+                    width: popup_width,
+                    height: popup_height.min(content.height),
+                };
+                let content_bottom = content.y.saturating_add(content.height);
+                if popup.y + popup.height > content_bottom {
+                    let overflow = popup.y + popup.height - content_bottom;
+                    popup.y = popup.y.saturating_sub(overflow);
+                }
+                frame.render_widget(Clear, popup);
+                let title = if ac.filter.is_empty() {
+                    "Topic Suggestions".to_string()
+                } else {
+                    format!("Topic Suggestions [{}]", ac.filter)
+                };
+                let list = List::new(items)
+                    .block(Block::default().borders(Borders::ALL).title(title))
+                    .highlight_style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                    );
+                let mut state = ListState::default();
+                state.select(selection);
+                frame.render_stateful_widget(list, popup, &mut state);
+
+                if total > slots && popup.height > 2 {
+                    let mut vs = ScrollbarState::new(total)
+                        .position(ac.selected.min(total.saturating_sub(1)));
+                    let bar_height = popup.height.saturating_sub(2);
+                    if bar_height > 0 {
+                        let bar_area = Rect {
+                            x: popup.x + popup.width - 1,
+                            y: popup.y + 1,
+                            width: 1,
+                            height: bar_height,
+                        };
+                        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+                        frame.render_stateful_widget(bar, bar_area, &mut vs);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn draw_env_bar(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -256,12 +344,32 @@ fn draw_status_panel(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
-    let total = app.rows.len();
-    let row = if total == 0 { 0 } else { app.selected_row + 1 };
-    let cols = app.selected_columns.len();
-    let col = if cols == 0 { 0 } else { app.selected_col + 1 };
+    let (row, total) = match app.results_mode {
+        ResultsMode::Messages => {
+            let total = app.rows.len();
+            let row = if total == 0 { 0 } else { app.selected_row + 1 };
+            (row, total)
+        }
+        ResultsMode::TopicList => {
+            let total = app.topics_with_partitions.len();
+            let row = if total == 0 { 0 } else { app.selected_row + 1 };
+            (row, total)
+        }
+    };
+    let (col, cols) = if matches!(app.results_mode, ResultsMode::Messages) {
+        let cols = app.selected_columns.len();
+        let col = if cols == 0 { 0 } else { app.selected_col + 1 };
+        (col, cols)
+    } else {
+        (0, 0)
+    };
     let legend = format!(
-        "F8 Home  F2 Envs  F12 Info  F10 Help | Tab focus | Query: Enter newline, Ctrl-Enter run, Ctrl/Alt+←/→ move word, Ctrl/Alt+Backspace/Delete delete word, Ctrl+Home/End doc | Results: arrows, Shift-←/→ h-scroll | F5 copy payload | F7 copy status | Ctrl-Q/Ctrl-C quit | Row {row}/{total} Col {col}/{cols}"
+        "F8 Home  F2 Envs  F12 Info  F10 Help | Tab focus | Query: Enter newline, Ctrl-Enter run, Ctrl/Alt+←/→ move word, Ctrl/Alt+Backspace/Delete delete word, Ctrl+Home/End doc, Right/Ctrl-Y accept autocomplete, Ctrl-N/P navigate | Results: arrows, Shift-←/→ h-scroll | F5 copy payload | F7 copy status | Ctrl-Q/Ctrl-C quit | Row {row}/{total}{}",
+        if matches!(app.results_mode, ResultsMode::Messages) {
+            format!(" Col {col}/{cols}")
+        } else {
+            String::new()
+        }
     );
     let block = Block::default().borders(Borders::ALL).title("Help");
     let para = Paragraph::new(legend).block(block);
@@ -589,6 +697,7 @@ fn highlight_sql_line(s: &str) -> Vec<Span<'static>> {
 fn push_word(spans: &mut Vec<Span<'static>>, w: &str) {
     let kw = [
         "select",
+        "list",
         "from",
         "where",
         "and",
@@ -622,14 +731,73 @@ fn push_word(spans: &mut Vec<Span<'static>>, w: &str) {
 }
 
 fn draw_results(frame: &mut Frame, area: Rect, app: &AppState) {
-    // Split results into left (table) and right (json detail)
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-        .split(area);
+    match app.results_mode {
+        ResultsMode::Messages => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+                .split(area);
+            draw_table(frame, cols[0], app);
+            draw_json_detail(frame, cols[1], app);
+        }
+        ResultsMode::TopicList => {
+            draw_topics_results_table(frame, area, app);
+        }
+    }
+}
 
-    draw_table(frame, cols[0], app);
-    draw_json_detail(frame, cols[1], app);
+fn draw_topics_results_table(frame: &mut Frame, area: Rect, app: &AppState) {
+    let headers = vec![
+        Cell::from(header_span("Topic")),
+        Cell::from(header_span("Partitions")),
+    ];
+    let rows: Vec<Row> = if app.topics_with_partitions.is_empty() {
+        vec![Row::new(vec![Cell::from("No topics"), Cell::from("")])]
+    } else {
+        app.topics_with_partitions
+            .iter()
+            .map(|(topic, parts)| {
+                Row::new(vec![
+                    Cell::from(topic.clone()),
+                    Cell::from(parts.to_string()),
+                ])
+            })
+            .collect()
+    };
+    let border_style = if app.focus == Focus::Results {
+        Style::default().fg(Color::LightCyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let table = Table::new(
+        rows,
+        [Constraint::Percentage(70), Constraint::Percentage(30)],
+    )
+    .header(Row::new(headers).style(Style::default().add_modifier(Modifier::BOLD)))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Topics")
+            .border_style(border_style),
+    )
+    .row_highlight_style(Style::default())
+    .column_spacing(2);
+    let mut state = TableState::default();
+    if !app.topics_with_partitions.is_empty() {
+        state.select(Some(
+            app.selected_row
+                .min(app.topics_with_partitions.len().saturating_sub(1)),
+        ));
+    }
+    frame.render_stateful_widget(table, area, &mut state);
+
+    let total = app.topics_with_partitions.len();
+    if total > 0 {
+        let mut vs =
+            ScrollbarState::new(total).position(app.selected_row.min(total.saturating_sub(1)));
+        let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(vbar, area, &mut vs);
+    }
 }
 
 fn draw_topics(frame: &mut Frame, area: Rect, app: &AppState) {

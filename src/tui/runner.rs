@@ -19,14 +19,18 @@ use crate::consumer::spawn_partition_consumer;
 use crate::merger::run_merger;
 use crate::models::{MessageEnvelope, OffsetSpec};
 use crate::output::OutputSink;
-use crate::query::{OrderDir, SelectItem, parse_query};
+use crate::query::{Command, OrderDir, SelectItem, parse_command, parse_query};
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
 use rdkafka::client::ClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::ConsumerContext;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 
-use super::app::{AppState, EnvEditor, EnvFieldFocus, Screen, TuiEvent};
+use super::app::{
+    AppState, AutoCompleteState, EnvEditor, EnvFieldFocus, ResultsMode, Screen, TuiEvent,
+};
 use super::env_store::Environment;
 use super::env_store::config_dir;
 use super::query_bounds::{find_query_range, strip_trailing_semicolon};
@@ -153,6 +157,23 @@ pub async fn run(args: RunArgs) -> Result<()> {
                 }
                 TuiEvent::Topics(list) => {
                     app.topics = list;
+                    if app.autocomplete.is_some() {
+                        maybe_update_autocomplete(&mut app, &tx_evt, true);
+                    }
+                }
+                TuiEvent::TopicsWithPartitions(list) => {
+                    app.topics_with_partitions = list;
+                    app.selected_row = 0;
+                    if app.topics_with_partitions.len() == 1
+                        && app.topics_with_partitions[0].0.starts_with("Error:")
+                    {
+                        app.status = app.topics_with_partitions[0].0.clone();
+                    } else if app.topics_with_partitions.is_empty() {
+                        app.status = "No topics found".to_string();
+                    } else {
+                        app.status = format!("Found {} topics", app.topics_with_partitions.len());
+                    }
+                    app.clamp_selection();
                 }
             }
         }
@@ -179,6 +200,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         }
                         (KeyCode::F(2), _) => {
                             app.screen = Screen::Envs;
+                            app.autocomplete = None;
                             if app.env_editor.is_none() {
                                 if let Some(i) = app.env_store.selected {
                                     if let Some(e) = app.env_store.envs.get(i) {
@@ -190,12 +212,15 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         }
                         (KeyCode::F(12), _) => {
                             app.screen = Screen::Info;
+                            app.autocomplete = None;
+                            app.topics_last_fetched_at = Some(Instant::now());
                             fetch_topics_async(&app, tx_evt.clone());
                         }
                         (KeyCode::F(6), _) => {
                             if matches!(app.screen, Screen::Envs) || app.show_env_modal {
                                 move_env_selection(&mut app, 1);
                             } else if matches!(app.screen, Screen::Info) {
+                                app.topics_last_fetched_at = Some(Instant::now());
                                 fetch_topics_async(&app, tx_evt.clone());
                             }
                         }
@@ -229,12 +254,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                     app.status = "Please enter a query".to_string();
                                     continue;
                                 }
-                                match parse_query(&query) {
-                                    Ok(ast) => {
+                                match parse_command(&query) {
+                                    Ok(Command::Select(ast)) => {
                                         let columns = ast.select.clone();
+                                        app.results_mode = ResultsMode::Messages;
+                                        app.autocomplete = None;
+                                        app.autocomplete_frozen_token = None;
                                         app.selected_columns = columns;
                                         app.table_hscroll = 0;
                                         app.clear_rows();
+                                        app.topics_with_partitions.clear();
                                         run_counter += 1;
                                         app.current_run = Some(run_counter);
                                         app.last_run_query_range = Some((qs, qe));
@@ -258,6 +287,25 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                             ssl,
                                         )
                                         .await;
+                                    }
+                                    Ok(Command::ListTopics) => {
+                                        app.results_mode = ResultsMode::TopicList;
+                                        app.autocomplete = None;
+                                        app.autocomplete_frozen_token = None;
+                                        app.table_hscroll = 0;
+                                        app.clear_rows();
+                                        app.topics_with_partitions.clear();
+                                        app.current_run = None;
+                                        app.last_run_query_range = Some((qs, qe));
+                                        app.selected_row = 0;
+                                        app.json_vscroll = 0;
+                                        let env_host = app
+                                            .selected_env()
+                                            .map(|e| e.host.clone())
+                                            .unwrap_or(app.host.clone());
+                                        app.status = format!("Listing topics from {}...", env_host);
+                                        fetch_topics_with_partitions_async(&app, tx_evt.clone());
+                                        app.clamp_selection();
                                     }
                                     Err(e) => {
                                         app.status = format!("Parse error: {}", e);
@@ -277,12 +325,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                     app.status = "Please enter a query".to_string();
                                     continue;
                                 }
-                                match parse_query(&query) {
-                                    Ok(ast) => {
+                                match parse_command(&query) {
+                                    Ok(Command::Select(ast)) => {
                                         let columns = ast.select.clone();
+                                        app.results_mode = ResultsMode::Messages;
+                                        app.autocomplete = None;
+                                        app.autocomplete_frozen_token = None;
                                         app.selected_columns = columns;
                                         app.table_hscroll = 0;
                                         app.clear_rows();
+                                        app.topics_with_partitions.clear();
                                         run_counter += 1;
                                         app.current_run = Some(run_counter);
                                         app.last_run_query_range = Some((qs, qe));
@@ -306,6 +358,25 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                             ssl,
                                         )
                                         .await;
+                                    }
+                                    Ok(Command::ListTopics) => {
+                                        app.results_mode = ResultsMode::TopicList;
+                                        app.autocomplete = None;
+                                        app.autocomplete_frozen_token = None;
+                                        app.table_hscroll = 0;
+                                        app.clear_rows();
+                                        app.topics_with_partitions.clear();
+                                        app.current_run = None;
+                                        app.last_run_query_range = Some((qs, qe));
+                                        app.selected_row = 0;
+                                        app.json_vscroll = 0;
+                                        let env_host = app
+                                            .selected_env()
+                                            .map(|e| e.host.clone())
+                                            .unwrap_or(app.host.clone());
+                                        app.status = format!("Listing topics from {}...", env_host);
+                                        fetch_topics_with_partitions_async(&app, tx_evt.clone());
+                                        app.clamp_selection();
                                     }
                                     Err(e) => {
                                         app.status = format!("Parse error: {}", e);
@@ -353,13 +424,33 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 editor.host_cursor = editor.host.len();
                                 app.env_editor = Some(editor);
                                 app.screen = Screen::Envs;
+                                app.autocomplete = None;
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 // Enter inserts newline in editor, ensure caret stays visible
                                 app.input.insert(app.input_cursor, '\n');
                                 app.input_cursor += 1;
                                 ensure_input_cursor_visible(&mut app);
+                                app.autocomplete = None;
+                                app.autocomplete_dirty = false;
                             } else {
                                 // Results: ignore Enter
+                            }
+                        }
+                        (KeyCode::Char('n'), m) if m.contains(KeyModifiers::CONTROL) => {
+                            if matches!(app.focus, super::app::Focus::Query) {
+                                move_autocomplete_selection(&mut app, true);
+                            }
+                        }
+                        (KeyCode::Char('p'), m) if m.contains(KeyModifiers::CONTROL) => {
+                            if matches!(app.focus, super::app::Focus::Query) {
+                                move_autocomplete_selection(&mut app, false);
+                            }
+                        }
+                        (KeyCode::Char('y'), m) if m.contains(KeyModifiers::CONTROL) => {
+                            if matches!(app.focus, super::app::Focus::Query)
+                                && try_accept_autocomplete(&mut app)
+                            {
+                                continue;
                             }
                         }
                         (KeyCode::Backspace, m) => {
@@ -401,11 +492,23 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             match app.focus {
                                 super::app::Focus::Host => { /* no-op */ }
                                 super::app::Focus::Query => {
+                                    let mut dirty = false;
                                     if has_ctrl_or_alt(m) {
                                         delete_prev_word(&mut app);
+                                        dirty = true;
                                     } else if app.input_cursor > 0 {
+                                        if let Some(prev_char) =
+                                            app.input[..app.input_cursor].chars().next_back()
+                                        {
+                                            dirty = !prev_char.is_whitespace();
+                                        }
                                         app.input.remove(app.input_cursor - 1);
                                         app.input_cursor -= 1;
+                                        ensure_input_cursor_visible(&mut app);
+                                    }
+                                    if dirty {
+                                        app.autocomplete_dirty = true;
+                                        maybe_update_autocomplete(&mut app, &tx_evt, false);
                                     }
                                 }
                                 super::app::Focus::Results => {}
@@ -444,10 +547,22 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                     sync_env_metadata_from_editor(&mut app);
                                 }
                             } else if matches!(app.focus, super::app::Focus::Query) {
+                                let mut dirty = false;
                                 if has_ctrl_or_alt(m) {
                                     delete_next_word(&mut app);
+                                    dirty = true;
                                 } else if app.input_cursor < app.input.len() {
+                                    if let Some(next_char) =
+                                        app.input[app.input_cursor..].chars().next()
+                                    {
+                                        dirty = !next_char.is_whitespace();
+                                    }
                                     app.input.remove(app.input_cursor);
+                                    ensure_input_cursor_visible(&mut app);
+                                }
+                                if dirty {
+                                    app.autocomplete_dirty = true;
+                                    maybe_update_autocomplete(&mut app, &tx_evt, false);
                                 }
                             }
                         }
@@ -466,6 +581,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 }
                             } else {
                                 app.next_focus();
+                                if !matches!(app.focus, super::app::Focus::Query) {
+                                    app.autocomplete = None;
+                                }
                             }
                         }
                         (KeyCode::BackTab, _) => {
@@ -824,16 +942,32 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 super::app::Focus::Query => {
                                     app.input.insert(app.input_cursor, ch);
                                     app.input_cursor += 1;
+                                    ensure_input_cursor_visible(&mut app);
+                                    if !ch.is_whitespace() {
+                                        app.autocomplete_dirty = true;
+                                        maybe_update_autocomplete(&mut app, &tx_evt, false);
+                                    } else {
+                                        app.autocomplete = None;
+                                    }
                                 }
                             }
                         }
                         (KeyCode::Esc, _) => {
                             if app.show_env_modal {
                                 app.show_env_modal = false;
+                            } else if matches!(app.focus, super::app::Focus::Query)
+                                && app.autocomplete.as_ref().map(|a| a.active).unwrap_or(false)
+                            {
+                                freeze_autocomplete_at_cursor(&mut app);
+                                app.autocomplete = None;
+                                app.autocomplete_dirty = false;
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 app.input.clear();
                                 app.input_cursor = 0;
                                 ensure_input_cursor_visible(&mut app);
+                                app.autocomplete = None;
+                                app.autocomplete_dirty = false;
+                                app.autocomplete_frozen_token = None;
                             }
                         }
                         // Navigation: results or env list / textareas
@@ -863,7 +997,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             } else if matches!(app.focus, super::app::Focus::Results) {
                                 if app.selected_row > 0 {
                                     app.selected_row -= 1;
-                                    app.json_vscroll = 0;
+                                    if matches!(app.results_mode, ResultsMode::Messages) {
+                                        app.json_vscroll = 0;
+                                    }
                                 }
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 move_cursor_up(&mut app);
@@ -893,9 +1029,12 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                     move_env_selection(&mut app, 1);
                                 }
                             } else if matches!(app.focus, super::app::Focus::Results) {
-                                if app.selected_row + 1 < app.rows.len() {
+                                let total = total_results_rows(&app);
+                                if total > 0 && app.selected_row + 1 < total {
                                     app.selected_row += 1;
-                                    app.json_vscroll = 0;
+                                    if matches!(app.results_mode, ResultsMode::Messages) {
+                                        app.json_vscroll = 0;
+                                    }
                                 }
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 move_cursor_down(&mut app);
@@ -939,17 +1078,20 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                     }
                                 }
                             } else if matches!(app.focus, super::app::Focus::Results) {
-                                if app.selected_col > 0 {
-                                    app.selected_col -= 1;
-                                } else {
-                                    app.selected_col = 0;
+                                if matches!(app.results_mode, ResultsMode::Messages) {
+                                    if app.selected_col > 0 {
+                                        app.selected_col -= 1;
+                                    } else {
+                                        app.selected_col = 0;
+                                    }
+                                    app.json_vscroll = 0;
                                 }
-                                app.json_vscroll = 0;
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 if has_ctrl_or_alt(m) {
                                     move_prev_word(&mut app);
                                 } else if app.input_cursor > 0 {
                                     app.input_cursor -= 1;
+                                    ensure_input_cursor_visible(&mut app);
                                 }
                             }
                         }
@@ -981,12 +1123,17 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                     }
                                 }
                             } else if matches!(app.focus, super::app::Focus::Results) {
-                                let cols = app.selected_columns.len();
-                                if cols > 0 && app.selected_col + 1 < cols {
-                                    app.selected_col += 1;
+                                if matches!(app.results_mode, ResultsMode::Messages) {
+                                    let cols = app.selected_columns.len();
+                                    if cols > 0 && app.selected_col + 1 < cols {
+                                        app.selected_col += 1;
+                                    }
+                                    app.json_vscroll = 0;
                                 }
-                                app.json_vscroll = 0;
                             } else if matches!(app.focus, super::app::Focus::Query) {
+                                if m.is_empty() && try_accept_autocomplete(&mut app) {
+                                    continue;
+                                }
                                 if has_ctrl_or_alt(m) {
                                     move_next_word(&mut app);
                                 } else if app.input_cursor < app.input.len() {
@@ -999,7 +1146,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             if matches!(app.focus, super::app::Focus::Results) {
                                 let step = 10;
                                 app.selected_row = app.selected_row.saturating_sub(step);
-                                app.json_vscroll = 0;
+                                if matches!(app.results_mode, ResultsMode::Messages) {
+                                    app.json_vscroll = 0;
+                                }
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 scroll_input(&mut app, true);
                             }
@@ -1007,10 +1156,14 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         (KeyCode::PageDown, _) => {
                             if matches!(app.focus, super::app::Focus::Results) {
                                 let step = 10;
-                                if !app.rows.is_empty() {
-                                    app.selected_row =
-                                        (app.selected_row + step).min(app.rows.len() - 1);
-                                    app.json_vscroll = 0;
+                                let total = total_results_rows(&app);
+                                if total > 0 {
+                                    let max_idx = total - 1;
+                                    let target = app.selected_row.saturating_add(step);
+                                    app.selected_row = target.min(max_idx);
+                                    if matches!(app.results_mode, ResultsMode::Messages) {
+                                        app.json_vscroll = 0;
+                                    }
                                 }
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 scroll_input(&mut app, false);
@@ -1019,7 +1172,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         (KeyCode::Home, m) => {
                             if matches!(app.focus, super::app::Focus::Results) {
                                 app.selected_row = 0;
-                                app.json_vscroll = 0;
+                                if matches!(app.results_mode, ResultsMode::Messages) {
+                                    app.json_vscroll = 0;
+                                }
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 if m.contains(KeyModifiers::CONTROL) {
                                     goto_start_of_doc(&mut app);
@@ -1030,9 +1185,12 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         }
                         (KeyCode::End, m) => {
                             if matches!(app.focus, super::app::Focus::Results) {
-                                if !app.rows.is_empty() {
-                                    app.selected_row = app.rows.len() - 1;
-                                    app.json_vscroll = 0;
+                                let total = total_results_rows(&app);
+                                if total > 0 {
+                                    app.selected_row = total - 1;
+                                    if matches!(app.results_mode, ResultsMode::Messages) {
+                                        app.json_vscroll = 0;
+                                    }
                                 }
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 if m.contains(KeyModifiers::CONTROL) {
@@ -1063,11 +1221,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         handled = handle_env_editor_paste(&mut app, &s);
                     }
                     if !handled && matches!(app.focus, super::app::Focus::Query) {
+                        let inserted_non_ws = s.chars().any(|ch| !ch.is_whitespace());
                         for ch in s.chars() {
                             app.input.insert(app.input_cursor, ch);
                             app.input_cursor += 1;
                         }
                         ensure_input_cursor_visible(&mut app);
+                        if inserted_non_ws {
+                            app.autocomplete_dirty = true;
+                            maybe_update_autocomplete(&mut app, &tx_evt, false);
+                        }
                     }
                 }
                 _ => {}
@@ -1538,18 +1701,21 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
     let _q_gutter = q_cols[0];
     let q_content = q_cols[1];
     let results_area = rows[2];
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-        .split(results_area);
-    let table_rect = cols[0];
-    let json_rect = cols[1];
-    let json_inner = Rect {
+    let (table_rect, json_rect_opt) = if matches!(app.results_mode, ResultsMode::Messages) {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+            .split(results_area);
+        (cols[0], Some(cols[1]))
+    } else {
+        (results_area, None)
+    };
+    let json_inner = json_rect_opt.map(|json_rect| Rect {
         x: json_rect.x.saturating_add(1),
         y: json_rect.y.saturating_add(1),
         width: json_rect.width.saturating_sub(2),
         height: json_rect.height.saturating_sub(2),
-    };
+    });
 
     let mx = me.column;
     let my = me.row;
@@ -1608,92 +1774,119 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
                 return;
             }
             if point_in(mx, my, table_rect) {
-                // Map click Y to an approximate row index
-                // account for borders + header (top border + header row)
-                let data_start_y = table_rect.y.saturating_add(2);
-                if my >= data_start_y
-                    && my
-                        < table_rect
-                            .y
-                            .saturating_add(table_rect.height.saturating_sub(1))
-                {
-                    let y_rel = (my - data_start_y) as usize;
-                    let visible_rows = table_rect.height.saturating_sub(3) as usize; // top border + header + bottom border
-                    let approx_first = app.selected_row.saturating_sub(visible_rows / 2);
-                    let new_row = (approx_first + y_rel).min(app.rows.len().saturating_sub(1));
-                    if new_row != app.selected_row {
-                        app.selected_row = new_row;
-                        app.json_vscroll = 0;
-                    }
-                }
+                match app.results_mode {
+                    ResultsMode::Messages => {
+                        let data_start_y = table_rect.y.saturating_add(2);
+                        if my >= data_start_y
+                            && my
+                                < table_rect
+                                    .y
+                                    .saturating_add(table_rect.height.saturating_sub(1))
+                        {
+                            if !app.rows.is_empty() {
+                                let y_rel = (my - data_start_y) as usize;
+                                let visible_rows = table_rect.height.saturating_sub(3) as usize;
+                                let approx_first =
+                                    app.selected_row.saturating_sub(visible_rows / 2);
+                                let new_row =
+                                    (approx_first + y_rel).min(app.rows.len().saturating_sub(1));
+                                if new_row != app.selected_row {
+                                    app.selected_row = new_row;
+                                    app.json_vscroll = 0;
+                                }
+                            }
+                        }
 
-                // Map click X to column index (approximate using constraints)
-                let inner_x = table_rect.x.saturating_add(1);
-                if mx >= inner_x {
-                    let mut x_rel = (mx - inner_x) as usize;
-                    let mut col = 0usize;
-                    let widths: Vec<usize> = app
-                        .selected_columns
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| {
-                            let mut w = runner_column_width_hint(*c);
-                            if i + 1 < app.selected_columns.len() {
-                                w = w.saturating_add(1);
-                            }
-                            w
-                        })
-                        .collect();
-                    if !widths.is_empty() {
-                        for (i, w) in widths.iter().enumerate() {
-                            if *w == usize::MAX {
-                                col = i;
-                                break;
-                            }
-                            if x_rel < *w {
-                                col = i;
-                                break;
-                            } else {
-                                x_rel = x_rel.saturating_sub(*w);
+                        let inner_x = table_rect.x.saturating_add(1);
+                        if mx >= inner_x {
+                            let mut x_rel = (mx - inner_x) as usize;
+                            let mut col = 0usize;
+                            let widths: Vec<usize> = app
+                                .selected_columns
+                                .iter()
+                                .enumerate()
+                                .map(|(i, c)| {
+                                    let mut w = runner_column_width_hint(*c);
+                                    if i + 1 < app.selected_columns.len() {
+                                        w = w.saturating_add(1);
+                                    }
+                                    w
+                                })
+                                .collect();
+                            if !widths.is_empty() {
+                                for (i, w) in widths.iter().enumerate() {
+                                    if *w == usize::MAX {
+                                        col = i;
+                                        break;
+                                    }
+                                    if x_rel < *w {
+                                        col = i;
+                                        break;
+                                    } else {
+                                        x_rel = x_rel.saturating_sub(*w);
+                                    }
+                                }
+                                if col >= widths.len() {
+                                    col = widths.len() - 1;
+                                }
+                                if app.selected_col != col {
+                                    app.selected_col = col;
+                                    app.json_vscroll = 0;
+                                }
                             }
                         }
-                        if col >= widths.len() {
-                            col = widths.len() - 1;
-                        }
-                        if app.selected_col != col {
-                            app.selected_col = col;
-                            app.json_vscroll = 0;
+                    }
+                    ResultsMode::TopicList => {
+                        let data_start_y = table_rect.y.saturating_add(2);
+                        if my >= data_start_y
+                            && my
+                                < table_rect
+                                    .y
+                                    .saturating_add(table_rect.height.saturating_sub(1))
+                        {
+                            if !app.topics_with_partitions.is_empty() {
+                                let y_rel = (my - data_start_y) as usize;
+                                let visible_rows = table_rect.height.saturating_sub(3) as usize;
+                                let approx_first =
+                                    app.selected_row.saturating_sub(visible_rows / 2);
+                                let new_row = (approx_first + y_rel)
+                                    .min(app.topics_with_partitions.len().saturating_sub(1));
+                                app.selected_row = new_row;
+                            }
                         }
                     }
                 }
-            } else if point_in(mx, my, json_rect) {
-                // Detect click on Copy button in the JSON pane (top-right of inner area)
-                let label = "[ Copy ]";
-                let btn_w = label.chars().count() as u16;
-                if json_inner.width >= btn_w {
-                    let btn_rect = Rect {
-                        x: json_inner.x + json_inner.width - btn_w,
-                        y: json_inner.y,
-                        width: btn_w,
-                        height: 1,
-                    };
-                    if point_in(mx, my, btn_rect) {
-                        if let Some(s) = selected_cell_text(app) {
-                            if let Err(e) = copy_to_clipboard(&s) {
-                                app.status = format!("Clipboard error: {}", e);
-                            } else {
-                                app.status = "Payload copied".to_string();
+            } else if let Some(json_rect) = json_rect_opt {
+                if point_in(mx, my, json_rect) {
+                    if let Some(inner) = json_inner {
+                        let label = "[ Copy ]";
+                        let btn_w = label.chars().count() as u16;
+                        if inner.width >= btn_w {
+                            let btn_rect = Rect {
+                                x: inner.x + inner.width - btn_w,
+                                y: inner.y,
+                                width: btn_w,
+                                height: 1,
+                            };
+                            if point_in(mx, my, btn_rect) {
+                                if let Some(s) = selected_cell_text(app) {
+                                    if let Err(e) = copy_to_clipboard(&s) {
+                                        app.status = format!("Clipboard error: {}", e);
+                                    } else {
+                                        app.status = "Payload copied".to_string();
+                                    }
+                                    app.copy_btn_pressed = true;
+                                    app.copy_btn_deadline =
+                                        Some(Instant::now() + Duration::from_millis(150));
+                                } else {
+                                    app.status = "No payload to copy".to_string();
+                                }
+                                return;
                             }
-                            app.copy_btn_pressed = true;
-                            app.copy_btn_deadline =
-                                Some(Instant::now() + Duration::from_millis(150));
-                        } else {
-                            app.status = "No payload to copy".to_string();
                         }
-                        return; // handled
                     }
+                    // Otherwise, ignore; allow native selection by terminal
                 }
-                // Otherwise, ignore; allow native selection by terminal
             }
         }
         MouseEventKind::ScrollUp => {
@@ -1752,8 +1945,12 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
                 if app.selected_row > 0 {
                     app.selected_row -= 1;
                 }
-            } else if point_in(mx, my, json_rect) {
-                app.json_vscroll = app.json_vscroll.saturating_sub(1);
+            } else if matches!(app.results_mode, ResultsMode::Messages) {
+                if let Some(json_rect) = json_rect_opt {
+                    if point_in(mx, my, json_rect) {
+                        app.json_vscroll = app.json_vscroll.saturating_sub(1);
+                    }
+                }
             }
         }
         MouseEventKind::ScrollDown => {
@@ -1807,11 +2004,16 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
             if point_in(mx, my, q_content) {
                 app.input_vscroll = app.input_vscroll.saturating_add(1);
             } else if point_in(mx, my, table_rect) {
-                if app.selected_row + 1 < app.rows.len() {
+                let total = total_results_rows(app);
+                if total > 0 && app.selected_row + 1 < total {
                     app.selected_row += 1;
                 }
-            } else if point_in(mx, my, json_rect) {
-                app.json_vscroll = app.json_vscroll.saturating_add(1);
+            } else if matches!(app.results_mode, ResultsMode::Messages) {
+                if let Some(json_rect) = json_rect_opt {
+                    if point_in(mx, my, json_rect) {
+                        app.json_vscroll = app.json_vscroll.saturating_add(1);
+                    }
+                }
             }
         }
         MouseEventKind::ScrollLeft => {
@@ -1865,7 +2067,7 @@ fn fetch_topics_async(app: &AppState, tx: mpsc::UnboundedSender<TuiEvent>) {
                 .create_with_context(QuietContext)
                 .context("create consumer")?;
             let md = c
-                .fetch_metadata(None, std::time::Duration::from_secs(10))
+                .fetch_metadata(None, Duration::from_secs(10))
                 .context("fetch metadata")?;
             let mut names: Vec<String> = md.topics().iter().map(|t| t.name().to_string()).collect();
             names.sort();
@@ -1878,6 +2080,68 @@ fn fetch_topics_async(app: &AppState, tx: mpsc::UnboundedSender<TuiEvent>) {
             }
             Err(e) => {
                 let _ = tx.send(TuiEvent::Topics(vec![format!("Error: {}", e)]));
+            }
+        }
+    });
+}
+
+fn fetch_topics_with_partitions_async(app: &AppState, tx: mpsc::UnboundedSender<TuiEvent>) {
+    let host = app
+        .selected_env()
+        .map(|e| e.host.clone())
+        .unwrap_or_else(|| app.host.clone());
+    let ssl = app.current_ssl_config();
+    tokio::spawn(async move {
+        let mut cfg = ClientConfig::new();
+        cfg.set("bootstrap.servers", &host)
+            .set("group.id", format!("rkl-list-{}", uuid::Uuid::new_v4()))
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .set("enable.partition.eof", "true");
+        if let Some(ssl) = &ssl {
+            if ssl.ca_pem.is_some() || ssl.cert_pem.is_some() || ssl.key_pem.is_some() {
+                cfg.set("security.protocol", "ssl");
+                if let Some(ref s) = ssl.ca_pem {
+                    cfg.set("ssl.ca.pem", s);
+                }
+                if let Some(ref s) = ssl.cert_pem {
+                    cfg.set("ssl.certificate.pem", s);
+                }
+                if let Some(ref s) = ssl.key_pem {
+                    cfg.set("ssl.key.pem", s);
+                }
+            }
+        }
+        let list = async {
+            struct QuietContext;
+            impl ClientContext for QuietContext {
+                fn log(&self, _level: RDKafkaLogLevel, _fac: &str, _log_message: &str) {}
+            }
+            impl ConsumerContext for QuietContext {}
+            let c: StreamConsumer<QuietContext> = cfg
+                .create_with_context(QuietContext)
+                .context("create consumer")?;
+            let md = c
+                .fetch_metadata(None, std::time::Duration::from_secs(10))
+                .context("fetch metadata")?;
+            let mut entries: Vec<(String, usize)> = md
+                .topics()
+                .iter()
+                .map(|t| (t.name().to_string(), t.partitions().len()))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok::<_, anyhow::Error>(entries)
+        }
+        .await;
+        match list {
+            Ok(v) => {
+                let _ = tx.send(TuiEvent::TopicsWithPartitions(v));
+            }
+            Err(e) => {
+                let _ = tx.send(TuiEvent::TopicsWithPartitions(vec![(
+                    format!("Error: {}", e),
+                    0,
+                )]));
             }
         }
     });
@@ -2549,5 +2813,259 @@ fn scroll_input(app: &mut AppState, up: bool) {
         app.input_vscroll = app.input_vscroll.saturating_sub(5);
     } else {
         app.input_vscroll = app.input_vscroll.saturating_add(5);
+    }
+}
+
+const AUTOCOMPLETE_FETCH_COOLDOWN: Duration = Duration::from_secs(5);
+
+fn detect_from_token(text: &str, cursor: usize) -> Option<(usize, usize, usize)> {
+    let (qs, qe) = find_query_range(text, cursor);
+    if qs >= qe {
+        return None;
+    }
+    let rel_cursor = cursor.min(qe) - qs;
+    let query = &text[qs..qe];
+    let bytes = query.as_bytes();
+
+    let from_idx = find_keyword_before(bytes, b"from", rel_cursor)?;
+    if find_keyword_before(bytes, b"select", from_idx).is_none() {
+        return None;
+    }
+    let mut token_start = from_idx + 4;
+    while token_start < query.len() && bytes[token_start].is_ascii_whitespace() {
+        token_start += 1;
+    }
+    if rel_cursor < token_start {
+        return None;
+    }
+    let mut token_end = token_start;
+    while token_end < query.len() {
+        let b = bytes[token_end];
+        if b.is_ascii_whitespace() || b == b';' {
+            break;
+        }
+        token_end += 1;
+    }
+    if rel_cursor > token_end {
+        return None;
+    }
+    let typed_end = rel_cursor.min(token_end);
+    Some((qs + token_start, qs + token_end, qs + typed_end))
+}
+
+fn find_keyword_before(bytes: &[u8], keyword: &[u8], cursor: usize) -> Option<usize> {
+    if keyword.is_empty() || bytes.len() < keyword.len() {
+        return None;
+    }
+    let mut idx = cursor.min(bytes.len());
+    while idx >= keyword.len() {
+        let start = idx - keyword.len();
+        if slice_eq_ignore_ascii_case(&bytes[start..start + keyword.len()], keyword)
+            && is_word_boundary(bytes, start, start + keyword.len())
+        {
+            return Some(start);
+        }
+        if idx == keyword.len() {
+            break;
+        }
+        idx -= 1;
+    }
+    None
+}
+
+fn slice_eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+fn is_word_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
+    let prev = start > 0 && is_word_char_byte(bytes[start - 1]);
+    let next = end < bytes.len() && is_word_char_byte(bytes[end]);
+    !prev && !next
+}
+
+fn maybe_update_autocomplete(
+    app: &mut AppState,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+    force: bool,
+) {
+    if !force && !app.autocomplete_dirty {
+        return;
+    }
+    if !(matches!(app.screen, Screen::Home)
+        && matches!(app.focus, super::app::Focus::Query)
+        && !app.show_env_modal)
+    {
+        app.autocomplete = None;
+        if !force {
+            app.autocomplete_dirty = false;
+        }
+        return;
+    }
+    let Some((token_start, token_end, typed_end)) = detect_from_token(&app.input, app.input_cursor)
+    else {
+        app.autocomplete = None;
+        if !force {
+            app.autocomplete_dirty = false;
+        }
+        return;
+    };
+
+    if app.input_cursor > token_end {
+        app.autocomplete = None;
+        if !force {
+            app.autocomplete_dirty = false;
+        }
+        return;
+    }
+
+    let typed_end = typed_end.min(app.input.len()).min(token_end);
+    if typed_end < token_start {
+        app.autocomplete = None;
+        if !force {
+            app.autocomplete_dirty = false;
+        }
+        return;
+    }
+    let filter = app.input[token_start..typed_end].to_string();
+    if filter.trim().is_empty() {
+        app.autocomplete = None;
+        if !force {
+            app.autocomplete_dirty = false;
+        }
+        return;
+    }
+
+    if let Some((s, e, text)) = app.autocomplete_frozen_token.clone() {
+        if s == token_start && e == token_end {
+            if &app.input[token_start..token_end] == text {
+                app.autocomplete = None;
+                if !force {
+                    app.autocomplete_dirty = false;
+                }
+                return;
+            } else {
+                app.autocomplete_frozen_token = None;
+            }
+        } else if s != token_start || e != token_end {
+            app.autocomplete_frozen_token = None;
+        }
+    }
+
+    if app.topics.is_empty() {
+        let should_fetch = app
+            .topics_last_fetched_at
+            .map(|inst| inst.elapsed() > AUTOCOMPLETE_FETCH_COOLDOWN)
+            .unwrap_or(true);
+        if should_fetch {
+            app.topics_last_fetched_at = Some(Instant::now());
+            fetch_topics_async(app, tx.clone());
+        }
+    }
+
+    if !force {
+        app.autocomplete_dirty = false;
+    }
+
+    let suggestions = build_topic_suggestions(&app.topics, &filter);
+    let mut selected = app.autocomplete.as_ref().map(|a| a.selected).unwrap_or(0);
+    if suggestions.is_empty() {
+        selected = 0;
+    } else {
+        selected = selected.min(suggestions.len().saturating_sub(1));
+    }
+    app.autocomplete = Some(AutoCompleteState {
+        active: true,
+        filter,
+        suggestions,
+        selected,
+        token_abs_start: token_start,
+        token_abs_end: token_end,
+    });
+}
+
+fn build_topic_suggestions(topics: &[String], filter: &str) -> Vec<String> {
+    const MAX_SUGGESTIONS: usize = 16;
+    if topics.is_empty() {
+        return Vec::new();
+    }
+    if filter.is_empty() {
+        let mut list: Vec<String> = topics.to_vec();
+        list.sort();
+        list.truncate(MAX_SUGGESTIONS);
+        return list;
+    }
+    let matcher = SkimMatcherV2::default();
+    let mut scored = Vec::new();
+    for name in topics {
+        if let Some(score) = matcher.fuzzy_match(name, filter) {
+            scored.push((score, name));
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    scored
+        .into_iter()
+        .map(|(_, name)| name.clone())
+        .take(MAX_SUGGESTIONS)
+        .collect()
+}
+
+fn try_accept_autocomplete(app: &mut AppState) -> bool {
+    let (choice, start, end) = match app.autocomplete.as_ref() {
+        Some(state) if state.active && !state.suggestions.is_empty() => {
+            let idx = state.selected.min(state.suggestions.len() - 1);
+            (
+                state.suggestions[idx].clone(),
+                state.token_abs_start,
+                state.token_abs_end,
+            )
+        }
+        _ => return false,
+    };
+    if start > end || end > app.input.len() {
+        app.autocomplete = None;
+        return false;
+    }
+    app.input.replace_range(start..end, &choice);
+    let new_end = start + choice.len();
+    app.input_cursor = new_end;
+    ensure_input_cursor_visible(app);
+    app.autocomplete_frozen_token = Some((start, new_end, choice));
+    app.autocomplete = None;
+    true
+}
+
+fn move_autocomplete_selection(app: &mut AppState, down: bool) {
+    if let Some(state) = app.autocomplete.as_mut() {
+        if state.suggestions.is_empty() {
+            return;
+        }
+        if down {
+            if state.selected + 1 < state.suggestions.len() {
+                state.selected += 1;
+            }
+        } else if state.selected > 0 {
+            state.selected -= 1;
+        }
+    }
+}
+
+fn total_results_rows(app: &AppState) -> usize {
+    match app.results_mode {
+        ResultsMode::Messages => app.rows.len(),
+        ResultsMode::TopicList => app.topics_with_partitions.len(),
+    }
+}
+
+fn freeze_autocomplete_at_cursor(app: &mut AppState) {
+    if let Some((start, end, _)) = detect_from_token(&app.input, app.input_cursor) {
+        if end <= app.input.len() && start <= end {
+            let text = app.input[start..end].to_string();
+            app.autocomplete_frozen_token = Some((start, end, text));
+        }
     }
 }

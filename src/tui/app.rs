@@ -13,6 +13,8 @@ pub struct AppState {
     pub status_buffer: String,
     pub status_vscroll: u16,
     pub rows: Vec<MessageEnvelope>,
+    pub topics_with_partitions: Vec<(String, usize)>,
+    pub results_mode: ResultsMode,
     pub selected_columns: Vec<SelectItem>,
     pub current_run: Option<u64>,
     pub max_rows_in_memory: usize,
@@ -39,6 +41,10 @@ pub struct AppState {
     pub show_help: bool,
     // Info screen
     pub topics: Vec<String>,
+    pub autocomplete: Option<AutoCompleteState>,
+    pub topics_last_fetched_at: Option<Instant>,
+    pub autocomplete_frozen_token: Option<(usize, usize, String)>,
+    pub autocomplete_dirty: bool,
 }
 
 impl AppState {
@@ -63,6 +69,8 @@ impl AppState {
             status_buffer: String::new(),
             status_vscroll: 0,
             rows: Vec::new(),
+            topics_with_partitions: Vec::new(),
+            results_mode: ResultsMode::Messages,
             selected_columns: SelectItem::standard(true),
             current_run: None,
             max_rows_in_memory: 2000,
@@ -85,6 +93,10 @@ impl AppState {
             screen: Screen::Home,
             show_help: false,
             topics: Vec::new(),
+            autocomplete: None,
+            topics_last_fetched_at: None,
+            autocomplete_frozen_token: None,
+            autocomplete_dirty: false,
         }
     }
 
@@ -125,6 +137,7 @@ pub enum TuiEvent {
         message: String,
     },
     Topics(Vec<String>),
+    TopicsWithPartitions(Vec<(String, usize)>),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -150,14 +163,43 @@ impl Default for Focus {
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ResultsMode {
+    Messages,
+    TopicList,
+}
+
+impl Default for ResultsMode {
+    fn default() -> Self {
+        ResultsMode::Messages
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AutoCompleteState {
+    pub active: bool,
+    pub filter: String,
+    pub suggestions: Vec<String>,
+    pub selected: usize,
+    pub token_abs_start: usize,
+    pub token_abs_end: usize,
+}
+
 impl AppState {
     pub fn clamp_selection(&mut self) {
-        if self.rows.is_empty() {
+        let total_rows = match self.results_mode {
+            ResultsMode::Messages => self.rows.len(),
+            ResultsMode::TopicList => self.topics_with_partitions.len(),
+        };
+        if total_rows == 0 {
             self.selected_row = 0;
-        } else if self.selected_row >= self.rows.len() {
-            self.selected_row = self.rows.len().saturating_sub(1);
+        } else if self.selected_row >= total_rows {
+            self.selected_row = total_rows.saturating_sub(1);
         }
-        let cols = self.selected_columns.len().max(1);
+        let cols = match self.results_mode {
+            ResultsMode::Messages => self.selected_columns.len().max(1),
+            ResultsMode::TopicList => 1,
+        };
         if self.selected_col >= cols {
             self.selected_col = cols.saturating_sub(1);
         }

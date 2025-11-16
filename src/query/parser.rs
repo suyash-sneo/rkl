@@ -1,4 +1,4 @@
-use super::ast::*;
+use super::{Command, ast::*};
 
 #[derive(Debug)]
 pub enum ParseError {
@@ -13,6 +13,17 @@ pub enum ParseError {
 }
 
 type PResult<T> = Result<T, ParseError>;
+
+pub fn parse_command(input: &str) -> Result<Command, ParseError> {
+    let trimmed = strip_command_semicolon(input.trim());
+    if trimmed.is_empty() {
+        return Err(ParseError::UnexpectedToken(String::new()));
+    }
+    if is_list_topics_command(trimmed) {
+        return Ok(Command::ListTopics);
+    }
+    parse_query(trimmed).map(Command::Select)
+}
 
 pub fn parse_query(input: &str) -> PResult<SelectQuery> {
     let mut p = Parser::new(input);
@@ -494,9 +505,35 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn strip_command_semicolon(s: &str) -> &str {
+    let mut end = s.len();
+    let bytes = s.as_bytes();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end > 0 && bytes[end - 1] == b';' {
+        end -= 1;
+        while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+    }
+    &s[..end]
+}
+
+fn is_list_topics_command(s: &str) -> bool {
+    let mut parts = s.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(first), Some(second), None) => {
+            first.eq_ignore_ascii_case("list") && second.eq_ignore_ascii_case("topics")
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::Command;
 
     #[test]
     fn parses_example_query() {
@@ -645,5 +682,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_list_topics_command() {
+        let cmd = parse_command("LIST topics;").expect("parse LIST");
+        assert_eq!(cmd, Command::ListTopics);
+        let mixed = parse_command("list TOPICS").expect("parse list");
+        assert_eq!(mixed, Command::ListTopics);
+    }
+
+    #[test]
+    fn parses_select_via_command_parser() {
+        let cmd = parse_command("SELECT key FROM foo").expect("parse select");
+        match cmd {
+            Command::Select(ast) => {
+                assert_eq!(ast.from, "foo");
+                assert_eq!(ast.select, vec![SelectItem::Key]);
+            }
+            _ => panic!("expected select"),
+        }
     }
 }

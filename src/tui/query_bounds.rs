@@ -2,6 +2,14 @@ pub fn find_query_range(s: &str, cursor: usize) -> (usize, usize) {
     let bytes = s.as_bytes();
     let len = bytes.len();
     let cur = cursor.min(len);
+    let cursor_semicolon = if cur < len && bytes[cur] == b';' {
+        Some(cur)
+    } else if cur > 0 && bytes[cur - 1] == b';' {
+        Some(cur - 1)
+    } else {
+        None
+    };
+    let start_limit = cursor_semicolon.unwrap_or(cur);
 
     let mut last_stmt_start = 0usize;
     let mut last_semicolon: Option<usize> = None;
@@ -9,7 +17,7 @@ pub fn find_query_range(s: &str, cursor: usize) -> (usize, usize) {
     let mut string_delim = 0u8;
     let mut i = 0usize;
 
-    while i < cur {
+    while i < start_limit {
         let b = bytes[i];
         if in_string {
             if b == b'\\' && i + 1 < len {
@@ -46,7 +54,7 @@ pub fn find_query_range(s: &str, cursor: usize) -> (usize, usize) {
     let start = last_stmt_start.min(len);
 
     let mut end = len;
-    i = cur;
+    i = cursor_semicolon.unwrap_or(cur);
     while i < len {
         let b = bytes[i];
         if in_string {
