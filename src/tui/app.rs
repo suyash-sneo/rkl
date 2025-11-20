@@ -40,6 +40,9 @@ pub struct AppState {
     pub screen: Screen,
     pub show_help: bool,
     pub help_vscroll: u32,
+    pub timestamps_use_utc: bool,
+    pub timestamp_switch_pressed: bool,
+    pub timestamp_switch_deadline: Option<Instant>,
     // Info screen
     pub topics: Vec<String>,
     pub autocomplete: Option<AutoCompleteState>,
@@ -94,6 +97,9 @@ impl AppState {
             screen: Screen::Home,
             show_help: false,
             help_vscroll: 0,
+            timestamps_use_utc: true,
+            timestamp_switch_pressed: false,
+            timestamp_switch_deadline: None,
             topics: Vec::new(),
             autocomplete: None,
             topics_last_fetched_at: None,
@@ -142,8 +148,9 @@ pub enum TuiEvent {
     TopicsWithPartitions(Vec<(String, usize)>),
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub enum Focus {
+    #[default]
     Host,
     Query,
     Results,
@@ -159,22 +166,11 @@ impl AppState {
     }
 }
 
-impl Default for Focus {
-    fn default() -> Self {
-        Focus::Host
-    }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub enum ResultsMode {
+    #[default]
     Messages,
     TopicList,
-}
-
-impl Default for ResultsMode {
-    fn default() -> Self {
-        ResultsMode::Messages
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +219,24 @@ impl AppState {
             }
         })
     }
+
+    pub fn has_timestamp_column(&self) -> bool {
+        self.selected_columns
+            .iter()
+            .any(|c| matches!(c, SelectItem::Timestamp))
+    }
+
+    pub fn should_show_timestamp_switch(&self) -> bool {
+        self.results_mode == ResultsMode::Messages && self.has_timestamp_column()
+    }
+
+    pub fn timestamp_toggle_label(&self) -> &'static str {
+        if self.timestamps_use_utc {
+            "[Local time]"
+        } else {
+            "[UTC time]"
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -258,15 +272,10 @@ pub enum CaInputMode {
     Location,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub enum Screen {
+    #[default]
     Home,
     Envs,
     Info,
-}
-
-impl Default for Screen {
-    fn default() -> Self {
-        Screen::Home
-    }
 }

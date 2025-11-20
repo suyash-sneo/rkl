@@ -315,9 +315,25 @@ impl<'a> Parser<'a> {
             self.pos += 2;
             return Ok(CmpOp::Neq);
         }
+        if rest.starts_with("<=") {
+            self.pos += 2;
+            return Ok(CmpOp::Le);
+        }
+        if rest.starts_with(">=") {
+            self.pos += 2;
+            return Ok(CmpOp::Ge);
+        }
         if rest.starts_with("=") {
             self.pos += 1;
             return Ok(CmpOp::Eq);
+        }
+        if rest.starts_with("<") {
+            self.pos += 1;
+            return Ok(CmpOp::Lt);
+        }
+        if rest.starts_with(">") {
+            self.pos += 1;
+            return Ok(CmpOp::Gt);
         }
         Err(ParseError::UnexpectedToken(self.remaining().to_string()))
     }
@@ -701,6 +717,29 @@ mod tests {
                 assert_eq!(ast.select, vec![SelectItem::Key]);
             }
             _ => panic!("expected select"),
+        }
+    }
+
+    #[test]
+    fn parses_timestamp_comparisons() {
+        let expr = where_expr("SELECT key FROM t WHERE timestamp >= '2024-01-01T00:00:00Z'");
+        match expr {
+            Expr::Cmp { left, op, right } => {
+                assert!(matches!(left.root, RootPath::Timestamp));
+                assert!(left.segments.is_empty());
+                assert_eq!(op, CmpOp::Ge);
+                assert!(matches!(right, Literal::String(ref s) if s == "2024-01-01T00:00:00Z"));
+            }
+            other => panic!("unexpected expr: {other:?}"),
+        }
+
+        let expr_local = where_expr("SELECT key FROM t WHERE timestamp < '2024-01-02T00:00:00'");
+        match expr_local {
+            Expr::Cmp { left, op, .. } => {
+                assert_eq!(op, CmpOp::Lt);
+                assert!(matches!(left.root, RootPath::Timestamp));
+            }
+            other => panic!("unexpected expr: {other:?}"),
         }
     }
 }

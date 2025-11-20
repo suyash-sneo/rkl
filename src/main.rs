@@ -41,8 +41,6 @@ async fn main() -> Result<()> {
             return tui::run(RunArgs::default()).await;
         }
         (_, Some(Commands::Run(args))) => {
-            let args = args;
-
             // Parse --query if provided and compute effective settings
             println!(
                 "{}",
@@ -57,7 +55,7 @@ async fn main() -> Result<()> {
                         .order
                         .as_ref()
                         .map(|o| matches!(o.dir, OrderDir::Desc))
-                        .unwrap_or(false);
+                        .unwrap_or(true);
                     println!("{}", format!("Using query: {}", q).cyan());
                     println!("{}", format!("Topic: {}", ast.from).cyan());
                     let topic_name = ast.from.clone();
@@ -128,9 +126,13 @@ async fn main() -> Result<()> {
 
             // Spawn per-partition consumers
             let mut joinset = JoinSet::new();
-            let offset_spec =
-                OffsetSpec::from_str(&args.offset).unwrap_or_else(|_| OffsetSpec::Beginning);
+            let offset_spec = OffsetSpec::from_str(&args.offset).unwrap_or(OffsetSpec::Beginning);
             let query_arc = query_ast.clone().map(std::sync::Arc::new);
+            let query_limit = if query_arc.is_some() {
+                max_messages
+            } else {
+                None
+            };
             for &p in &partitions {
                 let txp = tx.clone();
                 let mut a = args.clone();
@@ -141,6 +143,7 @@ async fn main() -> Result<()> {
                     a.max_messages = None;
                 }
                 let q = query_arc.clone();
+                let limit = query_limit;
                 let ssl = if args.ssl_ca_pem.is_some()
                     || args.ssl_certificate_pem.is_some()
                     || args.ssl_key_pem.is_some()
@@ -154,7 +157,7 @@ async fn main() -> Result<()> {
                     None
                 };
                 joinset.spawn(async move {
-                    spawn_partition_consumer(a, p, offset_spec, txp, q, ssl).await
+                    spawn_partition_consumer(a, p, offset_spec, txp, q, limit, ssl).await
                 });
             }
             drop(tx); // merger will know when producers are done
@@ -212,14 +215,9 @@ fn parse_runargs_from_argv() -> RunArgs {
     // Reuse clap by pretending we're parsing RunArgs as a top-level command
     // If first non-flag arg exists and not starting with '-', treat as query.
     if argv.iter().skip(1).any(|a| a == "--query")
-        || argv
-            .iter()
-            .skip(1)
-            .next()
-            .map(|a| !a.starts_with('-'))
-            .unwrap_or(false)
+        || argv.get(1).map(|a| !a.starts_with('-')).unwrap_or(false)
     {
-        let mut args: Vec<String> = vec![argv.get(0).cloned().unwrap_or_else(|| "rkl".into())];
+        let mut args: Vec<String> = vec![argv.first().cloned().unwrap_or_else(|| "rkl".into())];
         let mut it = argv.iter().skip(1).cloned();
         let mut consumed_query = false;
         while let Some(a) = it.next() {
@@ -256,7 +254,7 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
                 .order
                 .as_ref()
                 .map(|o| matches!(o.dir, OrderDir::Desc))
-                .unwrap_or(false);
+                .unwrap_or(true);
             let topic_name = ast.from.clone();
             (Some(ast), topic_name, columns, max_messages, order_desc)
         } else {
@@ -314,9 +312,13 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
 
         let (tx, rx) = mpsc::channel::<MessageEnvelope>(args.channel_capacity);
         let mut joinset = JoinSet::new();
-        let offset_spec =
-            OffsetSpec::from_str(&args.offset).unwrap_or_else(|_| OffsetSpec::Beginning);
+        let offset_spec = OffsetSpec::from_str(&args.offset).unwrap_or(OffsetSpec::Beginning);
         let query_arc = query_ast.clone().map(std::sync::Arc::new);
+        let query_limit = if query_arc.is_some() {
+            max_messages
+        } else {
+            None
+        };
         for &p in &partitions {
             let txp = tx.clone();
             let mut a = args.clone();
@@ -326,6 +328,7 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
                 a.max_messages = None;
             }
             let q = query_arc.clone();
+            let limit = query_limit;
             let ssl = if args.ssl_ca_pem.is_some()
                 || args.ssl_certificate_pem.is_some()
                 || args.ssl_key_pem.is_some()
@@ -338,9 +341,9 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
             } else {
                 None
             };
-            joinset.spawn(
-                async move { spawn_partition_consumer(a, p, offset_spec, txp, q, ssl).await },
-            );
+            joinset.spawn(async move {
+                spawn_partition_consumer(a, p, offset_spec, txp, q, limit, ssl).await
+            });
         }
         drop(tx);
         let mut table_out = TableOutput::new(args.no_color, columns.clone(), args.max_cell_width);

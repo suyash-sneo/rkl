@@ -43,10 +43,8 @@ pub fn find_query_range(s: &str, cursor: usize) -> (usize, usize) {
             i += 1;
             continue;
         }
-        if is_select_at(bytes, i) {
-            if last_semicolon.map(|sc| i > sc).unwrap_or(true) {
-                last_stmt_start = i;
-            }
+        if is_select_at(bytes, i) && last_semicolon.map(|sc| i > sc).unwrap_or(true) {
+            last_stmt_start = i;
         }
         i += 1;
     }

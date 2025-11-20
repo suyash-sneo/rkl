@@ -19,7 +19,9 @@ use crate::consumer::spawn_partition_consumer;
 use crate::merger::run_merger;
 use crate::models::{MessageEnvelope, OffsetSpec};
 use crate::output::OutputSink;
-use crate::query::{Command, OrderDir, SelectItem, parse_command, parse_query};
+use crate::query::{
+    Command, OrderDir, SelectItem, SelectQuery, TimestampBounds, parse_command, parse_query,
+};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use rdkafka::client::ClientContext;
@@ -56,8 +58,6 @@ fn next_unique_env_name(envs: &[Environment]) -> String {
         n += 1;
     }
 }
-#[cfg(unix)]
-use libc;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -102,6 +102,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
                 }
             } else {
                 app.copy_btn_pressed = false;
+            }
+        }
+        if app.timestamp_switch_pressed {
+            if let Some(deadline) = app.timestamp_switch_deadline {
+                if Instant::now() >= deadline {
+                    app.timestamp_switch_pressed = false;
+                    app.timestamp_switch_deadline = None;
+                }
+            } else {
+                app.timestamp_switch_pressed = false;
             }
         }
 
@@ -291,9 +301,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                             .selected_env()
                                             .map(|e| e.host.clone())
                                             .unwrap_or(app.host.clone());
+                                        let plan_desc = describe_query_plan(&ast);
                                         app.status = format!(
-                                            "Running (run {}): topic '{}' on {}. Press q to quit.",
-                                            run_counter, ast.from, env_host
+                                            "Running (run {}): topic '{}' on {} | {}. Press q to quit.",
+                                            run_counter, ast.from, env_host, plan_desc
                                         );
                                         let mut run_args = args.clone();
                                         run_args.broker = env_host;
@@ -362,9 +373,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                             .selected_env()
                                             .map(|e| e.host.clone())
                                             .unwrap_or(app.host.clone());
+                                        let plan_desc = describe_query_plan(&ast);
                                         app.status = format!(
-                                            "Running (run {}): topic '{}' on {}. Press q to quit.",
-                                            run_counter, ast.from, env_host
+                                            "Running (run {}): topic '{}' on {} | {}. Press q to quit.",
+                                            run_counter, ast.from, env_host, plan_desc
                                         );
                                         let mut run_args = args.clone();
                                         run_args.broker = env_host;
@@ -1347,7 +1359,7 @@ async fn run_pipeline_with_ssl(
         .order
         .as_ref()
         .map(|o| matches!(o.dir, OrderDir::Desc))
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     let mut cfg = ClientConfig::new();
     cfg.set("bootstrap.servers", &args.broker)
@@ -1390,8 +1402,9 @@ async fn run_pipeline_with_ssl(
     let partitions: Vec<i32> = topic_md.partitions().iter().map(|p| p.id()).collect();
 
     let (tx_msg, rx_msg) = mpsc::channel::<MessageEnvelope>(args.channel_capacity);
-    let offset_spec = OffsetSpec::from_str(&args.offset).unwrap_or_else(|_| OffsetSpec::Beginning);
+    let offset_spec = OffsetSpec::from_str(&args.offset).unwrap_or(OffsetSpec::Beginning);
     let query_arc = std::sync::Arc::new(ast.clone());
+    let query_limit = max_messages_global;
 
     let mut joinset = tokio::task::JoinSet::new();
     for &p in &partitions {
@@ -1401,9 +1414,10 @@ async fn run_pipeline_with_ssl(
         a.keys_only = keys_only;
         a.max_messages = None;
         let q = Some(query_arc.clone());
+        let limit = query_limit;
         let ssl_clone = ssl.clone();
         joinset.spawn(async move {
-            spawn_partition_consumer(a, p, offset_spec, txp, q, ssl_clone).await
+            spawn_partition_consumer(a, p, offset_spec, txp, q, limit, ssl_clone).await
         });
     }
     drop(tx_msg);
@@ -1440,14 +1454,14 @@ fn selected_cell_text(app: &AppState) -> Option<String> {
         .selected_col
         .min(app.selected_columns.len().saturating_sub(1));
     let col = app.selected_columns[col_idx];
-    Some(runner_column_text(env, col))
+    Some(runner_column_text(env, col, app.timestamps_use_utc))
 }
 
-fn runner_column_text(env: &MessageEnvelope, col: SelectItem) -> String {
+fn runner_column_text(env: &MessageEnvelope, col: SelectItem, use_utc: bool) -> String {
     match col {
         SelectItem::Partition => env.partition.to_string(),
         SelectItem::Offset => env.offset.to_string(),
-        SelectItem::Timestamp => fmt_ts(env.timestamp_ms),
+        SelectItem::Timestamp => fmt_ts(env.timestamp_ms, use_utc),
         SelectItem::Key => env.key.clone(),
         SelectItem::Value => env.value.as_deref().unwrap_or("null").to_string(),
     }
@@ -1536,15 +1550,58 @@ fn copy_to_clipboard(s: &str) -> Result<()> {
     Ok(())
 }
 
-fn fmt_ts(ms: i64) -> String {
+fn fmt_ts(ms: i64, use_utc: bool) -> String {
     if ms <= 0 {
         return "0".to_string();
     }
     let secs = ms / 1000;
-    let tm = time::OffsetDateTime::from_unix_timestamp(secs as i64)
-        .unwrap_or_else(|_| time::OffsetDateTime::UNIX_EPOCH);
+    let base =
+        time::OffsetDateTime::from_unix_timestamp(secs).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    let tm = if use_utc {
+        base
+    } else if let Ok(offset) = time::UtcOffset::current_local_offset() {
+        base.to_offset(offset)
+    } else {
+        base
+    };
     tm.format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| ms.to_string())
+}
+
+fn describe_query_plan(ast: &SelectQuery) -> String {
+    let order_label = match ast.order.as_ref().map(|o| o.dir) {
+        Some(OrderDir::Asc) => "timestamp ASC".to_string(),
+        Some(OrderDir::Desc) => "timestamp DESC".to_string(),
+        None => "timestamp DESC (default)".to_string(),
+    };
+    let mut parts = vec![format!("order={}", order_label)];
+    if let Some(bounds) = ast
+        .r#where
+        .as_ref()
+        .and_then(|expr| expr.timestamp_bounds())
+    {
+        if let Some(text) = format_timestamp_bounds(bounds) {
+            parts.push(text);
+        }
+    }
+    parts.join(" | ")
+}
+
+fn format_timestamp_bounds(bounds: TimestampBounds) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(lower) = bounds.lower {
+        let op = if lower.inclusive { ">=" } else { ">" };
+        parts.push(format!("timestamp {} {}", op, fmt_ts(lower.millis, true)));
+    }
+    if let Some(upper) = bounds.upper {
+        let op = if upper.inclusive { "<=" } else { "<" };
+        parts.push(format!("timestamp {} {}", op, fmt_ts(upper.millis, true)));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" AND "))
+    }
 }
 
 fn handle_env_editor_paste(app: &mut AppState, raw: &str) -> bool {
@@ -1683,10 +1740,7 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
         return;
     }
     // Compute the layout rects like ui.rs to know where the table and json panes are
-    let (w, h) = match crossterm::terminal::size() {
-        Ok(x) => x,
-        Err(_) => (0, 0),
-    };
+    let (w, h) = crossterm::terminal::size().unwrap_or((0, 0));
     let root = Rect {
         x: 0,
         y: 0,
@@ -1804,28 +1858,33 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
             if point_in(mx, my, table_rect) {
                 match app.results_mode {
                     ResultsMode::Messages => {
-                        let data_start_y = table_rect.y.saturating_add(2);
+                        if let Some(rect) = timestamp_toggle_button_rect(table_rect, app) {
+                            if point_in(mx, my, rect) {
+                                toggle_timestamp_display(app);
+                                return;
+                            }
+                        }
+                        let data_rect = table_rect;
+                        let data_start_y = data_rect.y.saturating_add(2);
                         if my >= data_start_y
                             && my
-                                < table_rect
+                                < data_rect
                                     .y
-                                    .saturating_add(table_rect.height.saturating_sub(1))
+                                    .saturating_add(data_rect.height.saturating_sub(1))
+                            && !app.rows.is_empty()
                         {
-                            if !app.rows.is_empty() {
-                                let y_rel = (my - data_start_y) as usize;
-                                let visible_rows = table_rect.height.saturating_sub(3) as usize;
-                                let approx_first =
-                                    app.selected_row.saturating_sub(visible_rows / 2);
-                                let new_row =
-                                    (approx_first + y_rel).min(app.rows.len().saturating_sub(1));
-                                if new_row != app.selected_row {
-                                    app.selected_row = new_row;
-                                    app.json_vscroll = 0;
-                                }
+                            let y_rel = (my - data_start_y) as usize;
+                            let visible_rows = data_rect.height.saturating_sub(3) as usize;
+                            let approx_first = app.selected_row.saturating_sub(visible_rows / 2);
+                            let new_row =
+                                (approx_first + y_rel).min(app.rows.len().saturating_sub(1));
+                            if new_row != app.selected_row {
+                                app.selected_row = new_row;
+                                app.json_vscroll = 0;
                             }
                         }
 
-                        let inner_x = table_rect.x.saturating_add(1);
+                        let inner_x = data_rect.x.saturating_add(1);
                         if mx >= inner_x {
                             let mut x_rel = (mx - inner_x) as usize;
                             let mut col = 0usize;
@@ -1871,16 +1930,14 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
                                 < table_rect
                                     .y
                                     .saturating_add(table_rect.height.saturating_sub(1))
+                            && !app.topics_with_partitions.is_empty()
                         {
-                            if !app.topics_with_partitions.is_empty() {
-                                let y_rel = (my - data_start_y) as usize;
-                                let visible_rows = table_rect.height.saturating_sub(3) as usize;
-                                let approx_first =
-                                    app.selected_row.saturating_sub(visible_rows / 2);
-                                let new_row = (approx_first + y_rel)
-                                    .min(app.topics_with_partitions.len().saturating_sub(1));
-                                app.selected_row = new_row;
-                            }
+                            let y_rel = (my - data_start_y) as usize;
+                            let visible_rows = table_rect.height.saturating_sub(3) as usize;
+                            let approx_first = app.selected_row.saturating_sub(visible_rows / 2);
+                            let new_row = (approx_first + y_rel)
+                                .min(app.topics_with_partitions.len().saturating_sub(1));
+                            app.selected_row = new_row;
                         }
                     }
                 }
@@ -2056,6 +2113,43 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
         }
         _ => {}
     }
+}
+
+fn timestamp_toggle_button_rect(area: Rect, app: &AppState) -> Option<Rect> {
+    if !app.should_show_timestamp_switch() || area.width <= 2 || area.height <= 2 {
+        return None;
+    }
+    let label_width = app.timestamp_toggle_label().chars().count() as u16;
+    if label_width == 0 {
+        return None;
+    }
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if inner.width <= label_width {
+        return None;
+    }
+    Some(Rect {
+        x: inner.x + inner.width - label_width,
+        y: inner.y,
+        width: label_width,
+        height: 1,
+    })
+}
+
+fn toggle_timestamp_display(app: &mut AppState) {
+    app.timestamps_use_utc = !app.timestamps_use_utc;
+    app.timestamp_switch_pressed = true;
+    app.timestamp_switch_deadline = Some(Instant::now() + Duration::from_millis(150));
+    let mode = if app.timestamps_use_utc {
+        "UTC"
+    } else {
+        "system local"
+    };
+    app.status = format!("Timestamps now show in {mode} time");
 }
 
 fn scroll_help(app: &mut AppState, delta: i32) {
@@ -2877,9 +2971,7 @@ fn detect_from_token(text: &str, cursor: usize) -> Option<(usize, usize, usize)>
     let bytes = query.as_bytes();
 
     let from_idx = find_keyword_before(bytes, b"from", rel_cursor)?;
-    if find_keyword_before(bytes, b"select", from_idx).is_none() {
-        return None;
-    }
+    find_keyword_before(bytes, b"select", from_idx)?;
     let mut token_start = from_idx + 4;
     while token_start < query.len() && bytes[token_start].is_ascii_whitespace() {
         token_start += 1;
@@ -2991,7 +3083,7 @@ fn maybe_update_autocomplete(
 
     if let Some((s, e, text)) = app.autocomplete_frozen_token.clone() {
         if s == token_start && e == token_end {
-            if &app.input[token_start..token_end] == text {
+            if app.input[token_start..token_end] == text {
                 app.autocomplete = None;
                 if !force {
                     app.autocomplete_dirty = false;
@@ -3057,11 +3149,7 @@ fn build_topic_suggestions(topics: &[String], filter: &str) -> Vec<String> {
             scored.push((distance, score, name));
         }
     }
-    scored.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then(b.1.cmp(&a.1))
-            .then_with(|| a.2.cmp(b.2))
-    });
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then_with(|| a.2.cmp(b.2)));
     scored
         .into_iter()
         .map(|(_, _, name)| name.clone())
@@ -3087,9 +3175,7 @@ fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
         curr[0] = i + 1;
         for (j, ac) in a.iter().enumerate() {
             let cost = if ac == bc { 0 } else { 1 };
-            curr[j + 1] = (curr[j] + 1)
-                .min(prev[j + 1] + 1)
-                .min(prev[j] + cost);
+            curr[j + 1] = (curr[j] + 1).min(prev[j + 1] + 1).min(prev[j] + cost);
         }
         prev.copy_from_slice(&curr);
     }

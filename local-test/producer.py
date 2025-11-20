@@ -2,6 +2,8 @@ import json
 import random
 import time
 import uuid
+from typing import Optional
+
 from kafka import KafkaProducer
 from kafka.errors import NoBrokersAvailable
 
@@ -31,12 +33,15 @@ def build_key(service: str, env: str, region: str, user_id: str) -> str:
     return f"{service}-{env}-{region}:{user_id[:8]}"
 
 
-def generate_log_event() -> dict:
+def generate_log_event(timestamp_ms: Optional[int] = None) -> dict:
     """Generate a realistic log/event payload with categorical strings and GUIDs."""
     service = random.choice(SERVICES)
     env = random.choice(ENVS)
     region = random.choice(REGIONS)
     user_id = str(uuid.uuid4())
+
+    if timestamp_ms is None:
+        timestamp_ms = int(time.time() * 1000)
 
     req_method = random.choice(METHODS)
     path = random.choice(PATHS)
@@ -60,7 +65,7 @@ def generate_log_event() -> dict:
     payload = {
         "meta": {
             "id": str(uuid.uuid4()),
-            "timestamp": int(time.time() * 1000),
+            "timestamp": timestamp_ms,
             "service": service,
             "env": env,
             "region": region,
@@ -112,6 +117,12 @@ def main():
     bootstrap_servers = ['kafka:29092']
     topic = 'random-data'
     num_messages = 10000
+    window_minutes = 30
+    window_ms = window_minutes * 60 * 1000
+    now_ms = int(time.time() * 1000)
+
+    def sample_timestamp() -> int:
+        return now_ms - random.randint(0, window_ms)
     
     print("Waiting for Kafka to be available...")
     if not wait_for_kafka(bootstrap_servers):
@@ -131,7 +142,7 @@ def main():
     seed_payloads = []
 
     # 1) auth-prod key with PUT and an error in response msg
-    p1 = generate_log_event()
+    p1 = generate_log_event(sample_timestamp())
     p1["meta"]["service"] = "auth"
     p1["meta"]["env"] = "prod"
     p1["meta"]["region"] = "us-east-1"
@@ -142,7 +153,7 @@ def main():
     seed_payloads.append((k1, p1))
 
     # 2) orders service, non-GET method
-    p2 = generate_log_event()
+    p2 = generate_log_event(sample_timestamp())
     p2["meta"]["service"] = "orders"
     p2["request"]["method"] = "POST"
     p2["response"]["status"] = 201
@@ -151,7 +162,7 @@ def main():
     seed_payloads.append((k2, p2))
 
     # 3) billing service with a not-found error
-    p3 = generate_log_event()
+    p3 = generate_log_event(sample_timestamp())
     p3["meta"]["service"] = "billing"
     p3["request"]["method"] = "DELETE"
     p3["response"]["status"] = 404
@@ -160,7 +171,7 @@ def main():
     seed_payloads.append((k3, p3))
 
     # 4) catalog service, GET success false (e.g., 503)
-    p4 = generate_log_event()
+    p4 = generate_log_event(sample_timestamp())
     p4["meta"]["service"] = "catalog"
     p4["request"]["method"] = "GET"
     p4["response"]["status"] = 503
@@ -169,7 +180,7 @@ def main():
     seed_payloads.append((k4, p4))
 
     # 5) purchase event success=true for filtering
-    p5 = generate_log_event()
+    p5 = generate_log_event(sample_timestamp())
     p5["event"]["type"] = "purchase"
     p5["response"]["status"] = 200
     p5["response"]["msg"] = "ok"
@@ -177,14 +188,14 @@ def main():
     seed_payloads.append((k5, p5))
 
     for k, v in seed_payloads:
-        producer.send(topic, key=k, value=v)
+        producer.send(topic, key=k, value=v, timestamp_ms=v["meta"]["timestamp"])
 
     print(f"Produced {len(seed_payloads)} seed messages...")
 
     for i in range(num_messages):
-        payload = generate_log_event()
+        payload = generate_log_event(sample_timestamp())
         key = build_key(payload["meta"]["service"], payload["meta"]["env"], payload["meta"]["region"], payload["user"]["id"])
-        producer.send(topic, key=key, value=payload)
+        producer.send(topic, key=key, value=payload, timestamp_ms=payload["meta"]["timestamp"])
         if (i + 1) % 1000 == 0:
             print(f"Produced {i + 1} structured messages...")
     

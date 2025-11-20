@@ -1,3 +1,6 @@
+use serde_json::Value;
+use std::{cmp::Ordering, sync::OnceLock};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectItem {
     Partition,
@@ -48,7 +51,10 @@ pub enum CmpOp {
     Eq,
     Neq,
     Contains,
-    // Future: Lt, Gt, Le, Ge, Like, In, etc.
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +96,18 @@ pub struct SelectQuery {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimestampBound {
+    pub millis: i64,
+    pub inclusive: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TimestampBounds {
+    pub lower: Option<TimestampBound>,
+    pub upper: Option<TimestampBound>,
+}
+
 impl Expr {
     /// Evaluate this expression against a message triple `(key, value_json, timestamp_ms)`.
     pub fn matches(
@@ -119,7 +137,131 @@ impl Expr {
                     let left_str = path_to_string(left, key, value, value_str, timestamp_ms);
                     cmp_contains(&left_str, right)
                 }
+                CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
+                    if matches!(left.root, RootPath::Timestamp) && left.segments.is_empty() {
+                        let rhs_ms = match right {
+                            Literal::String(s) => parse_timestamp_literal_ms(s),
+                            Literal::Number(n) => Some(*n as i64),
+                            _ => None,
+                        };
+                        if let Some(rhs_ms) = rhs_ms {
+                            match op {
+                                CmpOp::Lt => timestamp_ms < rhs_ms,
+                                CmpOp::Le => timestamp_ms <= rhs_ms,
+                                CmpOp::Gt => timestamp_ms > rhs_ms,
+                                CmpOp::Ge => timestamp_ms >= rhs_ms,
+                                _ => unreachable!(),
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        let lv = resolve_path(left, key, value, timestamp_ms);
+                        cmp_ordering(&lv, right, *op)
+                    }
+                }
             },
+        }
+    }
+
+    /// Extract intersected timestamp bounds from an expression tree (AND only).
+    pub fn timestamp_bounds(&self) -> Option<TimestampBounds> {
+        fn merge_bounds(
+            acc: Option<TimestampBounds>,
+            next: Option<TimestampBounds>,
+        ) -> Option<TimestampBounds> {
+            match (acc, next) {
+                (None, b) | (b, None) => b,
+                (Some(a), Some(b)) => {
+                    let lower = match (a.lower, b.lower) {
+                        (None, x) | (x, None) => x,
+                        (Some(l1), Some(l2)) => {
+                            let (millis, inclusive) = match l1.millis.cmp(&l2.millis) {
+                                Ordering::Greater => (l1.millis, l1.inclusive),
+                                Ordering::Less => (l2.millis, l2.inclusive),
+                                Ordering::Equal => (l1.millis, l1.inclusive && l2.inclusive),
+                            };
+                            Some(TimestampBound { millis, inclusive })
+                        }
+                    };
+
+                    let upper = match (a.upper, b.upper) {
+                        (None, x) | (x, None) => x,
+                        (Some(u1), Some(u2)) => {
+                            let (millis, inclusive) = match u1.millis.cmp(&u2.millis) {
+                                Ordering::Less => (u1.millis, u1.inclusive),
+                                Ordering::Greater => (u2.millis, u2.inclusive),
+                                Ordering::Equal => (u1.millis, u1.inclusive && u2.inclusive),
+                            };
+                            Some(TimestampBound { millis, inclusive })
+                        }
+                    };
+
+                    Some(TimestampBounds { lower, upper })
+                }
+            }
+        }
+
+        fn walk(expr: &Expr) -> Option<TimestampBounds> {
+            match expr {
+                Expr::And(lhs, rhs) => {
+                    let lb = walk(lhs);
+                    let rb = walk(rhs);
+                    merge_bounds(lb, rb)
+                }
+                Expr::Or(_, _) => None,
+                Expr::Cmp { left, op, right } => {
+                    if !matches!(left.root, RootPath::Timestamp) || !left.segments.is_empty() {
+                        return Some(TimestampBounds::default());
+                    }
+                    let millis = match right {
+                        Literal::String(s) => parse_timestamp_literal_ms(s),
+                        Literal::Number(n) => Some(*n as i64),
+                        _ => None,
+                    }?;
+                    let bound = match op {
+                        CmpOp::Gt => Some(TimestampBound {
+                            millis,
+                            inclusive: false,
+                        }),
+                        CmpOp::Ge => Some(TimestampBound {
+                            millis,
+                            inclusive: true,
+                        }),
+                        CmpOp::Lt => Some(TimestampBound {
+                            millis,
+                            inclusive: false,
+                        }),
+                        CmpOp::Le => Some(TimestampBound {
+                            millis,
+                            inclusive: true,
+                        }),
+                        _ => None,
+                    };
+                    if let Some(b) = bound {
+                        if matches!(op, CmpOp::Gt | CmpOp::Ge) {
+                            Some(TimestampBounds {
+                                lower: Some(b),
+                                upper: None,
+                            })
+                        } else {
+                            Some(TimestampBounds {
+                                lower: None,
+                                upper: Some(b),
+                            })
+                        }
+                    } else {
+                        Some(TimestampBounds::default())
+                    }
+                }
+            }
+        }
+
+        let res = walk(self)?;
+        if res.lower.is_none() && res.upper.is_none() {
+            None
+        } else {
+            Some(res)
         }
     }
 }
@@ -226,7 +368,63 @@ fn value_to_string(value: &Value) -> String {
         _ => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
     }
 }
-use serde_json::Value;
+
+fn cmp_ordering(left: &Value, right: &Literal, op: CmpOp) -> bool {
+    let ordering = match right {
+        Literal::Number(n) => left.as_f64().and_then(|x| x.partial_cmp(n)),
+        Literal::String(s) => left.as_str().map(|x| x.cmp(s)),
+        Literal::Bool(b) => left.as_bool().map(|x| x.cmp(b)),
+        Literal::Null => {
+            if left.is_null() {
+                Some(Ordering::Equal)
+            } else {
+                Some(Ordering::Greater)
+            }
+        }
+    };
+    matches!(
+        (ordering, op),
+        (Some(Ordering::Less), CmpOp::Lt)
+            | (Some(Ordering::Less), CmpOp::Le)
+            | (Some(Ordering::Equal), CmpOp::Le)
+            | (Some(Ordering::Equal), CmpOp::Ge)
+            | (Some(Ordering::Greater), CmpOp::Gt)
+            | (Some(Ordering::Greater), CmpOp::Ge)
+    )
+}
+
+fn parse_timestamp_literal_ms(s: &str) -> Option<i64> {
+    use time::format_description::well_known::Rfc3339;
+    use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
+
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(dt) = OffsetDateTime::parse(trimmed, &Rfc3339) {
+        let millis = (dt.unix_timestamp_nanos() / 1_000_000) as i64;
+        return Some(millis);
+    }
+
+    fn local_format() -> &'static [time::format_description::FormatItem<'static>] {
+        static FMT: OnceLock<Vec<time::format_description::FormatItem<'static>>> = OnceLock::new();
+        FMT.get_or_init(|| {
+            time::format_description::parse("[year]-[month]-[day]T[hour]:[minute]:[second]")
+                .expect("valid timestamp format")
+        })
+    }
+
+    if let Ok(pdt) = PrimitiveDateTime::parse(trimmed, local_format()) {
+        if let Ok(offset) = UtcOffset::current_local_offset() {
+            let odt = pdt.assume_offset(offset);
+            let millis = (odt.unix_timestamp_nanos() / 1_000_000) as i64;
+            return Some(millis);
+        }
+    }
+
+    None
+}
 
 #[cfg(test)]
 mod tests {
@@ -402,5 +600,76 @@ mod tests {
         };
         let json_value = serde_json::json!({"msg":"hello"});
         assert!(fallback_value.matches(key, &json_value, None, ts));
+    }
+
+    #[test]
+    fn matches_timestamp_comparisons() {
+        let key = "k";
+        let value_json = Value::Null;
+        let ts_iso = "2024-01-01T12:00:00Z";
+        let ts_ms =
+            (time::OffsetDateTime::parse(ts_iso, &time::format_description::well_known::Rfc3339)
+                .unwrap()
+                .unix_timestamp_nanos()
+                / 1_000_000) as i64;
+
+        let expr_ge = Expr::Cmp {
+            left: path(RootPath::Timestamp, &[]),
+            op: CmpOp::Ge,
+            right: Literal::String(ts_iso.to_string()),
+        };
+        assert!(expr_ge.matches(key, &value_json, None, ts_ms));
+
+        let expr_gt = Expr::Cmp {
+            left: path(RootPath::Timestamp, &[]),
+            op: CmpOp::Gt,
+            right: Literal::Number((ts_ms - 1) as f64),
+        };
+        assert!(expr_gt.matches(key, &value_json, None, ts_ms));
+
+        let expr_lt = Expr::Cmp {
+            left: path(RootPath::Timestamp, &[]),
+            op: CmpOp::Lt,
+            right: Literal::String("2024-01-01T13:00:00Z".to_string()),
+        };
+        assert!(expr_lt.matches(key, &value_json, None, ts_ms));
+
+        let expr_le = Expr::Cmp {
+            left: path(RootPath::Timestamp, &[]),
+            op: CmpOp::Le,
+            right: Literal::Number(ts_ms as f64),
+        };
+        assert!(expr_le.matches(key, &value_json, None, ts_ms));
+    }
+
+    #[test]
+    fn timestamp_bounds_extract_ranges() {
+        let lower = Expr::Cmp {
+            left: path(RootPath::Timestamp, &[]),
+            op: CmpOp::Ge,
+            right: Literal::String("2024-01-01T00:00:00Z".to_string()),
+        };
+        let bounds_lower = lower.timestamp_bounds().expect("lower bounds");
+        assert!(bounds_lower.upper.is_none());
+        let lb = bounds_lower.lower.expect("lower");
+        assert!(lb.inclusive);
+
+        let upper = Expr::Cmp {
+            left: path(RootPath::Timestamp, &[]),
+            op: CmpOp::Lt,
+            right: Literal::String("2024-01-02T00:00:00".to_string()),
+        };
+        let bounds_upper = upper.timestamp_bounds().expect("upper bounds");
+        assert!(bounds_upper.lower.is_none());
+        let ub = bounds_upper.upper.expect("upper");
+        assert!(!ub.inclusive);
+
+        let both = Expr::And(Box::new(lower.clone()), Box::new(upper.clone()));
+        let bounds = both.timestamp_bounds().expect("combined");
+        assert!(bounds.lower.is_some());
+        assert!(bounds.upper.is_some());
+
+        let expr_or = Expr::Or(Box::new(lower), Box::new(upper));
+        assert!(expr_or.timestamp_bounds().is_none());
     }
 }

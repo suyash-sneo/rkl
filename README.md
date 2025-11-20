@@ -6,7 +6,7 @@ RKL is a terminal UI for exploring Kafka topics with an SQL-like experience. It 
 
 ## Features
 
-- SQL-inspired query engine (`SELECT`, `WHERE`, `ORDER BY timestamp`, `LIMIT`) with JSON-path filtering via `value->field->subfield`.
+- SQL-inspired query engine (`SELECT`, `WHERE`, `ORDER BY timestamp` with DESC default, `LIMIT`) with JSON-path filtering via `value->field->subfield`.
 - Real-time results table with horizontal scrolling plus a right-side JSON pane for the focused record.
 - Topic inspection with the `LIST topics;` command and an Info screen (F12) that caches broker metadata.
 - Fuzzy topic autocomplete triggered after `FROM`, accepted with Right arrow, and navigated with `Ctrl-N`/`Ctrl-P`.
@@ -52,8 +52,9 @@ curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/uninst
 ## Query Language
 
 - Syntax: `SELECT columns FROM topic [WHERE expr] [ORDER BY timestamp ASC|DESC] [LIMIT n]`.
-- Filter JSON by walking nested fields with `value->meta->service`, `value->response->status`, etc. `key` and raw `value` also support comparisons.
-- Operators: `=`, `!=`, `<>`, `CONTAINS`, `AND`, `OR`, and parentheses for grouping. `timestamp` is the only sortable column.
+- ORDER BY timestamp DESC is applied automatically when omitted so queries stream newest data first.
+- Filter JSON by walking nested fields with `value->meta->service`, `value->response->status`, etc. `key`, raw `value`, and `timestamp` all support comparisons.
+- Operators: `=`, `!=`, `<>`, `CONTAINS`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, and parentheses for grouping. `timestamp` comparisons accept either milliseconds or ISO-8601 strings; values ending in `Z` are treated as UTC while others use your system timezone.
 - End queries with `;` to separate multiple statements; the editor highlights the current query under the cursor.
 
 Examples:
@@ -62,6 +63,7 @@ Examples:
 SELECT key, value FROM random-data LIMIT 5;
 SELECT key FROM random-data WHERE value->response->msg CONTAINS 'error';
 SELECT key, value FROM random-data WHERE value->event->type = 'purchase' AND value->response->status = 200;
+SELECT key FROM random-data WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z';
 SELECT key FROM random-data WHERE (key = 'a' OR key = 'b') AND value->foo CONTAINS 'x' ORDER BY timestamp DESC LIMIT 100;
 ```
 

@@ -834,86 +834,67 @@ pub fn help_content_line_count() -> usize {
 }
 
 fn build_help_lines() -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    lines.push(heading_line("Global"));
-    lines.push(Line::from("- F8 Home, F2 Envs, F12 Info, F10 Help"));
-    lines.push(Line::from("- Ctrl-Q/C quit"));
-    lines.push(Line::from(""));
-
-    lines.push(heading_line("Home - Host bar"));
-    lines.push(Line::from("- Tab focus; Enter open envs; F2 Envs for full screen"));
-    lines.push(Line::from(""));
-
-    lines.push(heading_line("Home - Query"));
-    lines.push(Line::from("- Ctrl-Enter run current SELECT; Enter newline"));
-    lines.push(Line::from(
-        "- Right accept autocomplete; Ctrl-N/P navigate autocomplete",
-    ));
-    lines.push(Line::from(
-        "- Ctrl/Alt+Left/Right move word; Ctrl/Alt+Backspace/Delete delete word",
-    ));
-    lines.push(Line::from(
-        "- Ctrl+Home/End jump buffer; PageUp/PageDown scroll editor",
-    ));
-    lines.push(Line::from(""));
-
-    lines.push(heading_line("Home - Results"));
-    lines.push(Line::from(
-        "- Arrows move selection; PageUp/PageDown step; Home/End jump",
-    ));
-    lines.push(Line::from(
-        "- Shift-Left/Right horizontal scroll; F5 copy value; F7 copy status",
-    ));
-    lines.push(Line::from("- Mouse wheel scroll supported"));
-    lines.push(Line::from(""));
-
-    lines.push(heading_line("Environments"));
-    lines.push(Line::from("- F1 New, F2 Edit, F3 Delete"));
-    lines.push(Line::from("- F4 Save, F5 Test, Tab/Shift-Tab move fields"));
-    lines.push(Line::from("- Up/Down select; F9 toggle mouse select; Esc close"));
-    lines.push(Line::from("- Text areas accept typing and paste"));
-    lines.push(Line::from(""));
-
-    lines.push(heading_line("Info screen"));
-    lines.push(Line::from("- F6 Refresh topics"));
-    lines.push(Line::from(""));
-
-    lines.push(heading_line("Query syntax"));
-    lines.push(Line::from(
-        "- SELECT columns FROM topic [WHERE expr] [ORDER BY timestamp ASC|DESC] [LIMIT n]",
-    ));
-    lines.push(Line::from("- JSON path via value->field->subfield"));
-    lines.push(Line::from("- Operators: =, !=, <>, CONTAINS"));
-    lines.push(Line::from(""));
-
-    lines.push(heading_line("Examples"));
-    lines.push(Line::from("  SELECT key, value FROM my_topic LIMIT 10;"));
-    lines.push(Line::from(
-        "  SELECT key FROM t WHERE value->response->msg CONTAINS 'error';",
-    ));
-    lines.push(Line::from(
-        "  SELECT key, value FROM random-data WHERE value->event->type = 'purchase' AND value->response->status = 200;",
-    ));
-    lines.push(Line::from(
-        "  SELECT key FROM t WHERE (key = 'a' OR key = 'b') AND value->foo CONTAINS 'x' ORDER BY timestamp DESC LIMIT 100;",
-    ));
-    lines.push(Line::from("- Special command: LIST topics;"));
-    lines.push(Line::from(""));
-
-    lines.push(heading_line("Autocomplete"));
-    lines.push(Line::from(
-        "- Triggered after typing FROM and a space in a SELECT",
-    ));
-    lines.push(Line::from("- Fuzzy-matched suggestions for topics"));
-    lines.push(Line::from("- Right accepts; Ctrl-N/Ctrl-P move; Esc dismiss"));
-    lines.push(Line::from(""));
-
-    lines.push(heading_line("Help navigation"));
-    lines.push(Line::from(
-        "- Scroll with Up/Down or PageUp/PageDown; Home/End jump",
-    ));
-
-    lines
+    vec![
+        heading_line("Global"),
+        Line::from("- F8 Home, F2 Envs, F12 Info, F10 Help"),
+        Line::from("- Ctrl-Q/C quit"),
+        Line::from(""),
+        heading_line("Home - Host bar"),
+        Line::from("- Tab focus; Enter open envs; F2 Envs for full screen"),
+        Line::from(""),
+        heading_line("Home - Query"),
+        Line::from("- Ctrl-Enter run current SELECT; Enter newline"),
+        Line::from("- Right accept autocomplete; Ctrl-N/P navigate autocomplete"),
+        Line::from("- Ctrl/Alt+Left/Right move word; Ctrl/Alt+Backspace/Delete delete word"),
+        Line::from("- Ctrl+Home/End jump buffer; PageUp/PageDown scroll editor"),
+        Line::from(""),
+        heading_line("Home - Results"),
+        Line::from("- Arrows move selection; PageUp/PageDown step; Home/End jump"),
+        Line::from("- Shift-Left/Right horizontal scroll; F5 copy value; F7 copy status"),
+        Line::from("- Mouse wheel scroll supported"),
+        Line::from(""),
+        heading_line("Environments"),
+        Line::from("- F1 New, F2 Edit, F3 Delete"),
+        Line::from("- F4 Save, F5 Test, Tab/Shift-Tab move fields"),
+        Line::from("- Up/Down select; F9 toggle mouse select; Esc close"),
+        Line::from("- Text areas accept typing and paste"),
+        Line::from(""),
+        heading_line("Info screen"),
+        Line::from("- F6 Refresh topics"),
+        Line::from(""),
+        heading_line("Query syntax"),
+        Line::from(
+            "- SELECT columns FROM topic [WHERE expr] [ORDER BY timestamp ASC|DESC] [LIMIT n]",
+        ),
+        Line::from("- ORDER BY timestamp DESC is assumed when omitted"),
+        Line::from("- JSON path via value->field->subfield; key and timestamp supported"),
+        Line::from("- Operators: =, !=, <>, CONTAINS, <, <=, >, >="),
+        Line::from(
+            "- Timestamp filters accept ISO-8601 strings (UTC with Z, system timezone otherwise)",
+        ),
+        Line::from(""),
+        heading_line("Examples"),
+        Line::from("  SELECT key, value FROM my_topic LIMIT 10;"),
+        Line::from("  SELECT key FROM t WHERE value->response->msg CONTAINS 'error';"),
+        Line::from(
+            "  SELECT key, value FROM random-data WHERE value->event->type = 'purchase' AND value->response->status = 200;",
+        ),
+        Line::from(
+            "  SELECT key FROM t WHERE (key = 'a' OR key = 'b') AND value->foo CONTAINS 'x' ORDER BY timestamp DESC LIMIT 100;",
+        ),
+        Line::from(
+            "  SELECT key FROM t WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z';",
+        ),
+        Line::from("- Special command: LIST topics;"),
+        Line::from(""),
+        heading_line("Autocomplete"),
+        Line::from("- Triggered after typing FROM and a space in a SELECT"),
+        Line::from("- Fuzzy-matched suggestions for topics"),
+        Line::from("- Right accepts; Ctrl-N/Ctrl-P move; Esc dismiss"),
+        Line::from(""),
+        heading_line("Help navigation"),
+        Line::from("- Scroll with Up/Down or PageUp/PageDown; Home/End jump"),
+    ]
 }
 
 fn heading_line(text: &'static str) -> Line<'static> {
@@ -992,10 +973,53 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &AppState) {
             frame.render_stateful_widget(hbar, area, &mut hs);
         }
     }
+
+    draw_timestamp_toggle_button(frame, area, app);
 }
 
 fn header_span(text: &str) -> Span<'_> {
     Span::styled(text, Style::default().add_modifier(Modifier::BOLD))
+}
+
+fn draw_timestamp_toggle_button(frame: &mut Frame, area: Rect, app: &AppState) {
+    if !app.should_show_timestamp_switch() {
+        return;
+    }
+    if area.width <= 2 || area.height <= 2 {
+        return;
+    }
+    let label = app.timestamp_toggle_label();
+    let label_width = label.chars().count() as u16;
+    if label_width == 0 {
+        return;
+    }
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if inner.width <= label_width {
+        return;
+    }
+    let btn_rect = Rect {
+        x: inner.x + inner.width - label_width,
+        y: inner.y,
+        width: label_width,
+        height: 1,
+    };
+    let style = if app.timestamp_switch_pressed {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(Span::styled(label, style))).alignment(Alignment::Center),
+        btn_rect,
+    );
 }
 
 fn column_label(col: &SelectItem) -> &'static str {
@@ -1028,7 +1052,7 @@ fn make_row(idx: usize, env: &MessageEnvelope, app: &AppState) -> Row<'static> {
                 let preview = json_preview_minified(raw_value);
                 apply_hscroll(&preview, app.table_hscroll)
             }
-            _ => column_raw_text(env, *col),
+            _ => column_raw_text(env, *col, app),
         };
         cells.push(style_cell(
             Cell::from(text),
@@ -1045,14 +1069,20 @@ fn style_cell(mut cell: Cell<'static>, selected: bool) -> Cell<'static> {
     cell
 }
 
-fn fmt_ts(ms: i64) -> String {
+fn fmt_ts(ms: i64, use_utc: bool) -> String {
     if ms <= 0 {
         return "0".to_string();
     }
-    // Keep short human readable format
     let secs = ms / 1000;
-    let tm = time::OffsetDateTime::from_unix_timestamp(secs as i64)
-        .unwrap_or_else(|_| time::OffsetDateTime::UNIX_EPOCH);
+    let base =
+        time::OffsetDateTime::from_unix_timestamp(secs).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    let tm = if use_utc {
+        base
+    } else if let Ok(offset) = time::UtcOffset::current_local_offset() {
+        base.to_offset(offset)
+    } else {
+        base
+    };
     tm.format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| ms.to_string())
 }
@@ -1215,11 +1245,11 @@ fn apply_hscroll(s: &str, offset: usize) -> String {
     s.chars().skip(offset).collect()
 }
 
-fn column_raw_text(env: &MessageEnvelope, col: SelectItem) -> String {
+fn column_raw_text(env: &MessageEnvelope, col: SelectItem, app: &AppState) -> String {
     match col {
         SelectItem::Partition => env.partition.to_string(),
         SelectItem::Offset => env.offset.to_string(),
-        SelectItem::Timestamp => fmt_ts(env.timestamp_ms),
+        SelectItem::Timestamp => fmt_ts(env.timestamp_ms, app.timestamps_use_utc),
         SelectItem::Key => env.key.clone(),
         SelectItem::Value => env.value.as_deref().unwrap_or("null").to_string(),
     }
@@ -1339,6 +1369,6 @@ fn selected_cell_for_detail(app: &AppState) -> (String, Option<String>) {
     let col = app.selected_columns[col_idx];
     (
         column_label(&col).to_string(),
-        Some(column_raw_text(env, col)),
+        Some(column_raw_text(env, col, app)),
     )
 }
