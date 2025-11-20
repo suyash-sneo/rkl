@@ -121,6 +121,8 @@ async fn main() -> Result<()> {
             );
             println!("{}", "Starting readers (one per partition)...".yellow());
 
+            let partition_count = partitions.len().max(1);
+
             // Message channel: producers = partition tasks, consumer = merger task
             let (tx, rx) = mpsc::channel::<MessageEnvelope>(args.channel_capacity);
 
@@ -174,6 +176,8 @@ async fn main() -> Result<()> {
                 args.flush_interval_ms,
                 max_messages,
                 order_desc,
+                partition_count,
+                false,
             )
             .await?;
 
@@ -309,6 +313,7 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
         } else {
             topic_md.partitions().iter().map(|p| p.id()).collect()
         };
+        let partition_count = partitions.len().max(1);
 
         let (tx, rx) = mpsc::channel::<MessageEnvelope>(args.channel_capacity);
         let mut joinset = JoinSet::new();
@@ -354,6 +359,8 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
             args.flush_interval_ms,
             max_messages,
             order_desc,
+            partition_count,
+            false,
         )
         .await?;
         while let Some(res) = joinset.join_next().await {

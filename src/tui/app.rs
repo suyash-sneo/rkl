@@ -4,6 +4,9 @@ use crate::query::SelectItem;
 use std::time::Instant;
 use tui_textarea::TextArea;
 
+pub const SPINNER_FRAMES: &[&str] =
+    &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 #[derive(Default)]
 pub struct AppState {
     pub input: String,
@@ -49,6 +52,11 @@ pub struct AppState {
     pub topics_last_fetched_at: Option<Instant>,
     pub autocomplete_frozen_token: Option<(usize, usize, String)>,
     pub autocomplete_dirty: bool,
+    pub query_in_progress: bool,
+    pub query_limit: Option<usize>,
+    pub query_rows_seen: usize,
+    pub query_started_at: Option<Instant>,
+    pub query_spinner_idx: usize,
 }
 
 impl AppState {
@@ -105,6 +113,11 @@ impl AppState {
             topics_last_fetched_at: None,
             autocomplete_frozen_token: None,
             autocomplete_dirty: false,
+            query_in_progress: false,
+            query_limit: None,
+            query_rows_seen: 0,
+            query_started_at: None,
+            query_spinner_idx: 0,
         }
     }
 
@@ -123,11 +136,23 @@ impl AppState {
         }
         self.rows.append(&mut batch);
     }
+
+    pub fn update_query_progress_rows(&mut self, visible_rows: usize) {
+        if let Some(limit) = self.query_limit {
+            self.query_rows_seen = visible_rows.min(limit);
+        } else {
+            self.query_rows_seen = visible_rows;
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum TuiEvent {
     Batch {
+        run_id: u64,
+        rows: Vec<MessageEnvelope>,
+    },
+    Snapshot {
         run_id: u64,
         rows: Vec<MessageEnvelope>,
     },

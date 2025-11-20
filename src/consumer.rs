@@ -13,6 +13,8 @@ use std::io::Write as _;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
+const QUERY_SCAN_MULTIPLIER: usize = 3;
+
 pub async fn spawn_partition_consumer(
     args: RunArgs,
     partition: i32,
@@ -199,11 +201,16 @@ async fn run_query_partition_consumer(
         .unwrap_or(true);
     let limit_global = query_limit.or(query.limit);
     let window_size = limit_global.map(|n| n as i64).unwrap_or(256).max(1);
+    let per_partition_cap = limit_global.map(|n| n.saturating_mul(QUERY_SCAN_MULTIPLIER).max(n));
+    let mut matched_rows = 0usize;
 
     if order_desc {
         let mut scan_end_exclusive = effective_end_exclusive;
         'outer: loop {
             if scan_end_exclusive <= effective_start {
+                break;
+            }
+            if partition_cap_reached(matched_rows, per_partition_cap) {
                 break;
             }
             let remaining = scan_end_exclusive - effective_start;
@@ -233,6 +240,10 @@ async fn run_query_partition_consumer(
                             if tx.send(env).await.is_err() {
                                 break 'outer;
                             }
+                            matched_rows += 1;
+                            if partition_cap_reached(matched_rows, per_partition_cap) {
+                                break 'outer;
+                            }
                         }
                     }
                     Err(KafkaError::PartitionEOF(_)) => {
@@ -249,6 +260,9 @@ async fn run_query_partition_consumer(
         }
     } else {
         'asc: loop {
+            if partition_cap_reached(matched_rows, per_partition_cap) {
+                break 'asc;
+            }
             match consumer.recv().await {
                 Ok(msg) => {
                     if is_partition_eof(&msg) {
@@ -260,6 +274,10 @@ async fn run_query_partition_consumer(
 
                     if let Some(env) = build_query_envelope(&args, partition, &query, &msg) {
                         if tx.send(env).await.is_err() {
+                            break 'asc;
+                        }
+                        matched_rows += 1;
+                        if partition_cap_reached(matched_rows, per_partition_cap) {
                             break 'asc;
                         }
                     }
@@ -302,6 +320,11 @@ fn build_query_envelope(
         key,
         value: value_print,
     })
+}
+
+#[inline]
+fn partition_cap_reached(count: usize, cap: Option<usize>) -> bool {
+    cap.map(|c| count >= c).unwrap_or(false)
 }
 
 fn decode_key(msg: &BorrowedMessage<'_>) -> String {

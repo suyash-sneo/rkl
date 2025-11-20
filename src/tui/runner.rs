@@ -32,10 +32,12 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 
 use super::app::{
     AppState, AutoCompleteState, EnvEditor, EnvFieldFocus, ResultsMode, Screen, TuiEvent,
+    SPINNER_FRAMES,
 };
 use super::env_store::Environment;
 use super::env_store::config_dir;
 use super::query_bounds::{find_query_range, strip_trailing_semicolon};
+use super::timefmt::fmt_ts;
 use super::ui::{draw, help_content_line_count};
 
 const ENV_COPY_LABEL: &str = "[Copy]";
@@ -115,6 +117,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
             }
         }
 
+        if app.query_in_progress && !SPINNER_FRAMES.is_empty() {
+            app.query_spinner_idx = (app.query_spinner_idx + 1) % SPINNER_FRAMES.len();
+        }
+
         // Draw UI
         terminal.draw(|f| draw(f, &app))?;
 
@@ -125,10 +131,22 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     if Some(run_id) == app.current_run {
                         app.push_rows(std::mem::take(&mut rows));
                         app.clamp_selection();
+                        app.update_query_progress_rows(app.rows.len());
+                    }
+                }
+                TuiEvent::Snapshot { run_id, mut rows } => {
+                    if Some(run_id) == app.current_run {
+                        app.clear_rows();
+                        let len = rows.len();
+                        app.push_rows(std::mem::take(&mut rows));
+                        app.clamp_selection();
+                        app.update_query_progress_rows(len);
                     }
                 }
                 TuiEvent::Done { run_id } => {
                     if Some(run_id) == app.current_run {
+                        app.query_in_progress = false;
+                        app.query_started_at = None;
                         app.status = format!("Run {run_id} complete");
                         if !app.status_buffer.is_empty() {
                             app.status_buffer.push('\n');
@@ -139,6 +157,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
                 }
                 TuiEvent::Error { run_id, message } => {
                     if Some(run_id) == app.current_run {
+                        app.query_in_progress = false;
+                        app.query_started_at = None;
                         app.status = format!("Error: {message}");
                         if !app.status_buffer.is_empty() {
                             app.status_buffer.push('\n');
@@ -296,6 +316,12 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         app.topics_with_partitions.clear();
                                         run_counter += 1;
                                         app.current_run = Some(run_counter);
+                                        let query_limit = ast.limit.or(args.max_messages).or(Some(100));
+                                        app.query_in_progress = true;
+                                        app.query_limit = query_limit;
+                                        app.query_rows_seen = 0;
+                                        app.query_started_at = Some(Instant::now());
+                                        app.query_spinner_idx = 0;
                                         app.last_run_query_range = Some((qs, qe));
                                         let env_host = app
                                             .selected_env()
@@ -327,6 +353,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         app.clear_rows();
                                         app.topics_with_partitions.clear();
                                         app.current_run = None;
+                                        app.query_in_progress = false;
+                                        app.query_started_at = None;
+                                        app.query_rows_seen = 0;
+                                        app.query_limit = None;
                                         app.last_run_query_range = Some((qs, qe));
                                         app.selected_row = 0;
                                         app.json_vscroll = 0;
@@ -368,6 +398,12 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         app.topics_with_partitions.clear();
                                         run_counter += 1;
                                         app.current_run = Some(run_counter);
+                                        let query_limit = ast.limit.or(args.max_messages).or(Some(100));
+                                        app.query_in_progress = true;
+                                        app.query_limit = query_limit;
+                                        app.query_rows_seen = 0;
+                                        app.query_started_at = Some(Instant::now());
+                                        app.query_spinner_idx = 0;
                                         app.last_run_query_range = Some((qs, qe));
                                         let env_host = app
                                             .selected_env()
@@ -399,6 +435,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         app.clear_rows();
                                         app.topics_with_partitions.clear();
                                         app.current_run = None;
+                                        app.query_in_progress = false;
+                                        app.query_started_at = None;
+                                        app.query_rows_seen = 0;
+                                        app.query_limit = None;
                                         app.last_run_query_range = Some((qs, qe));
                                         app.selected_row = 0;
                                         app.json_vscroll = 0;
@@ -1297,14 +1337,16 @@ struct TuiOutput {
     run_id: u64,
     tx: mpsc::UnboundedSender<TuiEvent>,
     buffer: Vec<MessageEnvelope>,
+    snapshot_mode: bool,
 }
 
 impl TuiOutput {
-    fn new(run_id: u64, tx: mpsc::UnboundedSender<TuiEvent>) -> Self {
+    fn new(run_id: u64, tx: mpsc::UnboundedSender<TuiEvent>, snapshot_mode: bool) -> Self {
         Self {
             run_id,
             tx,
             buffer: Vec::with_capacity(256),
+            snapshot_mode,
         }
     }
 }
@@ -1319,10 +1361,18 @@ impl OutputSink for TuiOutput {
         }
         let mut out = Vec::new();
         std::mem::swap(&mut out, &mut self.buffer);
-        let _ = self.tx.send(TuiEvent::Batch {
-            run_id: self.run_id,
-            rows: out,
-        });
+        let evt = if self.snapshot_mode {
+            TuiEvent::Snapshot {
+                run_id: self.run_id,
+                rows: out,
+            }
+        } else {
+            TuiEvent::Batch {
+                run_id: self.run_id,
+                rows: out,
+            }
+        };
+        let _ = self.tx.send(evt);
     }
 }
 
@@ -1400,6 +1450,7 @@ async fn run_pipeline_with_ssl(
         .find(|t| t.name() == topic)
         .ok_or_else(|| anyhow!("Topic not found: {}", topic))?;
     let partitions: Vec<i32> = topic_md.partitions().iter().map(|p| p.id()).collect();
+    let partition_count = partitions.len().max(1);
 
     let (tx_msg, rx_msg) = mpsc::channel::<MessageEnvelope>(args.channel_capacity);
     let offset_spec = OffsetSpec::from_str(&args.offset).unwrap_or(OffsetSpec::Beginning);
@@ -1422,7 +1473,8 @@ async fn run_pipeline_with_ssl(
     }
     drop(tx_msg);
 
-    let mut sink = TuiOutput::new(run_id, tx.clone());
+    let snapshot_mode = max_messages_global.is_some();
+    let mut sink = TuiOutput::new(run_id, tx.clone(), snapshot_mode);
     run_merger(
         rx_msg,
         &mut sink,
@@ -1430,6 +1482,8 @@ async fn run_pipeline_with_ssl(
         args.flush_interval_ms,
         max_messages_global,
         order_desc,
+        partition_count,
+        true,
     )
     .await?;
 
@@ -1548,24 +1602,6 @@ fn copy_to_clipboard(s: &str) -> Result<()> {
     let mut cb = arboard::Clipboard::new().context("open clipboard")?;
     cb.set_text(s.to_string()).context("set clipboard text")?;
     Ok(())
-}
-
-fn fmt_ts(ms: i64, use_utc: bool) -> String {
-    if ms <= 0 {
-        return "0".to_string();
-    }
-    let secs = ms / 1000;
-    let base =
-        time::OffsetDateTime::from_unix_timestamp(secs).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-    let tm = if use_utc {
-        base
-    } else if let Ok(offset) = time::UtcOffset::current_local_offset() {
-        base.to_offset(offset)
-    } else {
-        base
-    };
-    tm.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| ms.to_string())
 }
 
 fn describe_query_plan(ast: &SelectQuery) -> String {

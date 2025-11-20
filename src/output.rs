@@ -1,7 +1,8 @@
 use crate::models::MessageEnvelope;
 use crate::query::SelectItem;
 use comfy_table::{Attribute, Cell, ContentArrangement, Table, presets::UTF8_FULL};
-use time::{OffsetDateTime, format_description::well_known::Iso8601};
+use std::sync::OnceLock;
+use time::{OffsetDateTime, format_description::FormatItem};
 
 /// Generic sink trait used by the merger to emit rows in batches.
 pub trait OutputSink {
@@ -89,16 +90,24 @@ fn fmt_ts(ms: i64) -> String {
     if ms <= 0 {
         return "0".to_string();
     }
-    let secs = ms / 1000;
-    let nanos = ((ms % 1000) * 1_000_000) as i128;
-    if let Ok(dt) =
-        OffsetDateTime::from_unix_timestamp_nanos((secs as i128) * 1_000_000_000 + nanos)
-    {
-        dt.format(&Iso8601::DEFAULT)
-            .unwrap_or_else(|_| ms.to_string())
-    } else {
-        ms.to_string()
+    let nanos = (ms as i128) * 1_000_000;
+    match OffsetDateTime::from_unix_timestamp_nanos(nanos) {
+        Ok(dt) => dt
+            .format(ts_format())
+            .unwrap_or_else(|_| ms.to_string()),
+        Err(_) => ms.to_string(),
     }
+}
+
+fn ts_format() -> &'static [FormatItem<'static>] {
+    static FMT: OnceLock<Vec<FormatItem<'static>>> = OnceLock::new();
+    FMT.get_or_init(|| {
+        time::format_description::parse(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
+        )
+        .expect("valid timestamp format")
+    })
+    .as_slice()
 }
 
 fn hdr(text: &str, _no_color: bool) -> Cell {
@@ -123,4 +132,21 @@ fn make_header(columns: &[SelectItem], no_color: bool) -> Vec<Cell> {
             hdr(label, no_color)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_ts_emits_millis_and_z_suffix() {
+        let ts = fmt_ts(1_700_000_000_789);
+        assert!(ts.contains(".789"), "timestamp missing millis: {}", ts);
+        assert!(ts.ends_with('Z'));
+    }
+
+    #[test]
+    fn fmt_ts_handles_zero() {
+        assert_eq!(fmt_ts(0), "0");
+    }
 }

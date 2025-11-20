@@ -9,8 +9,9 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 
-use super::app::{AppState, EnvFieldFocus, Focus, ResultsMode, Screen};
+use super::app::{AppState, EnvFieldFocus, Focus, ResultsMode, Screen, SPINNER_FRAMES};
 use super::query_bounds::find_query_range;
+use super::timefmt::fmt_ts;
 
 pub(super) const COPY_BTN_LABEL: &str = "[ Copy ]";
 
@@ -302,12 +303,78 @@ fn draw_status_panel(frame: &mut Frame, area: Rect, app: &AppState) {
     let block = Block::default().borders(Borders::ALL).title("Status");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let text = if app.status_buffer.is_empty() {
+    let status_text = if app.status_buffer.is_empty() {
         app.status.clone()
     } else {
         app.status_buffer.clone()
     };
-    let para = Paragraph::new(text.clone())
+    let mut lines: Vec<Line> = if status_text.is_empty() {
+        vec![Line::from("")]
+    } else {
+        status_text
+            .lines()
+            .map(|l| Line::from(l.to_string()))
+            .collect()
+    };
+    if app.query_in_progress {
+        let limit = app
+            .query_limit
+            .unwrap_or_else(|| app.query_rows_seen.max(1))
+            .max(1);
+        let current = app.query_rows_seen.min(limit);
+        let fraction = current as f64 / limit as f64;
+        let available = inner.width.saturating_sub(20) as usize;
+        let bar_width = available.max(10).min(30);
+        let filled = ((fraction * bar_width as f64).round() as usize).min(bar_width);
+        let empty = bar_width.saturating_sub(filled);
+        let filled_txt = "█".repeat(filled);
+        let empty_txt = "░".repeat(empty);
+        let spinner = if SPINNER_FRAMES.is_empty() {
+            "⠋"
+        } else {
+            SPINNER_FRAMES[app.query_spinner_idx % SPINNER_FRAMES.len()]
+        };
+        let elapsed = app
+            .query_started_at
+            .map(|start| start.elapsed().as_secs_f32())
+            .unwrap_or(0.0);
+        let mut spans = Vec::new();
+        spans.push(
+            Span::styled(
+                spinner,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+        spans.push(Span::raw(" Query "));
+        spans.push(Span::styled(
+            format!("{}/{}", current, limit),
+            Style::default().fg(Color::Green),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::raw("["));
+        if !filled_txt.is_empty() {
+            spans.push(Span::styled(
+                filled_txt,
+                Style::default().fg(Color::LightGreen),
+            ));
+        }
+        if !empty_txt.is_empty() {
+            spans.push(Span::styled(
+                empty_txt,
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        spans.push(Span::raw("] "));
+        spans.push(Span::styled(
+            format!("{:.1}s", elapsed),
+            Style::default().fg(Color::Gray),
+        ));
+        lines.push(Line::from(spans));
+    }
+    let total_lines = lines.len().max(1);
+    let para = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
         .scroll((app.status_vscroll, 0));
     frame.render_widget(para, inner);
@@ -334,7 +401,6 @@ fn draw_status_panel(frame: &mut Frame, area: Rect, app: &AppState) {
     }
 
     // Scrollbar
-    let total_lines = text.lines().count().max(1);
     let vis = inner.height as usize;
     if total_lines > vis {
         let mut vs = ScrollbarState::new(total_lines).position(app.status_vscroll as usize);
@@ -1067,24 +1133,6 @@ fn style_cell(mut cell: Cell<'static>, selected: bool) -> Cell<'static> {
         cell = cell.style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
     }
     cell
-}
-
-fn fmt_ts(ms: i64, use_utc: bool) -> String {
-    if ms <= 0 {
-        return "0".to_string();
-    }
-    let secs = ms / 1000;
-    let base =
-        time::OffsetDateTime::from_unix_timestamp(secs).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-    let tm = if use_utc {
-        base
-    } else if let Ok(offset) = time::UtcOffset::current_local_offset() {
-        base.to_offset(offset)
-    } else {
-        base
-    };
-    tm.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| ms.to_string())
 }
 
 #[allow(dead_code)]
