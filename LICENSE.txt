@@ -1,75 +1,184 @@
-Community-Centric Copyleft License (CCCL) v2.0
+Community-Centric Copyleft License (CCCL) v2.0 – Plain Language
 Copyright (c) 2025 Suyash Raj
 
-Preamble
-This license lets individual developers and small teams use, study, modify, and share the software freely, while ensuring that enterprises who gain commercial benefit contribute improvements or funding back to the community. It is a standalone license inspired by the principles of the GNU General Public License version 3 (GPLv3) but tailored to your requirements.
+This is a plain-English license for this project, RKL (pronounced “racle”).
+It tells you what you can do with the software and what is expected in return.
 
-1. Definitions
-Project – the original work distributed under this license.
+By using, copying, modifying, or distributing this software, you agree to these terms.
 
-Derivative Work – any work based on or incorporating the Project, including modifications, translations, adaptations, or works statically or dynamically linked with the Project.
+----------------------------------------------------------------------------
+1. Who this license is for
+----------------------------------------------------------------------------
 
-Distribution – any act of conveying or making available the Project or a Derivative Work to third parties, including through network services.
+This license is friendly to:
+- individual developers and small teams, and
+- fair-minded companies who are willing to give improvements back.
 
-Small Developer – (a) an individual acting personally, or (b) an entity with fewer than 50 total employees worldwide and less than USD $1,000,000 in gross annual revenue.
+It is not for companies who want to turn this into a closed-source product.
 
-Enterprise User – any entity that does not meet the Small Developer definition.
 
-Commercial Deployment – providing the Project or a Derivative Work to third parties in exchange for money, subscription fees, advertising revenue, or other commercial advantage.
+----------------------------------------------------------------------------
+2. Definitions
+----------------------------------------------------------------------------
 
-2. Grant of Rights
-Subject to the conditions below, every recipient receives a perpetual, worldwide, royalty-free license to:
+“Project” – this software, RKL (“racle”), as released under this license.
 
-Use and run the Project.
+“Derivative Work” – anything you build that is based on or includes the Project.
+This includes modifications, forks, additions, or software that links to it in a
+way that reasonably depends on it to work.
 
-Study the Project and access its source code.
+“Distribute” – give the Project or a Derivative Work to anyone else, in any form.
+This includes binaries, containers, SaaS, or providing it as part of a service.
 
-Modify the Project and create Derivative Works.
+“Small Developer” – you are a Small Developer if:
+- you are an individual acting personally, or
+- your company has fewer than 50 employees worldwide and less than
+  USD $1,000,000 in gross annual revenue.
 
-Distribute the Project or Derivative Works under this same license.
+“Enterprise User” – any organization that is not a Small Developer.
 
-3. Copyleft Requirements for All Recipients
-If you distribute or commercially deploy the Project or any Derivative Work:
+“Commercial Deployment” – using the Project or a Derivative Work to provide a
+paid product or service, earn subscription/usage/advertising revenue, or
+otherwise gain a commercial advantage.
 
-You must provide complete corresponding source code under this license to every recipient.
 
-You must preserve existing copyright notices, attributions, and license text.
+----------------------------------------------------------------------------
+3. What you are allowed to do
+----------------------------------------------------------------------------
 
-You must include a prominent notice stating any significant changes you made and the date of those changes.
+You may:
+- use and run the Project for any purpose,
+- study how it works,
+- modify it and create Derivative Works, and
+- distribute the Project or your Derivative Works.
 
-You may not impose additional restrictions on the rights granted by this license.
+These rights are free of charge, worldwide, and last as long as you follow the
+conditions in this license.
 
-4. Additional Permission for Small Developers
-Small Developers receive an extra permission: they may use, modify, and deploy the Project (including Commercial Deployment) without obligations beyond Section 3.
 
-5. Enterprise Contribution Requirement
-An Enterprise User may use, modify, or deploy the Project only if all of the following are satisfied:
+----------------------------------------------------------------------------
+4. Conditions that apply to everyone
+----------------------------------------------------------------------------
 
-(a) Public Source Releases – Publish any modifications, enhancements, or Derivative Works in a publicly accessible repository under this license within 90 days of first internal use or immediately upon any Distribution or Commercial Deployment.
+If you distribute the Project or any Derivative Work (including as a service),
+you must:
 
-(b) Attribution – Every release or deployment must provide clear attribution to the Project (including a link to the original repository) and to the Enterprise User’s public repository containing its modifications.
+1. Provide source code  
+   - Provide the complete corresponding source code for the Project and any
+     Derivative Work you distribute.
+   - The source must be licensed under this same license (CCCL v2.0).
 
-(c) Community Support – For each calendar year with a Commercial Deployment, the Enterprise User must either:
+2. Preserve notices  
+   - Keep existing copyright and attribution notices.
+   - Keep a copy of this license with your distribution.
 
-Contribute at least 40 documented developer-hours (code, documentation, design, or testing) back to the Project, or
+3. State your changes  
+   - Clearly say what you changed and when, in a way that users can see (for
+     example, in a CHANGELOG, README, or about box).
 
-Provide at least USD $5,000 in sponsorship to the Project or a stewarding nonprofit designated by the licensor.
-A written summary of the contributions or sponsorship must be published alongside the source release.
+4. No extra restrictions  
+   - You may not add terms that take away or weaken the rights granted by this
+     license.
 
-6. Prohibition on Closed-Source Commercialization
-No party may commercially deploy the Project or any Derivative Work without simultaneously providing all corresponding source code under this license to every recipient. Bundling the Project inside a proprietary or closed-source product is prohibited.
 
-7. Patent Peace
-If you initiate patent litigation alleging that the Project or a Derivative Work infringes a patent, your rights under this license terminate immediately.
+----------------------------------------------------------------------------
+5. Extra freedom for Small Developers
+----------------------------------------------------------------------------
 
-8. Termination and Cure
-Failure to meet any condition terminates your rights automatically. Rights may be reinstated at the licensor’s discretion after curing all violations and fulfilling overdue obligations (including sponsorships or contribution reports).
+If you are a Small Developer:
 
-9. Disclaimer of Warranty
-THE PROJECT IS PROVIDED “AS IS,” WITHOUT WARRANTY OF ANY KIND. YOU ASSUME ALL RISKS ASSOCIATED WITH ITS USE.
+- You may use, modify, and deploy the Project (including Commercial Deployment)
+  as long as you comply with Section 4 above.
+- You do not have any additional financial or contribution obligations just
+  because you are making money with it.
 
-10. Limitation of Liability
-IN NO EVENT WILL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR DAMAGES OF ANY KIND ARISING FROM OR RELATED TO THIS LICENSE OR THE USE OF THE PROJECT.
 
-11. Severability
-If any provision is held unenforceable, the remaining provisions remain in effect.
+----------------------------------------------------------------------------
+6. Extra duties for Enterprise Users
+----------------------------------------------------------------------------
+
+If you are an Enterprise User and you use, modify, or deploy the Project
+commercially, you must do all of the following:
+
+1. Publish your changes  
+   - If you modify or extend the Project, publish your modifications or
+     Derivative Works in a public source repository under this same license.
+   - Do this within 90 days of first internal use, or immediately when you
+     start distributing or commercially deploying them.
+
+2. Provide attribution  
+   - Clearly credit the Project and link to the original repository.
+   - Also link to your public repository that contains your modifications.
+
+3. Support the community (choose one per calendar year with Commercial Deployment)  
+   Either:
+   - Contribute at least 40 developer hours (code, docs, design, or tests)
+     back to the Project or its ecosystem, and document these contributions, or
+   - Provide at least USD $5,000 in sponsorship to the Project or a nonprofit
+     steward chosen by the licensor, and publish a short summary of this
+     sponsorship alongside your source release.
+
+These obligations are meant to ensure that Enterprise Users who gain commercial
+benefit help sustain the project and its community.
+
+
+----------------------------------------------------------------------------
+7. No closed-source commercialization
+----------------------------------------------------------------------------
+
+You may not:
+- embed the Project or a Derivative Work inside a proprietary or closed-source
+  product in a way that prevents your users from receiving the full source
+  code under this license, or
+- commercially deploy the Project while keeping your modifications private.
+
+If you make money from the Project, your users must receive the source code and
+the same rights you received.
+
+
+----------------------------------------------------------------------------
+8. Patent peace
+----------------------------------------------------------------------------
+
+If you start a patent lawsuit claiming that the Project or a Derivative Work
+infringes a patent, your rights under this license end immediately.
+
+
+----------------------------------------------------------------------------
+9. Termination and cure
+----------------------------------------------------------------------------
+
+If you break any of these terms, your rights under this license automatically
+end.
+
+The licensor may choose to restore your rights if:
+- you stop the violation,
+- you fix any harm caused, and
+- you meet any overdue obligations (including contributions or sponsorships).
+
+
+----------------------------------------------------------------------------
+10. No warranty
+----------------------------------------------------------------------------
+
+THE PROJECT IS PROVIDED “AS IS.”  
+There is no warranty of any kind, express or implied.  
+You use it at your own risk.
+
+
+----------------------------------------------------------------------------
+11. Limitation of liability
+----------------------------------------------------------------------------
+
+To the maximum extent allowed by law, the author(s) and contributors are not
+liable for any damages or losses arising from your use of the Project, this
+license, or any Derivative Work, whether in contract, tort, or otherwise.
+
+
+----------------------------------------------------------------------------
+12. Severability
+----------------------------------------------------------------------------
+
+If a court finds any part of this license invalid or unenforceable, the rest of
+the license stays in effect.
+
