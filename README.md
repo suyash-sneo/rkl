@@ -1,10 +1,10 @@
 # RKL
 
-RKL (pronounced “racle”, like “oracle” with a silent “o”) is a terminal UI for exploring Kafka topics with an SQL-like experience. It pairs a query editor, results table, JSON payload viewer, and environment manager so you can inspect data quickly without writing ad-hoc consumers.
+RKL (pronounced "racle", like "oracle" with a silent "o") is a terminal UI for exploring Kafka topics with an SQL-like experience. It pairs a query editor, results table, JSON payload viewer, and environment manager so you can inspect data quickly without writing ad-hoc consumers.
 
 ![RKL TUI Screenshot](/assets/rkl-screenshot.png?raw=true)
 
-## Features
+## Feature highlights
 
 - SQL-inspired query engine (`SELECT`, `WHERE`, `ORDER BY timestamp|poffset|poffset_ts`, `LIMIT`) with JSON-path filtering via `value->field->subfield`.
 - Real-time results table with horizontal scrolling plus a right-side JSON pane for the focused record.
@@ -13,271 +13,46 @@ RKL (pronounced “racle”, like “oracle” with a silent “o”) is a termi
 - Environment manager for hosts, credentials, and PEM-encoded CA/cert/key material with a built-in connectivity test.
 - Dedicated CLI mode for one-shot queries (`rkl run ...`) when you need to script output or run inside CI.
 
-## Quickstart
+## How to learn RKL
+
+If you're new to RKL, start here and follow these docs in order:
+
+1. **Getting started** – install, uninstall, and a first run
+   - [Getting started & installation](docs/getting-started.md)
+2. **Querying Kafka** – learn the language and timestamp semantics
+   - [Query language](docs/query-language.md)
+   - [High-performance timestamp queries](docs/timestamp-queries.md)
+   - [Commands (e.g. `LIST topics;`)](docs/commands.md)
+3. **Using the TUI** – editor behavior and navigation
+   - [TUI controls (concise key reference)](docs/tui-controls.md)
+   - [Query editor features (history, multi-line editing, parse status, quick re-run)](docs/query-editor.md)
+   - [Autocomplete](docs/autocomplete.md)
+   - [Environments & SSL](docs/environments-and-ssl.md)
+4. **CLI mode** – scripting and non-interactive use
+   - [CLI usage](docs/cli.md)
+5. **Operating the tool** – building, debugging, and tuning
+   - [Build from source](docs/build.md)
+   - [Troubleshooting & performance tips](docs/troubleshooting-and-performance.md)
+6. **Roadmap / ideas**
+   - [Future query UI ideas](docs/future-query-ui-ideas.md)
+
+Each document is self-contained, so you can also jump directly to the section that matches what you're trying to do (for example, "How do I filter by timestamp?" → timestamp queries; "What are the editor shortcuts?" → query editor features).
+
+## Quickstart (5-minute version)
+
+For a fast path:
+
+1. Install RKL using the script in [Getting started](docs/getting-started.md).
+2. Run `rkl` and:
+   - Press `Tab` to focus the Query editor.
+   - Paste a query from [Query language](docs/query-language.md) such as:
+
+     ```sql
+     SELECT key, value FROM random-data LIMIT 5;
+     ```
+
+   - Press `Ctrl-Enter` to run it.
+3. Use the arrow keys to explore the results table, and `F10` to open the built-in help for a full keymap.
+
+From there, use the documentation map above to deepen your understanding.
 
-1. Install the binary with one of the scripts below (no sudo required).
-2. Launch `rkl` to open the Home screen, tab into the Query editor, and press `Ctrl-Enter` to run your `SELECT`.
-3. Switch environments with `F2` or Enter on the host bar, and use `LIST topics;` or the sample queries below to explore data.
-
-Install latest:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | bash
-```
-
-Install a specific version:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | RKL_VERSION=v0.1.0 bash
-```
-
-Custom install location:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/install.sh | RKL_INSTALL_DIR="$HOME/bin" bash
-```
-
-Uninstall (default path `~/.local/bin`):
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/uninstall.sh | bash
-```
-
-Uninstall from a custom location:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/uninstall.sh | RKL_INSTALL_DIR="$HOME/bin" bash
-```
-
-## Query Language
-
-- Syntax: `SELECT columns FROM topic [WHERE expr] [ORDER BY timestamp|poffset|poffset_ts ASC|DESC] [LIMIT n]`.
-- ORDER BY poffset DESC is applied automatically when omitted so queries sample the latest offsets per partition without a global timestamp sort.
-- `ORDER BY poffset` keeps each partition independent, `ORDER BY poffset_ts` uses the same per-partition sampling but globally re-sorts by timestamp.
-- Filter JSON by walking nested fields with `value->meta->service`, `value->response->status`, etc. `key`, raw `value`, and `timestamp` all support comparisons.
-- Operators: `=`, `!=`, `<>`, `CONTAINS`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, and parentheses for grouping. `timestamp` comparisons accept either milliseconds or ISO-8601 strings; values ending in `Z` are treated as UTC while others use your system timezone.
-- End queries with `;` to separate multiple statements; the editor highlights the current query under the cursor.
-
-Examples:
-
-```sql
--- Basic sampling
-SELECT key, value FROM random-data LIMIT 5;
-
--- Simple JSON filter
-SELECT key FROM random-data
-WHERE value->response->msg CONTAINS 'error';
-
--- Multiple JSON predicates
-SELECT key, value FROM random-data
-WHERE value->event->type = 'purchase'
-  AND value->response->status = 200;
-
--- Restrict to an exact UTC day
-SELECT key FROM random-data
-WHERE timestamp >= '2024-01-01T00:00:00Z'
-  AND timestamp <  '2024-01-02T00:00:00Z';
-
--- Complex boolean filter plus explicit DESC and LIMIT
-SELECT key FROM random-data
-WHERE (key = 'a' OR key = 'b')
-  AND value->foo CONTAINS 'x'
-ORDER BY timestamp DESC
-LIMIT 100;
-```
-
-## High-performance timestamp queries
-
-RKL is optimized for topics with millions or billions of messages. The query engine uses partition-parallel consumers plus timestamp-aware seeking so it only reads the smallest possible window of data that can satisfy your query.
-
-### Ordering by timestamp
-
-- `ORDER BY timestamp DESC` means “newest first” with a global timestamp sort across partitions.
-- If you omit `ORDER BY`, RKL uses `ORDER BY poffset DESC` by default, which tails each partition by offset without reordering across partitions.
-- Timestamp-ordered queries seek near the latest offsets in each partition and scan backwards in windows, instead of starting from the beginning of the topic.
-- Results are globally ordered by timestamp across partitions, so it behaves like a database query on a `timestamp` column.
-
-### Offset sampling modes
-
-- `ORDER BY poffset DESC` (the default) samples the tail of each partition independently so you see the most recent offsets from each shard with minimal reordering cost.
-- `ORDER BY poffset ASC` walks forward from the effective start offset in each partition, which is useful for historical replays.
-- `ORDER BY poffset_ts` combines offset-based sampling with a global timestamp sort at the end, so you get deterministic ordering without repeated backward seeks per partition.
-
-Examples:
-
-```sql
--- Latest offsets per partition (implicit ORDER BY poffset DESC)
-SELECT partition, offset, timestamp, key, value
-FROM random-data
-LIMIT 100;
-
--- Same, but explicit
-SELECT key, value
-FROM random-data
-ORDER BY timestamp DESC
-LIMIT 100;
-
--- Oldest 50 messages (ASC order)
-SELECT key, value
-FROM random-data
-ORDER BY timestamp ASC
-LIMIT 50;
-```
-
-### Timestamp filters and performance
-
-When you add a `WHERE timestamp ...` clause, RKL uses Kafka’s timestamp index to seek directly into the relevant time window in each partition. That means:
-
-- Far fewer messages are scanned, even on very large topics.
-- The TUI shows partial results quickly while it fills in the rest.
-- You can use timestamp filters together with other JSON filters and LIMIT.
-
-Supported forms:
-
-- `timestamp >  'YYYY-MM-DDTHH:MM:SS[Z]'`
-- `timestamp >= 'YYYY-MM-DDTHH:MM:SS[Z]'`
-- `timestamp <  'YYYY-MM-DDTHH:MM:SS[Z]'`
-- `timestamp <= 'YYYY-MM-DDTHH:MM:SS[Z]'`
-- Any combination using `AND`, for example: `timestamp >= ... AND timestamp < ...`.
-
-Examples on large topics:
-
-```sql
--- Errors in the last hour, newest first
-SELECT key, value
-FROM prod.events
-WHERE value->response->msg CONTAINS 'error'
-  AND timestamp >= '2024-01-01T12:00:00Z'
-ORDER BY timestamp DESC
-LIMIT 200;
-
--- Traffic from yesterday (full day window)
-SELECT partition, offset, timestamp, key
-FROM access.logs
-WHERE timestamp >= '2024-01-02T00:00:00Z'
-  AND timestamp <  '2024-01-03T00:00:00Z'
-ORDER BY timestamp DESC
-LIMIT 500;
-
--- Oldest events from a specific maintenance window
-SELECT key, value
-FROM maintenance.events
-WHERE timestamp >= '2024-01-05T22:00:00Z'
-  AND timestamp <  '2024-01-06T02:00:00Z'
-ORDER BY timestamp ASC
-LIMIT 100;
-
--- Drill into a narrow 5-minute interval
-SELECT key, value
-FROM random-data
-WHERE timestamp >= '2024-01-10T14:30:00Z'
-  AND timestamp <  '2024-01-10T14:35:00Z'
-  AND value->event->type = 'purchase'
-ORDER BY timestamp DESC;
-```
-
-Behind the scenes, RKL uses the timestamp bounds to derive an effective earliest and latest offset per partition and only scans that window, which keeps queries fast even when the topic contains billions of messages.
-
-### Local time vs UTC
-
-Timestamp comparisons accept either raw millisecond values or ISO-8601 timestamps:
-
-- Values ending with `Z` are treated as UTC, for example:
-  - `timestamp >= '2024-01-01T00:00:00Z'`
-  - `timestamp <  '2024-01-02T00:00:00Z'`
-- Values without `Z` are interpreted in your **system timezone** and converted to UTC internally, for example:
-  - `timestamp >= '2024-01-01T09:00:00'` (local 9 AM)
-  - `timestamp <  '2024-01-01T18:00:00'` (local 6 PM)
-
-This lets you write queries using either UTC (for reproducible, environment-independent queries) or your local time (for quick, ad-hoc debugging) without doing manual timezone math.
-
-For realistic payloads to experiment with, see `local-test/README.md`.
-
-## Commands (LIST topics)
-
-`LIST topics;` runs against the currently selected environment and switches the results view into topic-list mode. Use the arrow keys or mouse wheel to inspect partitions, `F5` to copy the selected value, and `Tab` to return to the query editor for the next command.
-
-## Autocomplete
-
-- Trigger: type `FROM ` inside a valid `SELECT` statement.
-- Suggestions are fuzzy-matched against the cached topic list; refresh the list from the Info screen with `F6`.
-- Right arrow accepts the highlighted topic, `Ctrl-N`/`Ctrl-P` move through the list, and `Esc` dismisses the popup.
-
-## TUI controls (concise)
-
-- `Tab` cycles focus between Host bar, Query editor, and Results. The footer displays context-aware hints for each focus.
-- `Ctrl-Enter` runs the current `SELECT`. Plain `Enter` inserts a newline.
-- `Right` accepts autocomplete suggestions, while `Ctrl-N`/`Ctrl-P` navigate within them.
-- `Shift-Left/Right` horizontally scrolls the results table; `F5` copies the value column and `F7` copies the status panel.
-- `F2` opens the Environments screen, `F8` jumps Home, `F12` opens the Info screen, and `F10` toggles the full help dialog.
-- `Ctrl-Q`/`Ctrl-C` exits at any time.
-
-## Query editor features
-
-- **Per-session & persistent history**: Press `Ctrl-R` in the editor to open the Query History popup, scroll with Up/Down, hit `Enter` to load a query, or `Esc` to cancel. History is saved under `~/.rkl/envs/query-history.txt` so your commands survive restarts.
-- **Better multi-line editing**: `Home`/`End` jump within the current line, `Ctrl-Home`/`Ctrl-End` jump to the start or end of the buffer, and the footer shows `Ln X, Col Y` while you edit. These bindings play nicely with macOS terminals.
-- **Inline parse status**: As you type, the footer shows `Parse: OK` for valid statements or a concise `Parse error: ...` message so you can fix issues before running them.
-- **Quick re-run**: Use `Ctrl-Shift-Enter` (or `Ctrl-Shift-R`) to re-run the last successfully executed `SELECT` without touching the editor—handy when you just tweaked environments or want to repeat the same query.
-
-## Environments & SSL
-
-- Press `F2` or hit `Enter` on the Host bar to open the Environments manager. The left list stores named hosts; the right pane contains fields for broker URL plus optional PEM fields for private key, certificate, and CA.
-- Create (`F1`), edit (`F2`), delete (`F3`), and save (`F4`) environments. Use `F5` to test connectivity with the currently edited credentials before returning to the Home screen.
-- Fields accept pasted PEM blobs, and `F9` toggles mouse-selection mode for easier copying.
-- For end-to-end TLS experiments (including mTLS), try the docker-compose scenario documented in `local-test/README.md`.
-
-## CLI usage
-
-RKL ships with a one-shot CLI that shares the same query parser as the TUI. Either run `rkl run --help` directly or set `RKL_MODE=cli` to make the CLI the default mode.
-
-```sh
-# Run a SELECT and print a table once
-RKL_MODE=cli rkl run --broker localhost:9092 --query "SELECT key, value FROM random-data LIMIT 20;"
-
-# Use --topic/--search when you just need a key/value grep
-rkl run --broker localhost:9092 --topic random-data --search error --max-messages 50
-```
-
-CLI flags mirror the environment fields (including `--ssl-ca-pem`, `--ssl-certificate-pem`, and `--ssl-key-pem`) so you can reuse the same credentials outside of the TUI.
-
-## Future query UI ideas
-
-- Named or saved queries with a browser so you can keep a favorites list ready to run.
-- Query templates/snippets that expand into time-bounded WHERE clauses or other common patterns.
-- Multiple editor buffers or “tabs” (think `Alt-1/2/3`) to juggle several in-flight statements.
-- External editor integration (`$EDITOR`) to pop open a full GUI/IDE editor and return the contents to RKL.
-- Per-topic and per-environment recent query lists to resurface context-specific work.
-
-## Build
-
-- `cargo build --release` produces the optimized binary in `target/release/rkl`.
-- `cargo test` and `cargo clippy` keep the parser and helper crates healthy.
-- `cargo run --bin rkl` launches the binary from source; set `RKL_MODE` as needed for TUI vs CLI.
-
-## Troubleshooting
-
-- **SSL or SASL handshake errors**: confirm the CA, certificate, and private key PEMs belong to the selected broker; use `F5 Test` inside the Environments screen to validate before running queries.
-- **Metadata timeouts or empty topic lists**: verify the broker address, firewall rules, and authentication; run `LIST topics;` after pressing `F6` (Info screen) to refresh metadata.
-- **Queries returning no rows**: remove `LIMIT`, double-check `WHERE` clauses (case-sensitive `CONTAINS`), and ensure the timestamp ordering matches your expectation.
-- **CLI output wrapping oddly**: tweak `--max-cell-width` or supply `--no-color` when piping into other tools.
-
-### Performance tips
-
-- Think of `timestamp` as an indexed column in a SQL database:
-  - Adding `WHERE timestamp >= ... AND timestamp < ...` is analogous to using an index on a `TIMESTAMP` column, and lets RKL seek directly into the desired time range instead of scanning the whole topic.
-  - Adding `ORDER BY timestamp DESC LIMIT n` is similar to “give me the last N rows ordered by time” on an indexed table.
-- On very large topics, always narrow your queries by time whenever you can:
-  - Combine JSON filters with a time window, for example:
-    ```sql
-    SELECT key, value
-    FROM prod.events
-    WHERE value->response->status = 500
-      AND timestamp >= '2024-01-10T00:00:00Z'
-      AND timestamp <  '2024-01-11T00:00:00Z'
-    ORDER BY timestamp DESC
-    LIMIT 500;
-    ```
-  - This pattern behaves much like querying a relational table with `WHERE timestamp BETWEEN ... AND ...` on a timestamp index: RKL only touches the offsets that fall inside that window.
-- If you just need “what’s happening now”, prefer:
-  - `SELECT ... FROM topic ORDER BY timestamp DESC LIMIT n;`
-  - This uses the optimized backward windowing from the end of the log and avoids scanning from the beginning.
