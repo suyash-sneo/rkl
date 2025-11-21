@@ -212,6 +212,13 @@ For realistic payloads to experiment with, see `local-test/README.md`.
 - `F2` opens the Environments screen, `F8` jumps Home, `F12` opens the Info screen, and `F10` toggles the full help dialog.
 - `Ctrl-Q`/`Ctrl-C` exits at any time.
 
+## Query editor features
+
+- **Per-session & persistent history**: Press `Ctrl-R` in the editor to open the Query History popup, scroll with Up/Down, hit `Enter` to load a query, or `Esc` to cancel. History is saved under `~/.rkl/envs/query-history.txt` so your commands survive restarts.
+- **Better multi-line editing**: `Home`/`End` jump within the current line, `Ctrl-Home`/`Ctrl-End` jump to the start or end of the buffer, and the footer shows `Ln X, Col Y` while you edit. These bindings play nicely with macOS terminals.
+- **Inline parse status**: As you type, the footer shows `Parse: OK` for valid statements or a concise `Parse error: ...` message so you can fix issues before running them.
+- **Quick re-run**: Use `Ctrl-Shift-Enter` (or `Ctrl-Shift-R`) to re-run the last successfully executed `SELECT` without touching the editor—handy when you just tweaked environments or want to repeat the same query.
+
 ## Environments & SSL
 
 - Press `F2` or hit `Enter` on the Host bar to open the Environments manager. The left list stores named hosts; the right pane contains fields for broker URL plus optional PEM fields for private key, certificate, and CA.
@@ -232,6 +239,14 @@ rkl run --broker localhost:9092 --topic random-data --search error --max-message
 ```
 
 CLI flags mirror the environment fields (including `--ssl-ca-pem`, `--ssl-certificate-pem`, and `--ssl-key-pem`) so you can reuse the same credentials outside of the TUI.
+
+## Future query UI ideas
+
+- Named or saved queries with a browser so you can keep a favorites list ready to run.
+- Query templates/snippets that expand into time-bounded WHERE clauses or other common patterns.
+- Multiple editor buffers or “tabs” (think `Alt-1/2/3`) to juggle several in-flight statements.
+- External editor integration (`$EDITOR`) to pop open a full GUI/IDE editor and return the contents to RKL.
+- Per-topic and per-environment recent query lists to resurface context-specific work.
 
 ## Build
 

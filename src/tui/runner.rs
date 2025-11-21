@@ -89,6 +89,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
 
     let (tx_evt, mut rx_evt) = mpsc::unbounded_channel::<TuiEvent>();
     let mut app = AppState::new(args.query.clone().unwrap_or_default(), args.broker.clone());
+    update_parse_status(&mut app);
 
     let mut run_counter: u64 = 0;
 
@@ -119,8 +120,13 @@ pub async fn run(args: RunArgs) -> Result<()> {
             }
         }
 
-        if app.query_in_progress && !SPINNER_FRAMES.is_empty() {
+        if app.query_in_progress {
             app.query_spinner_idx = (app.query_spinner_idx + 1) % SPINNER_FRAMES.len();
+        }
+
+        if app.parse_status_dirty {
+            update_parse_status(&mut app);
+            app.parse_status_dirty = false;
         }
 
         // Draw UI
@@ -221,6 +227,11 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     let KeyEvent {
                         code, modifiers, ..
                     } = key;
+                    if (matches!(code, KeyCode::Char('c') | KeyCode::Char('q'))
+                        && modifiers.contains(KeyModifiers::CONTROL))
+                    {
+                        break Ok(());
+                    }
                     if app.show_help {
                         match code {
                             KeyCode::Esc | KeyCode::F(10) => {
@@ -236,9 +247,11 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         }
                         continue;
                     }
+                    if app.show_history_popup {
+                        handle_history_popup_key(&mut app, code, modifiers);
+                        continue;
+                    }
                     match (code, modifiers) {
-                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
-                        (KeyCode::Char('q'), KeyModifiers::CONTROL) => break Ok(()),
                         (KeyCode::F(10), _) => {
                             if app.show_help {
                                 app.show_help = false;
@@ -249,9 +262,11 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         }
                         (KeyCode::F(8), _) => {
                             app.screen = Screen::Home;
+                            app.show_history_popup = false;
                         }
                         (KeyCode::F(2), _) => {
                             app.screen = Screen::Envs;
+                            app.show_history_popup = false;
                             app.autocomplete = None;
                             if app.env_editor.is_none() {
                                 if let Some(i) = app.env_store.selected {
@@ -264,6 +279,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         }
                         (KeyCode::F(12), _) => {
                             app.screen = Screen::Info;
+                            app.show_history_popup = false;
                             app.autocomplete = None;
                             app.topics_last_fetched_at = Some(Instant::now());
                             fetch_topics_async(&app, tx_evt.clone());
@@ -290,6 +306,34 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 }
                             }
                         }
+                        (KeyCode::Char('r'), m)
+                            if m.contains(KeyModifiers::CONTROL)
+                                && m.contains(KeyModifiers::SHIFT) =>
+                        {
+                            if matches!(app.screen, Screen::Home)
+                                && !app.show_env_modal
+                                && matches!(app.focus, super::app::Focus::Query)
+                            {
+                                rerun_last_query(&mut app, &args, &tx_evt, &mut run_counter).await;
+                            }
+                        }
+                        (KeyCode::Char('r'), m)
+                            if m.contains(KeyModifiers::CONTROL)
+                                && !m.contains(KeyModifiers::SHIFT) =>
+                        {
+                            if matches!(app.screen, Screen::Home)
+                                && !app.show_env_modal
+                                && matches!(app.focus, super::app::Focus::Query)
+                            {
+                                if app.query_history.is_empty() {
+                                    push_status_line(&mut app, "No query history yet".to_string());
+                                } else {
+                                    app.show_history_popup = true;
+                                    app.history_selected_index =
+                                        app.query_history.len().saturating_sub(1);
+                                }
+                            }
+                        }
                         // Some macOS terminals send Ctrl-Enter as Ctrl-J (LF) or Ctrl-M (CR)
                         // Ctrl-Enter (and common terminal fallbacks) → run
                         (KeyCode::Char('j'), m) | (KeyCode::Char('m'), m)
@@ -299,86 +343,17 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 && !app.show_env_modal
                                 && matches!(app.focus, super::app::Focus::Query)
                             {
-                                let (qs, qe) = find_query_range(&app.input, app.input_cursor);
-                                let raw = &app.input[qs..qe];
-                                let query = strip_trailing_semicolon(raw).trim().to_string();
-                                if query.is_empty() {
-                                    push_status_line(&mut app, "Please enter a query".to_string());
-                                    continue;
-                                }
-                                match parse_command(&query) {
-                                    Ok(Command::Select(ast)) => {
-                                        let columns = ast.select.clone();
-                                        app.results_mode = ResultsMode::Messages;
-                                        app.autocomplete = None;
-                                        app.autocomplete_frozen_token = None;
-                                        app.selected_columns = columns;
-                                        app.table_hscroll = 0;
-                                        app.clear_rows();
-                                        app.topics_with_partitions.clear();
-                                        run_counter += 1;
-                                        app.current_run = Some(run_counter);
-                                        let query_limit = ast.limit.or(args.max_messages);
-                                        app.query_in_progress = true;
-                                        app.query_limit = query_limit;
-                                        app.query_rows_seen = 0;
-                                        app.query_started_at = Some(Instant::now());
-                                        app.query_spinner_idx = 0;
-                                        app.last_run_query_range = Some((qs, qe));
-                                        let env_host = app
-                                            .selected_env()
-                                            .map(|e| e.host.clone())
-                                            .unwrap_or(app.host.clone());
-                                        let plan_desc = describe_query_plan(&ast);
-                                        push_status_line(
-                                            &mut app,
-                                            format!(
-                                                "Running (run {}): topic '{}' on {} | {}. Press q to quit.",
-                                                run_counter, ast.from, env_host, plan_desc
-                                            ),
-                                        );
-                                        let mut run_args = args.clone();
-                                        run_args.broker = env_host;
-                                        app.clamp_selection();
-                                        let ssl = app.current_ssl_config();
-                                        spawn_pipeline_with_ssl(
-                                            run_args,
-                                            query,
-                                            run_counter,
-                                            tx_evt.clone(),
-                                            ssl,
-                                        )
+                                if m.contains(KeyModifiers::SHIFT) {
+                                    rerun_last_query(&mut app, &args, &tx_evt, &mut run_counter)
                                         .await;
-                                    }
-                                    Ok(Command::ListTopics) => {
-                                        app.results_mode = ResultsMode::TopicList;
-                                        app.autocomplete = None;
-                                        app.autocomplete_frozen_token = None;
-                                        app.table_hscroll = 0;
-                                        app.clear_rows();
-                                        app.topics_with_partitions.clear();
-                                        app.current_run = None;
-                                        app.query_in_progress = false;
-                                        app.query_started_at = None;
-                                        app.query_rows_seen = 0;
-                                        app.query_limit = None;
-                                        app.last_run_query_range = Some((qs, qe));
-                                        app.selected_row = 0;
-                                        app.json_vscroll = 0;
-                                        let env_host = app
-                                            .selected_env()
-                                            .map(|e| e.host.clone())
-                                            .unwrap_or(app.host.clone());
-                                        push_status_line(
-                                            &mut app,
-                                            format!("Listing topics from {}...", env_host),
-                                        );
-                                        fetch_topics_with_partitions_async(&app, tx_evt.clone());
-                                        app.clamp_selection();
-                                    }
-                                    Err(e) => {
-                                        handle_syntax_error(&mut app, &e);
-                                    }
+                                } else {
+                                    run_query_from_editor(
+                                        &mut app,
+                                        &args,
+                                        &tx_evt,
+                                        &mut run_counter,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -387,86 +362,17 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 && !app.show_env_modal
                                 && matches!(app.focus, super::app::Focus::Query)
                             {
-                                let (qs, qe) = find_query_range(&app.input, app.input_cursor);
-                                let raw = &app.input[qs..qe];
-                                let query = strip_trailing_semicolon(raw).trim().to_string();
-                                if query.is_empty() {
-                                    push_status_line(&mut app, "Please enter a query".to_string());
-                                    continue;
-                                }
-                                match parse_command(&query) {
-                                    Ok(Command::Select(ast)) => {
-                                        let columns = ast.select.clone();
-                                        app.results_mode = ResultsMode::Messages;
-                                        app.autocomplete = None;
-                                        app.autocomplete_frozen_token = None;
-                                        app.selected_columns = columns;
-                                        app.table_hscroll = 0;
-                                        app.clear_rows();
-                                        app.topics_with_partitions.clear();
-                                        run_counter += 1;
-                                        app.current_run = Some(run_counter);
-                                        let query_limit = ast.limit.or(args.max_messages);
-                                        app.query_in_progress = true;
-                                        app.query_limit = query_limit;
-                                        app.query_rows_seen = 0;
-                                        app.query_started_at = Some(Instant::now());
-                                        app.query_spinner_idx = 0;
-                                        app.last_run_query_range = Some((qs, qe));
-                                        let env_host = app
-                                            .selected_env()
-                                            .map(|e| e.host.clone())
-                                            .unwrap_or(app.host.clone());
-                                        let plan_desc = describe_query_plan(&ast);
-                                        push_status_line(
-                                            &mut app,
-                                            format!(
-                                                "Running (run {}): topic '{}' on {} | {}. Press q to quit.",
-                                                run_counter, ast.from, env_host, plan_desc
-                                            ),
-                                        );
-                                        let mut run_args = args.clone();
-                                        run_args.broker = env_host;
-                                        app.clamp_selection();
-                                        let ssl = app.current_ssl_config();
-                                        spawn_pipeline_with_ssl(
-                                            run_args,
-                                            query,
-                                            run_counter,
-                                            tx_evt.clone(),
-                                            ssl,
-                                        )
+                                if m.contains(KeyModifiers::SHIFT) {
+                                    rerun_last_query(&mut app, &args, &tx_evt, &mut run_counter)
                                         .await;
-                                    }
-                                    Ok(Command::ListTopics) => {
-                                        app.results_mode = ResultsMode::TopicList;
-                                        app.autocomplete = None;
-                                        app.autocomplete_frozen_token = None;
-                                        app.table_hscroll = 0;
-                                        app.clear_rows();
-                                        app.topics_with_partitions.clear();
-                                        app.current_run = None;
-                                        app.query_in_progress = false;
-                                        app.query_started_at = None;
-                                        app.query_rows_seen = 0;
-                                        app.query_limit = None;
-                                        app.last_run_query_range = Some((qs, qe));
-                                        app.selected_row = 0;
-                                        app.json_vscroll = 0;
-                                        let env_host = app
-                                            .selected_env()
-                                            .map(|e| e.host.clone())
-                                            .unwrap_or(app.host.clone());
-                                        push_status_line(
-                                            &mut app,
-                                            format!("Listing topics from {}...", env_host),
-                                        );
-                                        fetch_topics_with_partitions_async(&app, tx_evt.clone());
-                                        app.clamp_selection();
-                                    }
-                                    Err(e) => {
-                                        handle_syntax_error(&mut app, &e);
-                                    }
+                                } else {
+                                    run_query_from_editor(
+                                        &mut app,
+                                        &args,
+                                        &tx_evt,
+                                        &mut run_counter,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -516,6 +422,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 app.input.insert(app.input_cursor, '\n');
                                 app.input_cursor += 1;
                                 ensure_input_cursor_visible(&mut app);
+                                app.parse_status_dirty = true;
                                 app.autocomplete = None;
                                 app.autocomplete_dirty = false;
                             } else {
@@ -580,8 +487,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 super::app::Focus::Query => {
                                     let mut dirty = false;
                                     if has_ctrl_or_alt(m) {
-                                        delete_prev_word(&mut app);
-                                        dirty = true;
+                                        if delete_prev_word(&mut app) {
+                                            dirty = true;
+                                        }
                                     } else if app.input_cursor > 0 {
                                         if let Some(prev_char) =
                                             app.input[..app.input_cursor].chars().next_back()
@@ -591,6 +499,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         app.input.remove(app.input_cursor - 1);
                                         app.input_cursor -= 1;
                                         ensure_input_cursor_visible(&mut app);
+                                        app.parse_status_dirty = true;
                                     }
                                     if dirty {
                                         app.autocomplete_dirty = true;
@@ -635,8 +544,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 let mut dirty = false;
                                 if has_ctrl_or_alt(m) {
-                                    delete_next_word(&mut app);
-                                    dirty = true;
+                                    if delete_next_word(&mut app) {
+                                        dirty = true;
+                                    }
                                 } else if app.input_cursor < app.input.len() {
                                     if let Some(next_char) =
                                         app.input[app.input_cursor..].chars().next()
@@ -645,6 +555,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                     }
                                     app.input.remove(app.input_cursor);
                                     ensure_input_cursor_visible(&mut app);
+                                    app.parse_status_dirty = true;
                                 }
                                 if dirty {
                                     app.autocomplete_dirty = true;
@@ -1053,6 +964,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                     app.input.insert(app.input_cursor, ch);
                                     app.input_cursor += 1;
                                     ensure_input_cursor_visible(&mut app);
+                                    app.parse_status_dirty = true;
                                     if !ch.is_whitespace() {
                                         app.autocomplete_dirty = true;
                                         maybe_update_autocomplete(&mut app, &tx_evt, false);
@@ -1075,6 +987,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 app.input.clear();
                                 app.input_cursor = 0;
                                 ensure_input_cursor_visible(&mut app);
+                                app.parse_status_dirty = true;
                                 app.autocomplete = None;
                                 app.autocomplete_dirty = false;
                                 app.autocomplete_frozen_token = None;
@@ -1202,6 +1115,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 } else if app.input_cursor > 0 {
                                     app.input_cursor -= 1;
                                     ensure_input_cursor_visible(&mut app);
+                                    app.parse_status_dirty = true;
                                 }
                             }
                         }
@@ -1249,6 +1163,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 } else if app.input_cursor < app.input.len() {
                                     app.input_cursor += 1;
                                     ensure_input_cursor_visible(&mut app);
+                                    app.parse_status_dirty = true;
                                 }
                             }
                         }
@@ -1345,6 +1260,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             app.input_cursor += 1;
                         }
                         ensure_input_cursor_visible(&mut app);
+                        if !s.is_empty() {
+                            app.parse_status_dirty = true;
+                        }
                         if inserted_non_ws {
                             app.autocomplete_dirty = true;
                             maybe_update_autocomplete(&mut app, &tx_evt, false);
@@ -1369,6 +1287,122 @@ pub async fn run(args: RunArgs) -> Result<()> {
     .ok();
 
     res
+}
+
+async fn run_query_from_editor(
+    app: &mut AppState,
+    args: &RunArgs,
+    tx_evt: &mpsc::UnboundedSender<TuiEvent>,
+    run_counter: &mut u64,
+) {
+    let (qs, qe) = find_query_range(&app.input, app.input_cursor);
+    let raw = &app.input[qs..qe];
+    let query = strip_trailing_semicolon(raw).trim().to_string();
+    if query.is_empty() {
+        push_status_line(app, "Please enter a query".to_string());
+        return;
+    }
+    dispatch_query(app, args, tx_evt, run_counter, query, Some((qs, qe)), false).await;
+}
+
+async fn rerun_last_query(
+    app: &mut AppState,
+    args: &RunArgs,
+    tx_evt: &mpsc::UnboundedSender<TuiEvent>,
+    run_counter: &mut u64,
+) {
+    if let Some(query) = app.last_executed_query.clone() {
+        dispatch_query(app, args, tx_evt, run_counter, query, None, true).await;
+    } else {
+        push_status_line(app, "No previous query to re-run".to_string());
+    }
+}
+
+async fn dispatch_query(
+    app: &mut AppState,
+    args: &RunArgs,
+    tx_evt: &mpsc::UnboundedSender<TuiEvent>,
+    run_counter: &mut u64,
+    query: String,
+    range_hint: Option<(usize, usize)>,
+    is_rerun: bool,
+) {
+    match parse_command(&query) {
+        Ok(Command::Select(ast)) => {
+            let columns = ast.select.clone();
+            app.results_mode = ResultsMode::Messages;
+            app.autocomplete = None;
+            app.autocomplete_frozen_token = None;
+            app.selected_columns = columns;
+            app.table_hscroll = 0;
+            app.clear_rows();
+            app.topics_with_partitions.clear();
+            *run_counter += 1;
+            app.current_run = Some(*run_counter);
+            let query_limit = ast.limit.or(args.max_messages);
+            app.query_in_progress = true;
+            app.query_limit = query_limit;
+            app.query_rows_seen = 0;
+            app.query_started_at = Some(Instant::now());
+            app.query_spinner_idx = 0;
+            if let Some(range) = range_hint {
+                app.last_run_query_range = Some(range);
+            }
+            let env_host = app
+                .selected_env()
+                .map(|e| e.host.clone())
+                .unwrap_or(app.host.clone());
+            let plan_desc = describe_query_plan(&ast);
+            let prefix = if is_rerun {
+                "Re-running last query"
+            } else {
+                "Running"
+            };
+            push_status_line(
+                app,
+                format!(
+                    "{} (run {}): topic '{}' on {} | {}. Press q to quit.",
+                    prefix, *run_counter, ast.from, env_host, plan_desc
+                ),
+            );
+            let mut run_args = args.clone();
+            run_args.broker = env_host;
+            app.clamp_selection();
+            let ssl = app.current_ssl_config();
+            spawn_pipeline_with_ssl(run_args, query.clone(), *run_counter, tx_evt.clone(), ssl)
+                .await;
+            app.record_query_history(&query);
+            app.last_executed_query = Some(query);
+        }
+        Ok(Command::ListTopics) => {
+            app.results_mode = ResultsMode::TopicList;
+            app.autocomplete = None;
+            app.autocomplete_frozen_token = None;
+            app.table_hscroll = 0;
+            app.clear_rows();
+            app.topics_with_partitions.clear();
+            app.current_run = None;
+            app.query_in_progress = false;
+            app.query_started_at = None;
+            app.query_rows_seen = 0;
+            app.query_limit = None;
+            if let Some(range) = range_hint {
+                app.last_run_query_range = Some(range);
+            }
+            app.selected_row = 0;
+            app.json_vscroll = 0;
+            let env_host = app
+                .selected_env()
+                .map(|e| e.host.clone())
+                .unwrap_or(app.host.clone());
+            push_status_line(app, format!("Listing topics from {}...", env_host));
+            fetch_topics_with_partitions_async(app, tx_evt.clone());
+            app.clamp_selection();
+        }
+        Err(e) => {
+            handle_syntax_error(app, &e);
+        }
+    }
 }
 
 struct TuiOutput {
@@ -1902,6 +1936,107 @@ fn sync_env_metadata_from_editor(app: &mut AppState) {
 
 // (Removed unused test_connection)
 
+fn handle_history_popup_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
+    if app.query_history.is_empty() {
+        app.show_history_popup = false;
+        return;
+    }
+    let len = app.query_history.len();
+    if app.history_selected_index >= len {
+        app.history_selected_index = len.saturating_sub(1);
+    }
+    match code {
+        KeyCode::Up => {
+            if app.history_selected_index > 0 {
+                app.history_selected_index -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.history_selected_index + 1 < len {
+                app.history_selected_index += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            let step = 5.min(len);
+            app.history_selected_index = app.history_selected_index.saturating_sub(step);
+        }
+        KeyCode::PageDown => {
+            if len > 0 {
+                let step = 5.min(len);
+                let max_idx = len.saturating_sub(1);
+                let next = app.history_selected_index.saturating_add(step);
+                app.history_selected_index = next.min(max_idx);
+            }
+        }
+        KeyCode::Enter => {
+            load_history_entry_into_editor(app);
+        }
+        KeyCode::Esc => {
+            app.show_history_popup = false;
+        }
+        KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.show_history_popup = false;
+        }
+        _ => {}
+    }
+}
+
+fn load_history_entry_into_editor(app: &mut AppState) {
+    if app.query_history.is_empty() {
+        app.show_history_popup = false;
+        return;
+    }
+    let idx = app
+        .history_selected_index
+        .min(app.query_history.len().saturating_sub(1));
+    let entry = app.query_history[idx].clone();
+    if let Some(pos) = find_history_query_position(&app.input, &entry) {
+        app.input_cursor = pos;
+    } else {
+        let needs_sep = !app.input.trim_end().is_empty();
+        if needs_sep && !app.input.ends_with('\n') {
+            app.input.push('\n');
+        }
+        if needs_sep {
+            app.input.push('\n');
+        }
+        let insert_pos = app.input.len();
+        app.input.push_str(&entry);
+        app.input_cursor = insert_pos;
+        app.autocomplete = None;
+        app.autocomplete_dirty = false;
+        app.autocomplete_frozen_token = None;
+    }
+    app.show_history_popup = false;
+    app.parse_status_dirty = true;
+    ensure_input_cursor_visible(app);
+}
+
+fn find_history_query_position(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    if let Some(pos) = haystack.find(needle) {
+        return Some(pos);
+    }
+    let trimmed = needle.trim();
+    if trimmed != needle {
+        if let Some(pos) = haystack.find(trimmed) {
+            return Some(pos);
+        }
+    }
+    if let Some(core) = trimmed.strip_suffix(';') {
+        if let Some(pos) = haystack.find(core) {
+            return Some(pos);
+        }
+    }
+    let needle_with_semicolon = format!("{};", needle);
+    if let Some(pos) = haystack.find(&needle_with_semicolon) {
+        return Some(pos);
+    }
+    None
+}
+
 fn handle_mouse(app: &mut AppState, me: MouseEvent) {
     if app.mouse_selection_mode {
         return;
@@ -2018,8 +2153,12 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
                 };
                 let x_rel = mx.saturating_sub(q_content.x) as usize;
                 let col = x_rel.min(line_end.saturating_sub(line_start));
+                let prev_cursor = app.input_cursor;
                 app.input_cursor = line_start + col;
                 ensure_input_cursor_visible(app);
+                if app.input_cursor != prev_cursor {
+                    app.parse_status_dirty = true;
+                }
                 return;
             }
             if point_in(mx, my, table_rect) {
@@ -2896,6 +3035,7 @@ fn compute_line_starts(text: &str) -> Vec<usize> {
 }
 
 fn move_cursor_up(app: &mut AppState) {
+    let prev_cursor = app.input_cursor;
     let (line, col) = line_col(&app.input, app.input_cursor);
     if line == 0 {
         return;
@@ -2904,9 +3044,13 @@ fn move_cursor_up(app: &mut AppState) {
     let prev_len = line_len(&app.input, line - 1);
     app.input_cursor = prev_start + col.min(prev_len);
     ensure_input_cursor_visible(app);
+    if app.input_cursor != prev_cursor {
+        app.parse_status_dirty = true;
+    }
 }
 
 fn move_cursor_down(app: &mut AppState) {
+    let prev_cursor = app.input_cursor;
     let (line, col) = line_col(&app.input, app.input_cursor);
     let total = app.input.split('\n').count();
     if line + 1 >= total {
@@ -2916,59 +3060,92 @@ fn move_cursor_down(app: &mut AppState) {
     let next_len = line_len(&app.input, line + 1);
     app.input_cursor = next_start + col.min(next_len);
     ensure_input_cursor_visible(app);
+    if app.input_cursor != prev_cursor {
+        app.parse_status_dirty = true;
+    }
 }
 
 fn move_cursor_line_home(app: &mut AppState) {
+    let prev_cursor = app.input_cursor;
     let (line, _) = line_col(&app.input, app.input_cursor);
     app.input_cursor = nth_line_start(&app.input, line);
     ensure_input_cursor_visible(app);
+    if app.input_cursor != prev_cursor {
+        app.parse_status_dirty = true;
+    }
 }
 
 fn move_cursor_line_end(app: &mut AppState) {
+    let prev_cursor = app.input_cursor;
     let (line, _) = line_col(&app.input, app.input_cursor);
     let start = nth_line_start(&app.input, line);
     let len = line_len(&app.input, line);
     app.input_cursor = start + len;
     ensure_input_cursor_visible(app);
+    if app.input_cursor != prev_cursor {
+        app.parse_status_dirty = true;
+    }
 }
 
 fn goto_start_of_doc(app: &mut AppState) {
+    if app.input_cursor == 0 {
+        return;
+    }
     app.input_cursor = 0;
     ensure_input_cursor_visible(app);
+    app.parse_status_dirty = true;
 }
 
 fn goto_end_of_doc(app: &mut AppState) {
+    if app.input_cursor == app.input.len() {
+        return;
+    }
     app.input_cursor = app.input.len();
     ensure_input_cursor_visible(app);
+    app.parse_status_dirty = true;
 }
 
 fn move_prev_word(app: &mut AppState) {
+    let prev_cursor = app.input_cursor;
     let target = find_prev_word_boundary(&app.input, app.input_cursor);
     app.input_cursor = target;
     ensure_input_cursor_visible(app);
+    if app.input_cursor != prev_cursor {
+        app.parse_status_dirty = true;
+    }
 }
 
 fn move_next_word(app: &mut AppState) {
+    let prev_cursor = app.input_cursor;
     let target = find_next_word_boundary(&app.input, app.input_cursor);
     app.input_cursor = target;
     ensure_input_cursor_visible(app);
+    if app.input_cursor != prev_cursor {
+        app.parse_status_dirty = true;
+    }
 }
 
-fn delete_prev_word(app: &mut AppState) {
+fn delete_prev_word(app: &mut AppState) -> bool {
     let start = find_prev_word_boundary(&app.input, app.input_cursor);
     if start < app.input_cursor {
         app.input.replace_range(start..app.input_cursor, "");
         app.input_cursor = start;
         ensure_input_cursor_visible(app);
+        app.parse_status_dirty = true;
+        return true;
     }
+    false
 }
 
-fn delete_next_word(app: &mut AppState) {
+fn delete_next_word(app: &mut AppState) -> bool {
     let end = find_next_word_boundary(&app.input, app.input_cursor);
     if end > app.input_cursor {
         app.input.replace_range(app.input_cursor..end, "");
         ensure_input_cursor_visible(app);
+        app.parse_status_dirty = true;
+        return true;
     }
+    false
 }
 
 fn find_prev_word_boundary(text: &str, cursor: usize) -> usize {
@@ -3371,6 +3548,7 @@ fn try_accept_autocomplete(app: &mut AppState) -> bool {
     ensure_input_cursor_visible(app);
     app.autocomplete_frozen_token = Some((start, new_end, choice));
     app.autocomplete = None;
+    app.parse_status_dirty = true;
     true
 }
 
@@ -3401,6 +3579,27 @@ fn freeze_autocomplete_at_cursor(app: &mut AppState) {
         if end <= app.input.len() && start <= end {
             let text = app.input[start..end].to_string();
             app.autocomplete_frozen_token = Some((start, end, text));
+        }
+    }
+}
+
+fn update_parse_status(app: &mut AppState) {
+    let (qs, qe) = find_query_range(&app.input, app.input_cursor);
+    let raw = &app.input[qs..qe];
+    let trimmed = strip_trailing_semicolon(raw).trim();
+    if trimmed.is_empty() {
+        app.parse_ok = true;
+        app.parse_error_msg = None;
+        return;
+    }
+    match parse_command(trimmed) {
+        Ok(_) => {
+            app.parse_ok = true;
+            app.parse_error_msg = None;
+        }
+        Err(e) => {
+            app.parse_ok = false;
+            app.parse_error_msg = Some(format!("{}", e));
         }
     }
 }

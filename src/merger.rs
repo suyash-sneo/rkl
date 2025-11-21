@@ -10,6 +10,7 @@ use tokio::time::{Duration, interval};
 /// When a LIMIT is present we retain up to `limit * partitions` rows to reduce
 /// churn while still bounding memory. The merger always drains the channel to
 /// completion so partition tasks can finish their per-partition scans.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_merger<S: OutputSink + Send>(
     rx: Receiver<MessageEnvelope>,
     out: &mut S,
@@ -154,7 +155,7 @@ async fn run_merger_bounded<S: OutputSink + Send>(
         return Ok(());
     }
 
-    rows.sort_unstable_by(|a, b| cmp_envelopes(a, b));
+    rows.sort_unstable_by(cmp_envelopes);
     if order_desc {
         rows.reverse();
     }
@@ -311,7 +312,7 @@ impl BoundedHeap {
         if rows.is_empty() {
             return rows;
         }
-        rows.sort_unstable_by(|a, b| cmp_envelopes(a, b));
+        rows.sort_unstable_by(cmp_envelopes);
         if order_desc {
             rows.reverse();
         }

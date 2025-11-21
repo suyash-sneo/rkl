@@ -127,9 +127,7 @@ impl SelectQuery {
         let order_desc = matches!(order_dir, OrderDir::Desc);
         let n_global = base_limit.unwrap_or(50 * partitions);
         let per_partition_limit = match order_field {
-            OrderField::Poffset | OrderField::PoffsetTs => {
-                Some((n_global + partitions - 1) / partitions)
-            }
+            OrderField::Poffset | OrderField::PoffsetTs => Some(n_global.div_ceil(partitions)),
             OrderField::Timestamp => Some(n_global),
         };
         let global_sort_by_timestamp =

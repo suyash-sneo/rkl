@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 
 use super::app::{AppState, EnvFieldFocus, Focus, ResultsMode, SPINNER_FRAMES, Screen};
-use super::query_bounds::find_query_range;
+use super::query_bounds::{find_query_range, strip_trailing_semicolon};
 use super::timefmt::fmt_ts;
 
 pub(super) const COPY_BTN_LABEL: &str = "[ Copy ]";
@@ -62,6 +62,10 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
             draw_topics(frame, chunks[1], app);
             draw_footer(frame, chunks[2], app);
         }
+    }
+
+    if app.show_history_popup {
+        draw_history_popup(frame, size, app);
     }
 
     if app.show_help {
@@ -326,16 +330,12 @@ fn draw_status_panel(frame: &mut Frame, area: Rect, app: &AppState) {
         let current = app.query_rows_seen.min(limit);
         let fraction = current as f64 / limit as f64;
         let available = inner.width.saturating_sub(20) as usize;
-        let bar_width = available.max(10).min(30);
+        let bar_width = available.clamp(10, 30);
         let filled = ((fraction * bar_width as f64).round() as usize).min(bar_width);
         let empty = bar_width.saturating_sub(filled);
         let filled_txt = "█".repeat(filled);
         let empty_txt = "░".repeat(empty);
-        let spinner = if SPINNER_FRAMES.is_empty() {
-            "⠋"
-        } else {
-            SPINNER_FRAMES[app.query_spinner_idx % SPINNER_FRAMES.len()]
-        };
+        let spinner = SPINNER_FRAMES[app.query_spinner_idx % SPINNER_FRAMES.len()];
         let elapsed = app
             .query_started_at
             .map(|start| start.elapsed().as_secs_f32())
@@ -415,9 +415,34 @@ fn draw_status_panel(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
-    let legend = footer_legend(app);
+    let mut spans = Vec::new();
+    spans.push(Span::raw(footer_legend(app)));
+    if matches!(app.screen, Screen::Home) && matches!(app.focus, Focus::Query) {
+        let (line_no, col_no) = cursor_line_col(&app.input, app.input_cursor);
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(
+            format!("Ln {}, Col {}", line_no, col_no),
+            Style::default().fg(Color::Gray),
+        ));
+        let (qs, qe) = find_query_range(&app.input, app.input_cursor);
+        let raw = &app.input[qs..qe];
+        let trimmed = strip_trailing_semicolon(raw).trim();
+        if !trimmed.is_empty() {
+            spans.push(Span::raw(" | "));
+            if app.parse_ok {
+                spans.push(Span::styled("Parse: OK", Style::default().fg(Color::Green)));
+            } else if let Some(msg) = &app.parse_error_msg {
+                let available = area.width.saturating_sub(30) as usize;
+                let shortened = truncate_with_ellipsis(msg, available.max(20));
+                spans.push(Span::styled(
+                    format!("Parse error: {}", shortened),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+        }
+    }
     let block = Block::default().borders(Borders::ALL).title("Help");
-    let para = Paragraph::new(legend).block(block);
+    let para = Paragraph::new(Line::from(spans)).block(block);
     frame.render_widget(para, area);
 }
 
@@ -690,6 +715,53 @@ fn line_col_at(text: &str, cursor: usize) -> (usize, usize) {
     (line, col)
 }
 
+fn cursor_line_col(text: &str, cursor: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut col = 1usize;
+    let mut idx = 0usize;
+    for ch in text.chars() {
+        if idx >= cursor {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+        idx += ch.len_utf8();
+    }
+    (line, col)
+}
+
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        if max_chars > 1 {
+            out.pop();
+        }
+        out.push('…');
+    }
+    out
+}
+
+fn history_preview(entry: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let cleaned = entry.replace('\n', " ⏎ ");
+    if cleaned.chars().count() > max_width {
+        let mut truncated: String = cleaned.chars().take(max_width.saturating_sub(1)).collect();
+        truncated.push('…');
+        truncated
+    } else {
+        cleaned
+    }
+}
+
 fn intersects(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
     // [a_start, a_end) intersects [b_start, b_end)
     a_start < b_end && b_start < a_end
@@ -899,6 +971,70 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &AppState) {
         let mut vs = ScrollbarState::new(total_lines).position(scroll);
         let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(vbar, inner, &mut vs);
+    }
+}
+
+fn draw_history_popup(frame: &mut Frame, area: Rect, app: &AppState) {
+    if app.query_history.is_empty() {
+        return;
+    }
+    let popup = centered_rect(60, 60, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Query History (Up/Down, Enter, Esc)")
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let total = app.query_history.len();
+    let display_cap = 15usize.min(total.max(1));
+    let mut start = total.saturating_sub(display_cap);
+    if app.history_selected_index < start {
+        start = app.history_selected_index;
+    } else if app.history_selected_index >= start + display_cap {
+        start = app.history_selected_index + 1 - display_cap;
+    }
+    let items: Vec<ListItem> = app.query_history[start..]
+        .iter()
+        .enumerate()
+        .take(display_cap)
+        .map(|(offset, entry)| {
+            let idx = start + offset;
+            let preview = history_preview(entry, inner.width.saturating_sub(4) as usize);
+            ListItem::new(format!("{:>3}. {}", idx + 1, preview))
+        })
+        .collect();
+
+    let visible_len = items.len().max(1);
+    let list = List::new(if items.is_empty() {
+        vec![ListItem::new("No history yet")]
+    } else {
+        items
+    })
+    .highlight_style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+    );
+    let mut state = ListState::default();
+    if !app.query_history.is_empty() {
+        let rel = app.history_selected_index.saturating_sub(start);
+        state.select(Some(rel.min(visible_len.saturating_sub(1))));
+    }
+    frame.render_stateful_widget(list, inner, &mut state);
+
+    if total > display_cap {
+        let mut vs = ScrollbarState::new(total)
+            .position(app.history_selected_index.min(total.saturating_sub(1)));
+        let bar_area = Rect {
+            x: inner.x + inner.width.saturating_sub(1),
+            y: inner.y,
+            width: 1,
+            height: inner.height,
+        };
+        let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(vbar, bar_area, &mut vs);
     }
 }
 

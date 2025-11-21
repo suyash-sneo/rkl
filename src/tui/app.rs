@@ -1,10 +1,15 @@
-use super::env_store::{EnvStore, Environment};
+use super::env_store::{EnvStore, Environment, config_dir};
 use crate::models::{MessageEnvelope, SslConfig};
 use crate::query::SelectItem;
+use std::fs;
+use std::path::PathBuf;
 use std::time::Instant;
 use tui_textarea::TextArea;
 
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+const QUERY_HISTORY_FILE: &str = "query-history.txt";
+pub const QUERY_HISTORY_LIMIT: usize = 200;
 
 #[derive(Default)]
 pub struct AppState {
@@ -56,6 +61,13 @@ pub struct AppState {
     pub query_rows_seen: usize,
     pub query_started_at: Option<Instant>,
     pub query_spinner_idx: usize,
+    pub query_history: Vec<String>,
+    pub show_history_popup: bool,
+    pub history_selected_index: usize,
+    pub parse_ok: bool,
+    pub parse_error_msg: Option<String>,
+    pub parse_status_dirty: bool,
+    pub last_executed_query: Option<String>,
 }
 
 impl AppState {
@@ -72,6 +84,8 @@ impl AppState {
             env_store.selected = Some(0);
             let _ = env_store.save();
         }
+        let history = load_query_history_from_disk();
+        let history_idx = history.len().saturating_sub(1);
         Self {
             input: initial_input.clone(),
             input_cursor: initial_input.len(),
@@ -117,6 +131,13 @@ impl AppState {
             query_rows_seen: 0,
             query_started_at: None,
             query_spinner_idx: 0,
+            query_history: history,
+            show_history_popup: false,
+            history_selected_index: history_idx,
+            parse_ok: true,
+            parse_error_msg: None,
+            parse_status_dirty: false,
+            last_executed_query: None,
         }
     }
 
@@ -263,6 +284,29 @@ impl AppState {
             "[UTC time]"
         }
     }
+
+    pub fn record_query_history(&mut self, query: &str) {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let entry = normalize_history_entry(query);
+        if self
+            .query_history
+            .last()
+            .map(|q| q == &entry)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.query_history.push(entry);
+        if self.query_history.len() > QUERY_HISTORY_LIMIT {
+            let drop_n = self.query_history.len() - QUERY_HISTORY_LIMIT;
+            self.query_history.drain(0..drop_n);
+        }
+        self.history_selected_index = self.query_history.len().saturating_sub(1);
+        let _ = save_query_history_to_disk(&self.query_history);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -304,4 +348,62 @@ pub enum Screen {
     Home,
     Envs,
     Info,
+}
+
+fn history_file_path() -> PathBuf {
+    config_dir().join(QUERY_HISTORY_FILE)
+}
+
+fn load_query_history_from_disk() -> Vec<String> {
+    let path = history_file_path();
+    if let Ok(raw) = fs::read_to_string(path) {
+        let mut entries: Vec<String> = raw
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(decode_history_entry)
+            .collect();
+        if entries.len() > QUERY_HISTORY_LIMIT {
+            let drop_n = entries.len() - QUERY_HISTORY_LIMIT;
+            entries.drain(0..drop_n);
+        }
+        entries
+            .into_iter()
+            .map(|e| normalize_history_entry(&e))
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn save_query_history_to_disk(entries: &[String]) -> std::io::Result<()> {
+    let path = history_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let serialized = entries
+        .iter()
+        .map(|q| encode_history_entry(q))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(path, serialized)
+}
+
+fn encode_history_entry(entry: &str) -> String {
+    entry.replace('\n', "\\n")
+}
+
+fn decode_history_entry(entry: &str) -> String {
+    entry.replace("\\n", "\n")
+}
+
+fn normalize_history_entry(query: &str) -> String {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.ends_with(';') {
+        trimmed.to_string()
+    } else {
+        format!("{};", trimmed)
+    }
 }
