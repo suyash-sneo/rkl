@@ -43,7 +43,11 @@ Each document is self-contained, so you can also jump directly to the section th
 For a fast path:
 
 1. Install RKL using the script in [Getting started](docs/getting-started.md).
-2. Run `rkl` and:
+2. Configure an environment for your broker:
+   - Easiest: start `rkl`, press `F2` to open the Environments screen, create a new environment, and set `host` to your Kafka `bootstrap.servers` (for example `localhost:9092`). Paste PEMs into the CA/cert/key fields if your broker requires TLS.
+   - Alternative: create a JSON file under `~/.rkl/envs` (for example `~/.rkl/envs/dev.json`) using the schema in [Environments & SSL](docs/environments-and-ssl.md); RKL will load it on startup.
+   - Note: a client certificate and private key PEM are **only** required when your broker enforces mutual TLS (mTLS). For plain TLS, a CA PEM is usually sufficient; for non-TLS clusters you can omit all PEM fields.
+3. Run `rkl` and:
    - Press `Tab` to focus the Query editor.
    - Paste a query from [Query language](docs/query-language.md) such as:
 
@@ -52,7 +56,6 @@ For a fast path:
      ```
 
    - Press `Ctrl-Enter` to run it.
-3. Use the arrow keys to explore the results table, and `F10` to open the built-in help for a full keymap.
+4. Use the arrow keys to explore the results table, and `F10` to open the built-in help for a full keymap.
 
 From there, use the documentation map above to deepen your understanding.
-
