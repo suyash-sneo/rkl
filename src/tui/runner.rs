@@ -19,6 +19,7 @@ use crate::consumer::spawn_partition_consumer;
 use crate::merger::run_merger;
 use crate::models::{MessageEnvelope, OffsetSpec};
 use crate::output::OutputSink;
+use crate::query::parser::ParseError;
 use crate::query::{
     Command, OrderDir, OrderField, SelectItem, SelectQuery, TimestampBounds, parse_command,
     parse_query,
@@ -164,43 +165,25 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     if Some(run_id) == app.current_run {
                         app.query_in_progress = false;
                         app.query_started_at = None;
-                        app.status = format!("Run {run_id} complete");
-                        if !app.status_buffer.is_empty() {
-                            app.status_buffer.push('\n');
-                        }
-                        app.status_buffer
-                            .push_str(&format!("✔ Completed run {}", run_id));
+                        push_status_line(&mut app, format!("✔ Completed run {run_id}"));
                     }
                 }
                 TuiEvent::Error { run_id, message } => {
                     if Some(run_id) == app.current_run {
                         app.query_in_progress = false;
                         app.query_started_at = None;
-                        app.status = format!("Error: {message}");
-                        if !app.status_buffer.is_empty() {
-                            app.status_buffer.push('\n');
-                        }
-                        app.status_buffer
-                            .push_str(&format!("✘ Error (run {}): {}", run_id, message));
+                        push_status_line(&mut app, format!("✘ Error (run {run_id}): {message}"));
                     }
                 }
                 TuiEvent::EnvTestProgress { message } => {
                     app.env_test_in_progress = true;
                     app.env_test_message = Some(message.clone());
-                    if !app.status_buffer.is_empty() {
-                        app.status_buffer.push('\n');
-                    }
-                    app.status_buffer
-                        .push_str(&format!("[env-test] {}", message));
+                    push_status_line(&mut app, format!("[env-test] {}", message));
                 }
                 TuiEvent::EnvTestDone { message } => {
                     app.env_test_in_progress = false;
                     app.env_test_message = Some(message.clone());
-                    if !app.status_buffer.is_empty() {
-                        app.status_buffer.push('\n');
-                    }
-                    app.status_buffer
-                        .push_str(&format!("[env-test] {}", message));
+                    push_status_line(&mut app, format!("[env-test] {}", message));
                 }
                 TuiEvent::Topics(list) => {
                     app.topics = list;
@@ -214,11 +197,13 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     if app.topics_with_partitions.len() == 1
                         && app.topics_with_partitions[0].0.starts_with("Error:")
                     {
-                        app.status = app.topics_with_partitions[0].0.clone();
+                        let msg = app.topics_with_partitions[0].0.clone();
+                        push_status_line(&mut app, msg);
                     } else if app.topics_with_partitions.is_empty() {
-                        app.status = "No topics found".to_string();
+                        push_status_line(&mut app, "No topics found".to_string());
                     } else {
-                        app.status = format!("Found {} topics", app.topics_with_partitions.len());
+                        let count = app.topics_with_partitions.len();
+                        push_status_line(&mut app, format!("Found {} topics", count));
                     }
                     app.clamp_selection();
                 }
@@ -318,7 +303,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 let raw = &app.input[qs..qe];
                                 let query = strip_trailing_semicolon(raw).trim().to_string();
                                 if query.is_empty() {
-                                    app.status = "Please enter a query".to_string();
+                                    push_status_line(&mut app, "Please enter a query".to_string());
                                     continue;
                                 }
                                 match parse_command(&query) {
@@ -345,9 +330,12 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                             .map(|e| e.host.clone())
                                             .unwrap_or(app.host.clone());
                                         let plan_desc = describe_query_plan(&ast);
-                                        app.status = format!(
-                                            "Running (run {}): topic '{}' on {} | {}. Press q to quit.",
-                                            run_counter, ast.from, env_host, plan_desc
+                                        push_status_line(
+                                            &mut app,
+                                            format!(
+                                                "Running (run {}): topic '{}' on {} | {}. Press q to quit.",
+                                                run_counter, ast.from, env_host, plan_desc
+                                            ),
                                         );
                                         let mut run_args = args.clone();
                                         run_args.broker = env_host;
@@ -381,12 +369,15 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                             .selected_env()
                                             .map(|e| e.host.clone())
                                             .unwrap_or(app.host.clone());
-                                        app.status = format!("Listing topics from {}...", env_host);
+                                        push_status_line(
+                                            &mut app,
+                                            format!("Listing topics from {}...", env_host),
+                                        );
                                         fetch_topics_with_partitions_async(&app, tx_evt.clone());
                                         app.clamp_selection();
                                     }
                                     Err(e) => {
-                                        app.status = format!("Parse error: {}", e);
+                                        handle_syntax_error(&mut app, &e);
                                     }
                                 }
                             }
@@ -400,7 +391,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 let raw = &app.input[qs..qe];
                                 let query = strip_trailing_semicolon(raw).trim().to_string();
                                 if query.is_empty() {
-                                    app.status = "Please enter a query".to_string();
+                                    push_status_line(&mut app, "Please enter a query".to_string());
                                     continue;
                                 }
                                 match parse_command(&query) {
@@ -427,9 +418,12 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                             .map(|e| e.host.clone())
                                             .unwrap_or(app.host.clone());
                                         let plan_desc = describe_query_plan(&ast);
-                                        app.status = format!(
-                                            "Running (run {}): topic '{}' on {} | {}. Press q to quit.",
-                                            run_counter, ast.from, env_host, plan_desc
+                                        push_status_line(
+                                            &mut app,
+                                            format!(
+                                                "Running (run {}): topic '{}' on {} | {}. Press q to quit.",
+                                                run_counter, ast.from, env_host, plan_desc
+                                            ),
                                         );
                                         let mut run_args = args.clone();
                                         run_args.broker = env_host;
@@ -463,12 +457,15 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                             .selected_env()
                                             .map(|e| e.host.clone())
                                             .unwrap_or(app.host.clone());
-                                        app.status = format!("Listing topics from {}...", env_host);
+                                        push_status_line(
+                                            &mut app,
+                                            format!("Listing topics from {}...", env_host),
+                                        );
                                         fetch_topics_with_partitions_async(&app, tx_evt.clone());
                                         app.clamp_selection();
                                     }
                                     Err(e) => {
-                                        app.status = format!("Parse error: {}", e);
+                                        handle_syntax_error(&mut app, &e);
                                     }
                                 }
                             }
@@ -703,11 +700,18 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                                 && e.name.eq_ignore_ascii_case(&ed.name)
                                         });
                                     if ed.name.trim().is_empty() {
-                                        app.status = "Environment name cannot be empty".to_string();
+                                        push_status_line(
+                                            &mut app,
+                                            "Environment name cannot be empty".to_string(),
+                                        );
                                         continue;
                                     }
                                     if ed.idx.is_none() && exists_name {
-                                        app.status = "Environment name already exists. Choose a unique name.".to_string();
+                                        push_status_line(
+                                            &mut app,
+                                            "Environment name already exists. Choose a unique name."
+                                                .to_string(),
+                                        );
                                         continue;
                                     }
                                     let new_env = Environment {
@@ -943,8 +947,14 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             } else if matches!(app.focus, super::app::Focus::Results) {
                                 if let Some(s) = selected_cell_text(&app) {
                                     match copy_to_clipboard(&s) {
-                                        Ok(()) => app.status = "Copied to clipboard".to_string(),
-                                        Err(e) => app.status = format!("Clipboard error: {}", e),
+                                        Ok(()) => push_status_line(
+                                            &mut app,
+                                            "Copied to clipboard".to_string(),
+                                        ),
+                                        Err(e) => push_status_line(
+                                            &mut app,
+                                            format!("Clipboard error: {}", e),
+                                        ),
                                     }
                                 }
                             }
@@ -958,16 +968,27 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                     crossterm::event::EnableMouseCapture
                                 );
                                 app.mouse_selection_mode = false;
-                                app.status = "Mouse capture enabled".to_string();
+                                push_status_line(&mut app, "Mouse capture enabled".to_string());
                             } else {
                                 let _ = crossterm::execute!(
                                     std::io::stdout(),
                                     crossterm::event::DisableMouseCapture
                                 );
                                 app.mouse_selection_mode = true;
-                                app.status =
+                                let mode_label = if app.mouse_selection_mode {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                };
+                                push_status_line(
+                                    &mut app,
+                                    format!("Mouse selection {}", mode_label),
+                                );
+                                push_status_line(
+                                    &mut app,
                                     "Mouse selection mode: drag to select/copy; F9 to return"
-                                        .to_string();
+                                        .to_string(),
+                                );
                             }
                         }
                         (KeyCode::Char(ch), _) => {
@@ -1658,6 +1679,81 @@ fn describe_query_plan(ast: &SelectQuery) -> String {
     parts.join(" | ")
 }
 
+fn handle_syntax_error(app: &mut AppState, err: &ParseError) {
+    let message = format_syntax_error_message(err);
+    push_status_line(app, message);
+    app.query_in_progress = false;
+    app.query_started_at = None;
+}
+
+fn push_status_line(app: &mut AppState, message: impl Into<String>) {
+    if !app.status.is_empty() {
+        if !app.status_buffer.is_empty() {
+            app.status_buffer.push_str("\n───\n");
+        }
+        app.status_buffer.push_str(&app.status);
+    }
+    app.status = message.into();
+    app.status_vscroll = 0;
+}
+
+fn format_syntax_error_message(err: &ParseError) -> String {
+    if let Some(hint) = parse_error_hint(err) {
+        format!("✘ Syntax error: {}. Hint: {}", err, hint)
+    } else {
+        format!("✘ Syntax error: {}", err)
+    }
+}
+
+fn parse_error_hint(err: &ParseError) -> Option<String> {
+    use ParseError::*;
+    match err {
+        UnexpectedEof => Some(
+            "The statement ended unexpectedly; check for missing FROM, WHERE, or closing parentheses."
+                .to_string(),
+        ),
+        UnexpectedToken(tok) => {
+            let snippet = preview_error_snippet(tok);
+            if snippet.is_empty() {
+                Some("Check for stray characters and ensure the query follows SELECT ... FROM ... syntax.".to_string())
+            } else {
+                Some(format!(
+                    "Check the syntax near '{}'; ensure clauses like SELECT, FROM, WHERE, and ORDER BY are in the right order.",
+                    snippet
+                ))
+            }
+        }
+        ExpectedKeyword(kw) => Some(format!("Add the '{}' keyword at this position.", kw)),
+        ExpectedIdentifier => Some(
+            "Provide a topic or column name after this keyword (e.g. FROM my_topic).".to_string(),
+        ),
+        ExpectedNumber => Some("Provide a numeric value (e.g. LIMIT 100).".to_string()),
+        ExpectedLiteral => Some(
+            "Provide a literal value (string/number/bool) to compare against, such as 'value' or 42."
+                .to_string(),
+        ),
+        ExpectedPath => Some(
+            "JSON paths must start with key, value, or timestamp (e.g. value->field).".to_string(),
+        ),
+        InvalidOrderByField(_) => Some(
+            "ORDER BY supports timestamp, poffset, or poffset_ts.".to_string(),
+        ),
+    }
+}
+
+fn preview_error_snippet(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        let mut snippet: String = trimmed.chars().take(40).collect();
+        if trimmed.chars().count() > 40 {
+            snippet.push('…');
+        }
+        snippet
+    }
+}
+
 fn format_timestamp_bounds(bounds: TimestampBounds) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(lower) = bounds.lower {
@@ -2027,15 +2123,15 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
                             if point_in(mx, my, btn_rect) {
                                 if let Some(s) = selected_cell_text(app) {
                                     if let Err(e) = copy_to_clipboard(&s) {
-                                        app.status = format!("Clipboard error: {}", e);
+                                        push_status_line(app, format!("Clipboard error: {}", e));
                                     } else {
-                                        app.status = "Payload copied".to_string();
+                                        push_status_line(app, "Payload copied".to_string());
                                     }
                                     app.copy_btn_pressed = true;
                                     app.copy_btn_deadline =
                                         Some(Instant::now() + Duration::from_millis(150));
                                 } else {
-                                    app.status = "No payload to copy".to_string();
+                                    push_status_line(app, "No payload to copy".to_string());
                                 }
                                 return;
                             }
@@ -2220,7 +2316,7 @@ fn toggle_timestamp_display(app: &mut AppState) {
     } else {
         "system local"
     };
-    app.status = format!("Timestamps now show in {mode} time");
+    push_status_line(app, format!("Timestamps now show in {mode} time"));
 }
 
 fn scroll_help(app: &mut AppState, delta: i32) {

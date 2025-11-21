@@ -303,19 +303,21 @@ fn draw_status_panel(frame: &mut Frame, area: Rect, app: &AppState) {
     let block = Block::default().borders(Borders::ALL).title("Status");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let status_text = if app.status_buffer.is_empty() {
-        app.status.clone()
-    } else {
-        app.status_buffer.clone()
-    };
-    let mut lines: Vec<Line> = if status_text.is_empty() {
-        vec![Line::from("")]
-    } else {
-        status_text
-            .lines()
-            .map(|l| Line::from(l.to_string()))
-            .collect()
-    };
+    let mut log_lines: Vec<Line> = Vec::new();
+    if !app.status.is_empty() {
+        log_lines.push(Line::from(app.status.clone()));
+    }
+    if !app.status_buffer.is_empty() {
+        if !log_lines.is_empty() {
+            log_lines.push(Line::from(""));
+        }
+        log_lines.extend(app.status_buffer.lines().map(|l| Line::from(l.to_string())));
+    }
+    if log_lines.is_empty() {
+        log_lines.push(Line::from(""));
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
     if app.query_in_progress {
         let limit = app
             .query_limit
@@ -370,7 +372,12 @@ fn draw_status_panel(frame: &mut Frame, area: Rect, app: &AppState) {
             Style::default().fg(Color::Gray),
         ));
         lines.push(Line::from(spans));
+        if !log_lines.is_empty() {
+            lines.push(Line::from(""));
+        }
     }
+    lines.extend(log_lines);
+
     let total_lines = lines.len().max(1);
     let para = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
