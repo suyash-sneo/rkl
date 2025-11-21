@@ -92,9 +92,7 @@ fn fmt_ts(ms: i64) -> String {
     }
     let nanos = (ms as i128) * 1_000_000;
     match OffsetDateTime::from_unix_timestamp_nanos(nanos) {
-        Ok(dt) => dt
-            .format(ts_format())
-            .unwrap_or_else(|_| ms.to_string()),
+        Ok(dt) => dt.format(ts_format()).unwrap_or_else(|_| ms.to_string()),
         Err(_) => ms.to_string(),
     }
 }

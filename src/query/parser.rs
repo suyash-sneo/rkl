@@ -500,13 +500,17 @@ impl<'a> Parser<'a> {
 
     fn parse_order_by(&mut self) -> PResult<OrderSpec> {
         self.skip_ws();
-        // Only timestamp supported for now
-        if !self.try_consume_word_case("timestamp") {
-            // allow value->timestamp? but keep strict for now
+        let field = if self.try_consume_word_case("timestamp") {
+            OrderField::Timestamp
+        } else if self.try_consume_word_case("poffset_ts") {
+            OrderField::PoffsetTs
+        } else if self.try_consume_word_case("poffset") {
+            OrderField::Poffset
+        } else {
             let mut preview = String::new();
             preview.push_str(self.remaining());
             return Err(ParseError::InvalidOrderByField(preview));
-        }
+        };
         let dir = if self.try_consume_keyword("ASC") {
             OrderDir::Asc
         } else if self.try_consume_keyword("DESC") {
@@ -514,10 +518,7 @@ impl<'a> Parser<'a> {
         } else {
             OrderDir::Asc
         };
-        Ok(OrderSpec {
-            field: OrderField::Timestamp,
-            dir,
-        })
+        Ok(OrderSpec { field, dir })
     }
 }
 
@@ -741,5 +742,57 @@ mod tests {
             }
             other => panic!("unexpected expr: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_order_by_poffset_variants() {
+        let q_desc = "SELECT key FROM t ORDER BY poffset DESC";
+        let ast_desc = parse_query(q_desc).expect("parse poffset desc");
+        assert!(matches!(
+            ast_desc.order,
+            Some(OrderSpec {
+                field: OrderField::Poffset,
+                dir: OrderDir::Desc
+            })
+        ));
+
+        let q_asc = "SELECT key FROM t ORDER BY poffset ASC";
+        let ast_asc = parse_query(q_asc).expect("parse poffset asc");
+        assert!(matches!(
+            ast_asc.order,
+            Some(OrderSpec {
+                field: OrderField::Poffset,
+                dir: OrderDir::Asc
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_order_by_poffset_ts_variants() {
+        let q_desc = "SELECT key FROM t ORDER BY poffset_ts DESC";
+        let ast_desc = parse_query(q_desc).expect("parse poffset_ts desc");
+        assert!(matches!(
+            ast_desc.order,
+            Some(OrderSpec {
+                field: OrderField::PoffsetTs,
+                dir: OrderDir::Desc
+            })
+        ));
+
+        let q_default = "SELECT key FROM t ORDER BY poffset_ts";
+        let ast_default = parse_query(q_default).expect("parse poffset_ts default asc");
+        assert!(matches!(
+            ast_default.order,
+            Some(OrderSpec {
+                field: OrderField::PoffsetTs,
+                dir: OrderDir::Asc
+            })
+        ));
+    }
+
+    #[test]
+    fn no_order_by_is_none() {
+        let ast = parse_query("SELECT key FROM t").expect("parse select");
+        assert!(ast.order.is_none());
     }
 }

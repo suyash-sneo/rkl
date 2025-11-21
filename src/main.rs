@@ -14,7 +14,7 @@ use consumer::spawn_partition_consumer;
 use merger::run_merger;
 use models::{MessageEnvelope, OffsetSpec, SslConfig};
 use output::TableOutput;
-use query::{OrderDir, SelectItem, parse_query};
+use query::{SelectItem, parse_query};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use std::io::Write as _;
@@ -46,29 +46,22 @@ async fn main() -> Result<()> {
                 "{}",
                 format!("Connecting to Kafka broker: {}", args.broker).cyan()
             );
-            let (query_ast, topic, columns, max_messages, order_desc) =
-                if let Some(ref q) = args.query {
-                    let ast = parse_query(q).context("Failed to parse --query")?;
-                    let columns = ast.select.clone();
-                    let max_messages = ast.limit.or(args.max_messages);
-                    let order_desc = ast
-                        .order
-                        .as_ref()
-                        .map(|o| matches!(o.dir, OrderDir::Desc))
-                        .unwrap_or(true);
-                    println!("{}", format!("Using query: {}", q).cyan());
-                    println!("{}", format!("Topic: {}", ast.from).cyan());
-                    let topic_name = ast.from.clone();
-                    (Some(ast), topic_name, columns, max_messages, order_desc)
-                } else {
-                    let topic_value = args
-                        .topic
-                        .clone()
-                        .expect("topic is required unless --query is provided");
-                    println!("{}", format!("Topic: {}", topic_value).cyan());
-                    let columns = SelectItem::standard(!args.keys_only);
-                    (None, topic_value, columns, args.max_messages, false)
-                };
+            let (query_ast, topic, columns) = if let Some(ref q) = args.query {
+                let ast = parse_query(q).context("Failed to parse --query")?;
+                let columns = ast.select.clone();
+                println!("{}", format!("Using query: {}", q).cyan());
+                println!("{}", format!("Topic: {}", ast.from).cyan());
+                let topic_name = ast.from.clone();
+                (Some(ast), topic_name, columns)
+            } else {
+                let topic_value = args
+                    .topic
+                    .clone()
+                    .expect("topic is required unless --query is provided");
+                println!("{}", format!("Topic: {}", topic_value).cyan());
+                let columns = SelectItem::standard(!args.keys_only);
+                (None, topic_value, columns)
+            };
 
             let keys_only = !columns.iter().any(|c| matches!(c, SelectItem::Value));
 
@@ -122,6 +115,19 @@ async fn main() -> Result<()> {
             println!("{}", "Starting readers (one per partition)...".yellow());
 
             let partition_count = partitions.len().max(1);
+            let (max_messages, order_desc, query_limit, global_sort_by_timestamp) =
+                if let Some(ast) = query_ast.as_ref() {
+                    let base_limit = ast.limit.or(args.max_messages);
+                    let plan = ast.execution_plan(partition_count, base_limit);
+                    (
+                        Some(plan.n_global),
+                        plan.order_desc,
+                        plan.per_partition_limit,
+                        plan.global_sort_by_timestamp,
+                    )
+                } else {
+                    (args.max_messages, false, None, true)
+                };
 
             // Message channel: producers = partition tasks, consumer = merger task
             let (tx, rx) = mpsc::channel::<MessageEnvelope>(args.channel_capacity);
@@ -130,11 +136,6 @@ async fn main() -> Result<()> {
             let mut joinset = JoinSet::new();
             let offset_spec = OffsetSpec::from_str(&args.offset).unwrap_or(OffsetSpec::Beginning);
             let query_arc = query_ast.clone().map(std::sync::Arc::new);
-            let query_limit = if query_arc.is_some() {
-                max_messages
-            } else {
-                None
-            };
             for &p in &partitions {
                 let txp = tx.clone();
                 let mut a = args.clone();
@@ -178,6 +179,7 @@ async fn main() -> Result<()> {
                 order_desc,
                 partition_count,
                 false,
+                global_sort_by_timestamp,
             )
             .await?;
 
@@ -249,25 +251,18 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
     // Run the same pipeline as the Run subcommand and log errors
     let res = async {
         // One-time consumer just to fetch metadata / partitions
-        let (query_ast, topic, columns, max_messages, order_desc) = if let Some(ref q) = args.query
-        {
+        let (query_ast, topic, columns) = if let Some(ref q) = args.query {
             let ast = parse_query(q).context("Failed to parse --query")?;
             let columns = ast.select.clone();
-            let max_messages = ast.limit.or(args.max_messages);
-            let order_desc = ast
-                .order
-                .as_ref()
-                .map(|o| matches!(o.dir, OrderDir::Desc))
-                .unwrap_or(true);
             let topic_name = ast.from.clone();
-            (Some(ast), topic_name, columns, max_messages, order_desc)
+            (Some(ast), topic_name, columns)
         } else {
             let topic_value = args
                 .topic
                 .clone()
                 .context("topic is required unless --query is provided")?;
             let columns = SelectItem::standard(!args.keys_only);
-            (None, topic_value, columns, args.max_messages, false)
+            (None, topic_value, columns)
         };
 
         let keys_only = !columns.iter().any(|c| matches!(c, SelectItem::Value));
@@ -316,14 +311,22 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
         let partition_count = partitions.len().max(1);
 
         let (tx, rx) = mpsc::channel::<MessageEnvelope>(args.channel_capacity);
+        let (max_messages, order_desc, query_limit, global_sort_by_timestamp) =
+            if let Some(ast) = query_ast.as_ref() {
+                let base_limit = ast.limit.or(args.max_messages);
+                let plan = ast.execution_plan(partition_count, base_limit);
+                (
+                    Some(plan.n_global),
+                    plan.order_desc,
+                    plan.per_partition_limit,
+                    plan.global_sort_by_timestamp,
+                )
+            } else {
+                (args.max_messages, false, None, true)
+            };
         let mut joinset = JoinSet::new();
         let offset_spec = OffsetSpec::from_str(&args.offset).unwrap_or(OffsetSpec::Beginning);
         let query_arc = query_ast.clone().map(std::sync::Arc::new);
-        let query_limit = if query_arc.is_some() {
-            max_messages
-        } else {
-            None
-        };
         for &p in &partitions {
             let txp = tx.clone();
             let mut a = args.clone();
@@ -361,6 +364,7 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
             order_desc,
             partition_count,
             false,
+            global_sort_by_timestamp,
         )
         .await?;
         while let Some(res) = joinset.join_next().await {

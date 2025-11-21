@@ -1,6 +1,6 @@
 use crate::args::RunArgs;
 use crate::models::{MessageEnvelope, OffsetSpec, SslConfig};
-use crate::query::{OrderDir, SelectQuery};
+use crate::query::{OrderDir, OrderField, OrderSpec, SelectQuery};
 use anyhow::{Context, Result};
 use rdkafka::Offset;
 use rdkafka::config::ClientConfig;
@@ -13,7 +13,7 @@ use std::io::Write as _;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
-const QUERY_SCAN_MULTIPLIER: usize = 3;
+const QUERY_SCAN_MULTIPLIER: usize = 5;
 
 pub async fn spawn_partition_consumer(
     args: RunArgs,
@@ -131,6 +131,46 @@ async fn run_search_partition_consumer(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanKind {
+    TimestampAsc,
+    TimestampDesc,
+    PoffsetAsc,
+    PoffsetDesc,
+    PoffsetTsAsc,
+    PoffsetTsDesc,
+}
+
+fn infer_scan_kind(query: &SelectQuery) -> ScanKind {
+    match query.order {
+        Some(OrderSpec {
+            field: OrderField::Timestamp,
+            dir: OrderDir::Asc,
+        }) => ScanKind::TimestampAsc,
+        Some(OrderSpec {
+            field: OrderField::Timestamp,
+            dir: OrderDir::Desc,
+        }) => ScanKind::TimestampDesc,
+        Some(OrderSpec {
+            field: OrderField::Poffset,
+            dir: OrderDir::Asc,
+        }) => ScanKind::PoffsetAsc,
+        Some(OrderSpec {
+            field: OrderField::Poffset,
+            dir: OrderDir::Desc,
+        }) => ScanKind::PoffsetDesc,
+        Some(OrderSpec {
+            field: OrderField::PoffsetTs,
+            dir: OrderDir::Asc,
+        }) => ScanKind::PoffsetTsAsc,
+        Some(OrderSpec {
+            field: OrderField::PoffsetTs,
+            dir: OrderDir::Desc,
+        }) => ScanKind::PoffsetTsDesc,
+        None => ScanKind::PoffsetDesc,
+    }
+}
+
 async fn run_query_partition_consumer(
     args: RunArgs,
     partition: i32,
@@ -194,99 +234,209 @@ async fn run_query_partition_consumer(
         .assign(&tpl)
         .context("Failed to assign partition")?;
 
-    let order_desc = query
-        .order
-        .as_ref()
-        .map(|o| matches!(o.dir, OrderDir::Desc))
-        .unwrap_or(true);
-    let limit_global = query_limit.or(query.limit);
-    let window_size = limit_global.map(|n| n as i64).unwrap_or(256).max(1);
-    let per_partition_cap = limit_global.map(|n| n.saturating_mul(QUERY_SCAN_MULTIPLIER).max(n));
-    let mut matched_rows = 0usize;
+    let scan_kind = infer_scan_kind(&query);
+    let per_partition_limit = query_limit;
 
-    if order_desc {
-        let mut scan_end_exclusive = effective_end_exclusive;
-        'outer: loop {
-            if scan_end_exclusive <= effective_start {
-                break;
+    match scan_kind {
+        ScanKind::TimestampDesc | ScanKind::TimestampAsc => {
+            let limit_global = per_partition_limit.or(query.limit);
+            let window_size = limit_global.map(|n| n as i64).unwrap_or(256).max(1);
+            let per_partition_cap =
+                limit_global.map(|n| n.saturating_mul(QUERY_SCAN_MULTIPLIER).max(n));
+            let mut matched_rows = 0usize;
+
+            if matches!(scan_kind, ScanKind::TimestampDesc) {
+                let mut scan_end_exclusive = effective_end_exclusive;
+                'outer: loop {
+                    if scan_end_exclusive <= effective_start {
+                        break;
+                    }
+                    if partition_cap_reached(matched_rows, per_partition_cap) {
+                        break;
+                    }
+                    let remaining = scan_end_exclusive - effective_start;
+                    let window = remaining.min(window_size);
+                    let window_start = scan_end_exclusive - window;
+
+                    consumer
+                        .seek(
+                            &topic,
+                            partition,
+                            Offset::Offset(window_start),
+                            Duration::from_secs(5),
+                        )
+                        .context("seek window")?;
+
+                    loop {
+                        match consumer.recv().await {
+                            Ok(msg) => {
+                                if is_partition_eof(&msg) {
+                                    break;
+                                }
+                                if msg.offset() >= scan_end_exclusive {
+                                    break;
+                                }
+
+                                if let Some(env) =
+                                    build_query_envelope(&args, partition, &query, &msg)
+                                {
+                                    if tx.send(env).await.is_err() {
+                                        break 'outer;
+                                    }
+                                    matched_rows += 1;
+                                    if partition_cap_reached(matched_rows, per_partition_cap) {
+                                        break 'outer;
+                                    }
+                                }
+                            }
+                            Err(KafkaError::PartitionEOF(_)) => {
+                                break;
+                            }
+                            Err(e) => {
+                                log_partition_error(partition, &format!("{}", e));
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                        }
+                    }
+
+                    scan_end_exclusive = window_start;
+                }
+            } else {
+                'asc: loop {
+                    if partition_cap_reached(matched_rows, per_partition_cap) {
+                        break 'asc;
+                    }
+                    match consumer.recv().await {
+                        Ok(msg) => {
+                            if is_partition_eof(&msg) {
+                                break 'asc;
+                            }
+                            if msg.offset() >= effective_end_exclusive {
+                                break 'asc;
+                            }
+
+                            if let Some(env) = build_query_envelope(&args, partition, &query, &msg)
+                            {
+                                if tx.send(env).await.is_err() {
+                                    break 'asc;
+                                }
+                                matched_rows += 1;
+                                if partition_cap_reached(matched_rows, per_partition_cap) {
+                                    break 'asc;
+                                }
+                            }
+                        }
+                        Err(KafkaError::PartitionEOF(_)) => break 'asc,
+                        Err(e) => {
+                            log_partition_error(partition, &format!("{}", e));
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
             }
-            if partition_cap_reached(matched_rows, per_partition_cap) {
-                break;
-            }
-            let remaining = scan_end_exclusive - effective_start;
-            let window = remaining.min(window_size);
-            let window_start = scan_end_exclusive - window;
-
-            consumer
-                .seek(
-                    &topic,
-                    partition,
-                    Offset::Offset(window_start),
-                    Duration::from_secs(5),
-                )
-                .context("seek window")?;
-
-            loop {
+        }
+        ScanKind::PoffsetAsc | ScanKind::PoffsetTsAsc => {
+            let per_limit = per_partition_limit.unwrap_or(usize::MAX);
+            let mut emitted = 0usize;
+            'asc: loop {
+                if emitted >= per_limit {
+                    break 'asc;
+                }
                 match consumer.recv().await {
                     Ok(msg) => {
                         if is_partition_eof(&msg) {
-                            break;
+                            break 'asc;
                         }
-                        if msg.offset() >= scan_end_exclusive {
-                            break;
+                        if msg.offset() >= effective_end_exclusive {
+                            break 'asc;
                         }
 
                         if let Some(env) = build_query_envelope(&args, partition, &query, &msg) {
                             if tx.send(env).await.is_err() {
-                                break 'outer;
+                                break 'asc;
                             }
-                            matched_rows += 1;
-                            if partition_cap_reached(matched_rows, per_partition_cap) {
-                                break 'outer;
+                            emitted += 1;
+                            if emitted >= per_limit {
+                                break 'asc;
                             }
                         }
                     }
-                    Err(KafkaError::PartitionEOF(_)) => {
-                        break;
-                    }
+                    Err(KafkaError::PartitionEOF(_)) => break 'asc,
                     Err(e) => {
                         log_partition_error(partition, &format!("{}", e));
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
             }
-
-            scan_end_exclusive = window_start;
         }
-    } else {
-        'asc: loop {
-            if partition_cap_reached(matched_rows, per_partition_cap) {
-                break 'asc;
-            }
-            match consumer.recv().await {
-                Ok(msg) => {
-                    if is_partition_eof(&msg) {
-                        break 'asc;
-                    }
-                    if msg.offset() >= effective_end_exclusive {
-                        break 'asc;
-                    }
+        ScanKind::PoffsetDesc | ScanKind::PoffsetTsDesc => {
+            let per_limit = per_partition_limit.unwrap_or(usize::MAX);
+            let mut emitted = 0usize;
+            let mut scan_end_exclusive = effective_end_exclusive;
+            let total_span = (effective_end_exclusive - effective_start).max(1);
+            let per_limit_window = per_partition_limit
+                .map(|n| n.min(i64::MAX as usize) as i64)
+                .unwrap_or(total_span);
+            let mut window_size = per_limit_window.max(1);
+            let min_window = 64i64.min(total_span);
+            window_size = window_size.max(min_window);
+            window_size = window_size.min(total_span);
 
-                    if let Some(env) = build_query_envelope(&args, partition, &query, &msg) {
-                        if tx.send(env).await.is_err() {
-                            break 'asc;
+            'outer: loop {
+                if scan_end_exclusive <= effective_start || emitted >= per_limit {
+                    break 'outer;
+                }
+                let remaining = scan_end_exclusive - effective_start;
+                let window = remaining.min(window_size);
+                if window <= 0 {
+                    break 'outer;
+                }
+                let window_start = scan_end_exclusive - window;
+
+                consumer
+                    .seek(
+                        &topic,
+                        partition,
+                        Offset::Offset(window_start),
+                        Duration::from_secs(5),
+                    )
+                    .context("seek window")?;
+
+                let mut local: Vec<MessageEnvelope> = Vec::new();
+                loop {
+                    match consumer.recv().await {
+                        Ok(msg) => {
+                            if is_partition_eof(&msg) {
+                                break;
+                            }
+                            if msg.offset() >= scan_end_exclusive {
+                                break;
+                            }
+
+                            if let Some(env) = build_query_envelope(&args, partition, &query, &msg)
+                            {
+                                local.push(env);
+                            }
                         }
-                        matched_rows += 1;
-                        if partition_cap_reached(matched_rows, per_partition_cap) {
-                            break 'asc;
+                        Err(KafkaError::PartitionEOF(_)) => break,
+                        Err(e) => {
+                            log_partition_error(partition, &format!("{}", e));
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                     }
                 }
-                Err(KafkaError::PartitionEOF(_)) => break 'asc,
-                Err(e) => {
-                    log_partition_error(partition, &format!("{}", e));
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+
+                for env in local.into_iter().rev() {
+                    if tx.send(env).await.is_err() {
+                        break 'outer;
+                    }
+                    emitted += 1;
+                    if emitted >= per_limit {
+                        break 'outer;
+                    }
                 }
+
+                scan_end_exclusive = window_start;
             }
         }
     }

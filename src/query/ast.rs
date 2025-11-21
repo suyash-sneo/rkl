@@ -79,12 +79,24 @@ pub enum OrderDir {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderField {
     Timestamp,
+    Poffset,
+    PoffsetTs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderSpec {
     pub field: OrderField,
     pub dir: OrderDir,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryExecutionPlan {
+    pub order_field: OrderField,
+    pub order_dir: OrderDir,
+    pub order_desc: bool,
+    pub n_global: usize,
+    pub per_partition_limit: Option<usize>,
+    pub global_sort_by_timestamp: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,6 +106,43 @@ pub struct SelectQuery {
     pub r#where: Option<Expr>,
     pub order: Option<OrderSpec>,
     pub limit: Option<usize>,
+}
+
+impl SelectQuery {
+    /// Returns (field, dir, is_default) where default means ORDER BY was omitted.
+    pub fn effective_order(&self) -> (OrderField, OrderDir, bool) {
+        match self.order.as_ref() {
+            Some(spec) => (spec.field, spec.dir, false),
+            None => (OrderField::Poffset, OrderDir::Desc, true),
+        }
+    }
+
+    pub fn execution_plan(
+        &self,
+        partition_count: usize,
+        base_limit: Option<usize>,
+    ) -> QueryExecutionPlan {
+        let partitions = partition_count.max(1);
+        let (order_field, order_dir, _) = self.effective_order();
+        let order_desc = matches!(order_dir, OrderDir::Desc);
+        let n_global = base_limit.unwrap_or(50 * partitions);
+        let per_partition_limit = match order_field {
+            OrderField::Poffset | OrderField::PoffsetTs => {
+                Some((n_global + partitions - 1) / partitions)
+            }
+            OrderField::Timestamp => Some(n_global),
+        };
+        let global_sort_by_timestamp =
+            matches!(order_field, OrderField::Timestamp | OrderField::PoffsetTs);
+        QueryExecutionPlan {
+            order_field,
+            order_dir,
+            order_desc,
+            n_global,
+            per_partition_limit,
+            global_sort_by_timestamp,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

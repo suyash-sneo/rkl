@@ -45,7 +45,11 @@ mod tests {
     #[test]
     fn renders_millisecond_precision() {
         let s = fmt_ts(1_700_000_000_123, true);
-        assert!(s.contains(".123"), "timestamp should include milliseconds: {}", s);
+        assert!(
+            s.contains(".123"),
+            "timestamp should include milliseconds: {}",
+            s
+        );
         assert!(s.ends_with("+00:00"));
     }
 

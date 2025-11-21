@@ -19,21 +19,84 @@ pub async fn run_merger<S: OutputSink + Send>(
     order_desc: bool,
     partition_count: usize,
     interactive: bool,
+    global_sort_by_timestamp: bool,
 ) -> Result<()> {
-    if let Some(limit) = max_messages {
-        run_merger_bounded(
-            rx,
-            out,
-            limit,
-            order_desc,
-            partition_count,
-            flush_interval_ms,
-            interactive,
-        )
-        .await
+    if global_sort_by_timestamp {
+        if let Some(limit) = max_messages {
+            run_merger_bounded(
+                rx,
+                out,
+                limit,
+                order_desc,
+                partition_count,
+                flush_interval_ms,
+                interactive,
+            )
+            .await
+        } else {
+            run_merger_streaming(rx, out, watermark, flush_interval_ms, order_desc).await
+        }
     } else {
-        run_merger_streaming(rx, out, watermark, flush_interval_ms, order_desc).await
+        run_merger_passthrough(rx, out, max_messages, flush_interval_ms, interactive).await
     }
+}
+
+async fn run_merger_passthrough<S: OutputSink + Send>(
+    mut rx: Receiver<MessageEnvelope>,
+    out: &mut S,
+    max_messages: Option<usize>,
+    flush_interval_ms: u64,
+    interactive: bool,
+) -> Result<()> {
+    let limit = max_messages.unwrap_or(usize::MAX);
+    let mut sent = 0usize;
+
+    if interactive {
+        let mut buf: Vec<MessageEnvelope> = Vec::new();
+        let mut tick = interval(Duration::from_millis(flush_interval_ms.max(1)));
+        loop {
+            tokio::select! {
+                biased;
+                _ = tick.tick() => {
+                    if !buf.is_empty() {
+                        for env in buf.drain(..) {
+                            out.push(&env);
+                        }
+                        out.flush_block();
+                    }
+                }
+                maybe_env = rx.recv() => {
+                    match maybe_env {
+                        Some(env) => {
+                            if sent < limit {
+                                buf.push(env);
+                                sent += 1;
+                            }
+                        }
+                        None => {
+                            if !buf.is_empty() {
+                                for env in buf.drain(..) {
+                                    out.push(&env);
+                                }
+                                out.flush_block();
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        while let Some(env) = rx.recv().await {
+            if sent < limit {
+                out.push(&env);
+                sent += 1;
+            }
+        }
+        out.flush_block();
+    }
+
+    Ok(())
 }
 
 async fn run_merger_bounded<S: OutputSink + Send>(
@@ -307,7 +370,7 @@ mod tests {
         drop(tx);
 
         let mut sink = TestSink::default();
-        run_merger(rx, &mut sink, 4, 50, Some(3), true, 4, false)
+        run_merger(rx, &mut sink, 4, 50, Some(3), true, 4, false, true)
             .await
             .unwrap();
 
@@ -335,7 +398,7 @@ mod tests {
         drop(tx);
 
         let mut sink = TestSink::default();
-        run_merger(rx, &mut sink, 4, 50, Some(4), false, 4, false)
+        run_merger(rx, &mut sink, 4, 50, Some(4), false, 4, false, true)
             .await
             .unwrap();
 
@@ -348,12 +411,7 @@ mod tests {
             .collect();
         assert_eq!(
             triples,
-            vec![
-                (2, 9, 900),
-                (0, 1, 1_000),
-                (0, 2, 1_000),
-                (1, 1, 1_000),
-            ]
+            vec![(2, 9, 900), (0, 1, 1_000), (0, 2, 1_000), (1, 1, 1_000),]
         );
     }
 }

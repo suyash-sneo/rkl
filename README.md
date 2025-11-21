@@ -6,7 +6,7 @@ RKL (pronounced “racle”, like “oracle” with a silent “o”) is a termi
 
 ## Features
 
-- SQL-inspired query engine (`SELECT`, `WHERE`, `ORDER BY timestamp` with DESC default, `LIMIT`) with JSON-path filtering via `value->field->subfield`.
+- SQL-inspired query engine (`SELECT`, `WHERE`, `ORDER BY timestamp|poffset|poffset_ts`, `LIMIT`) with JSON-path filtering via `value->field->subfield`.
 - Real-time results table with horizontal scrolling plus a right-side JSON pane for the focused record.
 - Topic inspection with the `LIST topics;` command and an Info screen (F12) that caches broker metadata.
 - Fuzzy topic autocomplete triggered after `FROM`, accepted with `Ctrl-Y` (or Right arrow), and navigated with `Ctrl-N`/`Ctrl-P`.
@@ -51,8 +51,9 @@ curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/uninst
 
 ## Query Language
 
-- Syntax: `SELECT columns FROM topic [WHERE expr] [ORDER BY timestamp ASC|DESC] [LIMIT n]`.
-- ORDER BY timestamp DESC is applied automatically when omitted so queries stream newest data first.
+- Syntax: `SELECT columns FROM topic [WHERE expr] [ORDER BY timestamp|poffset|poffset_ts ASC|DESC] [LIMIT n]`.
+- ORDER BY poffset DESC is applied automatically when omitted so queries sample the latest offsets per partition without a global timestamp sort.
+- `ORDER BY poffset` keeps each partition independent, `ORDER BY poffset_ts` uses the same per-partition sampling but globally re-sorts by timestamp.
 - Filter JSON by walking nested fields with `value->meta->service`, `value->response->status`, etc. `key`, raw `value`, and `timestamp` all support comparisons.
 - Operators: `=`, `!=`, `<>`, `CONTAINS`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, and parentheses for grouping. `timestamp` comparisons accept either milliseconds or ISO-8601 strings; values ending in `Z` are treated as UTC while others use your system timezone.
 - End queries with `;` to separate multiple statements; the editor highlights the current query under the cursor.
@@ -91,14 +92,21 @@ RKL is optimized for topics with millions or billions of messages. The query eng
 
 ### Ordering by timestamp
 
-- `ORDER BY timestamp DESC` (or omitting `ORDER BY` entirely) means “newest first”.
-- RKL seeks near the latest offsets in each partition and scans backwards in windows, instead of starting from the beginning of the topic.
+- `ORDER BY timestamp DESC` means “newest first” with a global timestamp sort across partitions.
+- If you omit `ORDER BY`, RKL uses `ORDER BY poffset DESC` by default, which tails each partition by offset without reordering across partitions.
+- Timestamp-ordered queries seek near the latest offsets in each partition and scan backwards in windows, instead of starting from the beginning of the topic.
 - Results are globally ordered by timestamp across partitions, so it behaves like a database query on a `timestamp` column.
+
+### Offset sampling modes
+
+- `ORDER BY poffset DESC` (the default) samples the tail of each partition independently so you see the most recent offsets from each shard with minimal reordering cost.
+- `ORDER BY poffset ASC` walks forward from the effective start offset in each partition, which is useful for historical replays.
+- `ORDER BY poffset_ts` combines offset-based sampling with a global timestamp sort at the end, so you get deterministic ordering without repeated backward seeks per partition.
 
 Examples:
 
 ```sql
--- Latest 100 messages, newest first (implicit DESC)
+-- Latest offsets per partition (implicit ORDER BY poffset DESC)
 SELECT partition, offset, timestamp, key, value
 FROM random-data
 LIMIT 100;

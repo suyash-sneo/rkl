@@ -4,8 +4,7 @@ use crate::query::SelectItem;
 use std::time::Instant;
 use tui_textarea::TextArea;
 
-pub const SPINNER_FRAMES: &[&str] =
-    &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Default)]
 pub struct AppState {
@@ -137,12 +136,8 @@ impl AppState {
         self.rows.append(&mut batch);
     }
 
-    pub fn update_query_progress_rows(&mut self, visible_rows: usize) {
-        if let Some(limit) = self.query_limit {
-            self.query_rows_seen = visible_rows.min(limit);
-        } else {
-            self.query_rows_seen = visible_rows;
-        }
+    pub fn update_query_progress_rows(&mut self, total_emitted: usize) {
+        self.query_rows_seen = total_emitted;
     }
 }
 
@@ -151,10 +146,12 @@ pub enum TuiEvent {
     Batch {
         run_id: u64,
         rows: Vec<MessageEnvelope>,
+        total_emitted: usize,
     },
     Snapshot {
         run_id: u64,
         rows: Vec<MessageEnvelope>,
+        total_emitted: usize,
     },
     Done {
         run_id: u64,
@@ -171,6 +168,10 @@ pub enum TuiEvent {
     },
     Topics(Vec<String>),
     TopicsWithPartitions(Vec<(String, usize)>),
+    QueryPlan {
+        run_id: u64,
+        planned_limit: usize,
+    },
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]

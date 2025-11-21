@@ -9,7 +9,7 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 
-use super::app::{AppState, EnvFieldFocus, Focus, ResultsMode, Screen, SPINNER_FRAMES};
+use super::app::{AppState, EnvFieldFocus, Focus, ResultsMode, SPINNER_FRAMES, Screen};
 use super::query_bounds::find_query_range;
 use super::timefmt::fmt_ts;
 
@@ -339,14 +339,12 @@ fn draw_status_panel(frame: &mut Frame, area: Rect, app: &AppState) {
             .map(|start| start.elapsed().as_secs_f32())
             .unwrap_or(0.0);
         let mut spans = Vec::new();
-        spans.push(
-            Span::styled(
-                spinner,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        );
+        spans.push(Span::styled(
+            spinner,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
         spans.push(Span::raw(" Query "));
         spans.push(Span::styled(
             format!("{}/{}", current, limit),
@@ -764,6 +762,8 @@ fn push_word(spans: &mut Vec<Span<'static>>, w: &str) {
         "timestamp",
         "partition",
         "offset",
+        "poffset",
+        "poffset_ts",
     ];
     if kw.contains(&w.to_ascii_lowercase().as_str()) {
         spans.push(Span::styled(
@@ -930,9 +930,12 @@ fn build_help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         heading_line("Query syntax"),
         Line::from(
-            "- SELECT columns FROM topic [WHERE expr] [ORDER BY timestamp ASC|DESC] [LIMIT n]",
+            "- SELECT columns FROM topic [WHERE expr] [ORDER BY timestamp|poffset|poffset_ts ASC|DESC] [LIMIT n]",
         ),
-        Line::from("- ORDER BY timestamp DESC is assumed when omitted"),
+        Line::from("- ORDER BY poffset DESC is assumed when omitted"),
+        Line::from(
+            "- poffset = per-partition offsets; poffset_ts = same scan but globally sorted by timestamp",
+        ),
         Line::from("- JSON path via value->field->subfield; key and timestamp supported"),
         Line::from("- Operators: =, !=, <>, CONTAINS, <, <=, >, >="),
         Line::from(
@@ -1159,7 +1162,8 @@ fn json_to_highlighted_lines(v: &serde_json::Value) -> Vec<Line<'static>> {
         Span::styled(s.to_string(), Style::default().fg(Color::Gray))
     }
     fn string_span(s: &str) -> Span<'static> {
-        Span::styled(format!("\"{}\"", s), Style::default().fg(Color::Yellow))
+        let rendered = serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s));
+        Span::styled(rendered, Style::default().fg(Color::Yellow))
     }
     fn number_span(n: &serde_json::Number) -> Span<'static> {
         Span::styled(n.to_string(), Style::default().fg(Color::Cyan))

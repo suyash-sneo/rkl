@@ -20,7 +20,8 @@ use crate::merger::run_merger;
 use crate::models::{MessageEnvelope, OffsetSpec};
 use crate::output::OutputSink;
 use crate::query::{
-    Command, OrderDir, SelectItem, SelectQuery, TimestampBounds, parse_command, parse_query,
+    Command, OrderDir, OrderField, SelectItem, SelectQuery, TimestampBounds, parse_command,
+    parse_query,
 };
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -31,8 +32,8 @@ use rdkafka::consumer::ConsumerContext;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 
 use super::app::{
-    AppState, AutoCompleteState, EnvEditor, EnvFieldFocus, ResultsMode, Screen, TuiEvent,
-    SPINNER_FRAMES,
+    AppState, AutoCompleteState, EnvEditor, EnvFieldFocus, ResultsMode, SPINNER_FRAMES, Screen,
+    TuiEvent,
 };
 use super::env_store::Environment;
 use super::env_store::config_dir;
@@ -127,20 +128,36 @@ pub async fn run(args: RunArgs) -> Result<()> {
         // Drain any events from pipeline
         while let Ok(ev) = rx_evt.try_recv() {
             match ev {
-                TuiEvent::Batch { run_id, mut rows } => {
+                TuiEvent::Batch {
+                    run_id,
+                    mut rows,
+                    total_emitted,
+                } => {
                     if Some(run_id) == app.current_run {
                         app.push_rows(std::mem::take(&mut rows));
                         app.clamp_selection();
-                        app.update_query_progress_rows(app.rows.len());
+                        app.update_query_progress_rows(total_emitted);
                     }
                 }
-                TuiEvent::Snapshot { run_id, mut rows } => {
+                TuiEvent::Snapshot {
+                    run_id,
+                    mut rows,
+                    total_emitted,
+                } => {
                     if Some(run_id) == app.current_run {
                         app.clear_rows();
-                        let len = rows.len();
                         app.push_rows(std::mem::take(&mut rows));
                         app.clamp_selection();
-                        app.update_query_progress_rows(len);
+                        app.update_query_progress_rows(total_emitted);
+                    }
+                }
+                TuiEvent::QueryPlan {
+                    run_id,
+                    planned_limit,
+                } => {
+                    if Some(run_id) == app.current_run {
+                        app.query_limit = Some(planned_limit);
+                        app.query_rows_seen = 0;
                     }
                 }
                 TuiEvent::Done { run_id } => {
@@ -316,7 +333,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         app.topics_with_partitions.clear();
                                         run_counter += 1;
                                         app.current_run = Some(run_counter);
-                                        let query_limit = ast.limit.or(args.max_messages).or(Some(100));
+                                        let query_limit = ast.limit.or(args.max_messages);
                                         app.query_in_progress = true;
                                         app.query_limit = query_limit;
                                         app.query_rows_seen = 0;
@@ -398,7 +415,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         app.topics_with_partitions.clear();
                                         run_counter += 1;
                                         app.current_run = Some(run_counter);
-                                        let query_limit = ast.limit.or(args.max_messages).or(Some(100));
+                                        let query_limit = ast.limit.or(args.max_messages);
                                         app.query_in_progress = true;
                                         app.query_limit = query_limit;
                                         app.query_rows_seen = 0;
@@ -1338,6 +1355,7 @@ struct TuiOutput {
     tx: mpsc::UnboundedSender<TuiEvent>,
     buffer: Vec<MessageEnvelope>,
     snapshot_mode: bool,
+    total_emitted: usize,
 }
 
 impl TuiOutput {
@@ -1347,12 +1365,14 @@ impl TuiOutput {
             tx,
             buffer: Vec::with_capacity(256),
             snapshot_mode,
+            total_emitted: 0,
         }
     }
 }
 
 impl OutputSink for TuiOutput {
     fn push(&mut self, env: &MessageEnvelope) {
+        self.total_emitted += 1;
         self.buffer.push(env.clone());
     }
     fn flush_block(&mut self) {
@@ -1365,11 +1385,13 @@ impl OutputSink for TuiOutput {
             TuiEvent::Snapshot {
                 run_id: self.run_id,
                 rows: out,
+                total_emitted: self.total_emitted,
             }
         } else {
             TuiEvent::Batch {
                 run_id: self.run_id,
                 rows: out,
+                total_emitted: self.total_emitted,
             }
         };
         let _ = self.tx.send(evt);
@@ -1404,12 +1426,7 @@ async fn run_pipeline_with_ssl(
     let ast = parse_query(&query_text).context("Failed to parse query")?;
     let topic = ast.from.clone();
     let keys_only = !ast.select.iter().any(|i| matches!(i, SelectItem::Value));
-    let max_messages_global = ast.limit.or(args.max_messages).or(Some(100));
-    let order_desc = ast
-        .order
-        .as_ref()
-        .map(|o| matches!(o.dir, OrderDir::Desc))
-        .unwrap_or(true);
+    let base_limit = ast.limit.or(args.max_messages);
 
     let mut cfg = ClientConfig::new();
     cfg.set("bootstrap.servers", &args.broker)
@@ -1451,11 +1468,20 @@ async fn run_pipeline_with_ssl(
         .ok_or_else(|| anyhow!("Topic not found: {}", topic))?;
     let partitions: Vec<i32> = topic_md.partitions().iter().map(|p| p.id()).collect();
     let partition_count = partitions.len().max(1);
+    let plan = ast.execution_plan(partition_count, base_limit);
+    let max_messages_global = Some(plan.n_global);
+    let order_desc = plan.order_desc;
+    let per_partition_limit = plan.per_partition_limit;
+    let global_sort_by_timestamp = plan.global_sort_by_timestamp;
+    let _ = tx.send(TuiEvent::QueryPlan {
+        run_id,
+        planned_limit: plan.n_global,
+    });
 
     let (tx_msg, rx_msg) = mpsc::channel::<MessageEnvelope>(args.channel_capacity);
     let offset_spec = OffsetSpec::from_str(&args.offset).unwrap_or(OffsetSpec::Beginning);
     let query_arc = std::sync::Arc::new(ast.clone());
-    let query_limit = max_messages_global;
+    let query_limit = per_partition_limit;
 
     let mut joinset = tokio::task::JoinSet::new();
     for &p in &partitions {
@@ -1484,6 +1510,7 @@ async fn run_pipeline_with_ssl(
         order_desc,
         partition_count,
         true,
+        global_sort_by_timestamp,
     )
     .await?;
 
@@ -1605,10 +1632,18 @@ fn copy_to_clipboard(s: &str) -> Result<()> {
 }
 
 fn describe_query_plan(ast: &SelectQuery) -> String {
-    let order_label = match ast.order.as_ref().map(|o| o.dir) {
-        Some(OrderDir::Asc) => "timestamp ASC".to_string(),
-        Some(OrderDir::Desc) => "timestamp DESC".to_string(),
-        None => "timestamp DESC (default)".to_string(),
+    let order_label = match ast.order.as_ref().map(|o| (o.field, o.dir)) {
+        Some((OrderField::Timestamp, OrderDir::Asc)) => "timestamp ASC".to_string(),
+        Some((OrderField::Timestamp, OrderDir::Desc)) => "timestamp DESC".to_string(),
+        Some((OrderField::Poffset, OrderDir::Asc)) => "poffset ASC".to_string(),
+        Some((OrderField::Poffset, OrderDir::Desc)) => "poffset DESC".to_string(),
+        Some((OrderField::PoffsetTs, OrderDir::Asc)) => {
+            "poffset_ts ASC (scan by offset, sort by timestamp)".to_string()
+        }
+        Some((OrderField::PoffsetTs, OrderDir::Desc)) => {
+            "poffset_ts DESC (scan by offset, sort by timestamp)".to_string()
+        }
+        None => "poffset DESC (default)".to_string(),
     };
     let mut parts = vec![format!("order={}", order_label)];
     if let Some(bounds) = ast
