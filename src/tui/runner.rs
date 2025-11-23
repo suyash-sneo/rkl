@@ -14,6 +14,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use tokio::sync::mpsc;
 
+use crate::app_config::{AppConfig, DefaultOrderDir, DefaultOrderField};
 use crate::args::RunArgs;
 use crate::consumer::spawn_partition_consumer;
 use crate::merger::run_merger;
@@ -21,8 +22,8 @@ use crate::models::{MessageEnvelope, OffsetSpec};
 use crate::output::OutputSink;
 use crate::query::parser::ParseError;
 use crate::query::{
-    Command, OrderDir, OrderField, SelectItem, SelectQuery, TimestampBounds, parse_command,
-    parse_query,
+    Command, OrderDir, OrderField, OrderSpec, SelectItem, SelectQuery, TimestampBounds,
+    parse_command, parse_query,
 };
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -33,11 +34,12 @@ use rdkafka::consumer::ConsumerContext;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 
 use super::app::{
-    AppState, AutoCompleteState, EnvEditor, EnvFieldFocus, ResultsMode, SPINNER_FRAMES, Screen,
-    TuiEvent,
+    AppConfigFieldFocus, AppState, AutoCompleteState, EnvEditor, EnvFieldFocus, ResultsMode,
+    SPINNER_FRAMES, Screen, TuiEvent, build_app_config_editor,
 };
 use super::env_store::Environment;
 use super::env_store::config_dir;
+use super::pem_utils::{decode_literal_backslash_n, normalize_pem_input};
 use super::query_bounds::{find_query_range, strip_trailing_semicolon};
 use super::timefmt::fmt_ts;
 use super::ui::{draw, help_content_line_count};
@@ -46,10 +48,6 @@ const ENV_COPY_LABEL: &str = "[Copy]";
 const ENV_PASTE_LABEL: &str = "[Paste]";
 const ENV_CLEAR_LABEL: &str = "[Clear]";
 const ENV_CONN_PASTE_LABEL: &str = "[Paste/F9 Select]";
-
-fn decode_display(s: &str) -> String {
-    s.replace("\\n", "\n")
-}
 
 fn next_unique_env_name(envs: &[Environment]) -> String {
     let base = "New Env";
@@ -119,6 +117,32 @@ pub async fn run(args: RunArgs) -> Result<()> {
                 app.timestamp_switch_pressed = false;
             }
         }
+        if app.env_save_pressed {
+            if let Some(deadline) = app.env_save_deadline {
+                if Instant::now() >= deadline {
+                    app.env_save_pressed = false;
+                    app.env_save_deadline = None;
+                }
+            } else {
+                app.env_save_pressed = false;
+            }
+        }
+        if app.app_config_save_pressed {
+            if let Some(deadline) = app.app_config_save_deadline {
+                if Instant::now() >= deadline {
+                    app.app_config_save_pressed = false;
+                    app.app_config_save_deadline = None;
+                }
+            } else {
+                app.app_config_save_pressed = false;
+            }
+        }
+        if let Some(deadline) = app.menu_pressed_deadline {
+            if Instant::now() >= deadline {
+                app.menu_pressed_screen = None;
+                app.menu_pressed_deadline = None;
+            }
+        }
 
         if app.query_in_progress {
             app.query_spinner_idx = (app.query_spinner_idx + 1) % SPINNER_FRAMES.len();
@@ -127,6 +151,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
         if app.parse_status_dirty {
             update_parse_status(&mut app);
             app.parse_status_dirty = false;
+        }
+
+        if matches!(app.screen, Screen::Envs) && app.env_editor.is_none() {
+            ensure_env_editor(&mut app);
         }
 
         // Draw UI
@@ -184,12 +212,24 @@ pub async fn run(args: RunArgs) -> Result<()> {
                 TuiEvent::EnvTestProgress { message } => {
                     app.env_test_in_progress = true;
                     app.env_test_message = Some(message.clone());
-                    push_status_line(&mut app, format!("[env-test] {}", message));
+                    if !app.env_test_log.is_empty() {
+                        app.env_test_log.push('\n');
+                    }
+                    app.env_test_log.push_str(&message);
+                    let total_lines = app.env_test_log.lines().count();
+                    app.env_conn_vscroll =
+                        total_lines.saturating_sub(1).min(u16::MAX as usize) as u16;
                 }
                 TuiEvent::EnvTestDone { message } => {
                     app.env_test_in_progress = false;
                     app.env_test_message = Some(message.clone());
-                    push_status_line(&mut app, format!("[env-test] {}", message));
+                    if !app.env_test_log.is_empty() {
+                        app.env_test_log.push('\n');
+                    }
+                    app.env_test_log.push_str(&message);
+                    let total_lines = app.env_test_log.lines().count();
+                    app.env_conn_vscroll =
+                        total_lines.saturating_sub(1).min(u16::MAX as usize) as u16;
                 }
                 TuiEvent::Topics(list) => {
                     app.topics = list;
@@ -232,32 +272,52 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     {
                         break Ok(());
                     }
-                    if app.show_help {
-                        match code {
-                            KeyCode::Esc | KeyCode::F(10) => {
-                                app.show_help = false;
-                            }
-                            KeyCode::Up => scroll_help(&mut app, -1),
-                            KeyCode::Down => scroll_help(&mut app, 1),
-                            KeyCode::PageUp => scroll_help(&mut app, -10),
-                            KeyCode::PageDown => scroll_help(&mut app, 10),
-                            KeyCode::Home => app.help_vscroll = 0,
-                            KeyCode::End => jump_help_to_end(&mut app),
-                            _ => {}
-                        }
-                        continue;
-                    }
                     if app.show_history_popup {
                         handle_history_popup_key(&mut app, code, modifiers);
                         continue;
                     }
+                    if matches!(app.screen, Screen::About) {
+                        match code {
+                            KeyCode::Esc | KeyCode::F(10) => {
+                                app.screen = app.last_screen_before_about.unwrap_or(Screen::Home);
+                                continue;
+                            }
+                            KeyCode::Up => {
+                                scroll_help(&mut app, -1);
+                                continue;
+                            }
+                            KeyCode::Down => {
+                                scroll_help(&mut app, 1);
+                                continue;
+                            }
+                            KeyCode::PageUp => {
+                                scroll_help(&mut app, -10);
+                                continue;
+                            }
+                            KeyCode::PageDown => {
+                                scroll_help(&mut app, 10);
+                                continue;
+                            }
+                            KeyCode::Home => {
+                                app.help_vscroll = 0;
+                                continue;
+                            }
+                            KeyCode::End => {
+                                jump_help_to_end(&mut app);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
                     match (code, modifiers) {
                         (KeyCode::F(10), _) => {
-                            if app.show_help {
-                                app.show_help = false;
+                            if matches!(app.screen, Screen::About) {
+                                app.screen = app.last_screen_before_about.unwrap_or(Screen::Home);
                             } else {
-                                app.show_help = true;
+                                app.last_screen_before_about = Some(app.screen);
+                                app.screen = Screen::About;
                                 app.help_vscroll = 0;
+                                app.show_history_popup = false;
                             }
                         }
                         (KeyCode::F(8), _) => {
@@ -395,6 +455,19 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         _ => {}
                                     }
                                 }
+                            } else if matches!(app.screen, Screen::AppConfig) {
+                                ensure_app_config_editor(&mut app);
+                                if let Some(ed) = app.app_config_editor.as_mut() {
+                                    match ed.field_focus {
+                                        AppConfigFieldFocus::TimestampsUseUtc => {
+                                            ed.timestamps_use_utc = !ed.timestamps_use_utc;
+                                        }
+                                        AppConfigFieldFocus::Buttons => {
+                                            attempt_save_app_config(&mut app);
+                                        }
+                                        _ => {}
+                                    }
+                                }
                             } else if matches!(app.focus, super::app::Focus::Host) {
                                 // Open env screen
                                 let (idx, env) = if let Some(env) = app.selected_env() {
@@ -482,6 +555,21 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 }
                                 continue;
                             }
+                            if matches!(app.screen, Screen::AppConfig) {
+                                ensure_app_config_editor(&mut app);
+                                if let Some(ed) = app.app_config_editor.as_mut() {
+                                    match ed.field_focus {
+                                        AppConfigFieldFocus::QueryScanMultiplier => {
+                                            ed.query_scan_multiplier.pop();
+                                        }
+                                        AppConfigFieldFocus::DefaultLimit => {
+                                            ed.default_limit.pop();
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                continue;
+                            }
                             match app.focus {
                                 super::app::Focus::Host => { /* no-op */ }
                                 super::app::Focus::Query => {
@@ -541,6 +629,19 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 if meta_changed {
                                     sync_env_metadata_from_editor(&mut app);
                                 }
+                            } else if matches!(app.screen, Screen::AppConfig) {
+                                ensure_app_config_editor(&mut app);
+                                if let Some(ed) = app.app_config_editor.as_mut() {
+                                    match ed.field_focus {
+                                        AppConfigFieldFocus::QueryScanMultiplier => {
+                                            ed.query_scan_multiplier.pop();
+                                        }
+                                        AppConfigFieldFocus::DefaultLimit => {
+                                            ed.default_limit.pop();
+                                        }
+                                        _ => {}
+                                    }
+                                }
                             } else if matches!(app.focus, super::app::Focus::Query) {
                                 let mut dirty = false;
                                 if has_ctrl_or_alt(m) {
@@ -576,6 +677,30 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         EnvFieldFocus::Buttons => EnvFieldFocus::Name,
                                     };
                                 }
+                            } else if matches!(app.screen, Screen::AppConfig) {
+                                ensure_app_config_editor(&mut app);
+                                if let Some(ed) = app.app_config_editor.as_mut() {
+                                    ed.field_focus = match ed.field_focus {
+                                        AppConfigFieldFocus::QueryScanMultiplier => {
+                                            AppConfigFieldFocus::DefaultLimit
+                                        }
+                                        AppConfigFieldFocus::DefaultLimit => {
+                                            AppConfigFieldFocus::DefaultOrderField
+                                        }
+                                        AppConfigFieldFocus::DefaultOrderField => {
+                                            AppConfigFieldFocus::DefaultOrderDir
+                                        }
+                                        AppConfigFieldFocus::DefaultOrderDir => {
+                                            AppConfigFieldFocus::TimestampsUseUtc
+                                        }
+                                        AppConfigFieldFocus::TimestampsUseUtc => {
+                                            AppConfigFieldFocus::Buttons
+                                        }
+                                        AppConfigFieldFocus::Buttons => {
+                                            AppConfigFieldFocus::QueryScanMultiplier
+                                        }
+                                    };
+                                }
                             } else {
                                 app.next_focus();
                                 if !matches!(app.focus, super::app::Focus::Query) {
@@ -594,6 +719,30 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         EnvFieldFocus::Ca => EnvFieldFocus::PublicKey,
                                         EnvFieldFocus::Conn => EnvFieldFocus::Ca,
                                         EnvFieldFocus::Buttons => EnvFieldFocus::Conn,
+                                    };
+                                }
+                            } else if matches!(app.screen, Screen::AppConfig) {
+                                ensure_app_config_editor(&mut app);
+                                if let Some(ed) = app.app_config_editor.as_mut() {
+                                    ed.field_focus = match ed.field_focus {
+                                        AppConfigFieldFocus::QueryScanMultiplier => {
+                                            AppConfigFieldFocus::Buttons
+                                        }
+                                        AppConfigFieldFocus::DefaultLimit => {
+                                            AppConfigFieldFocus::QueryScanMultiplier
+                                        }
+                                        AppConfigFieldFocus::DefaultOrderField => {
+                                            AppConfigFieldFocus::DefaultLimit
+                                        }
+                                        AppConfigFieldFocus::DefaultOrderDir => {
+                                            AppConfigFieldFocus::DefaultOrderField
+                                        }
+                                        AppConfigFieldFocus::TimestampsUseUtc => {
+                                            AppConfigFieldFocus::DefaultOrderDir
+                                        }
+                                        AppConfigFieldFocus::Buttons => {
+                                            AppConfigFieldFocus::TimestampsUseUtc
+                                        }
                                     };
                                 }
                             }
@@ -657,7 +806,23 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         app.env_store.envs.push(new_env.clone());
                                         app.env_store.selected = Some(app.env_store.envs.len() - 1);
                                     }
-                                    let _ = app.env_store.save();
+                                    match app.env_store.save() {
+                                        Ok(_) => {
+                                            app.env_save_pressed = true;
+                                            app.env_save_deadline =
+                                                Some(Instant::now() + Duration::from_millis(150));
+                                            push_status_line(
+                                                &mut app,
+                                                "✔ Environments saved".to_string(),
+                                            );
+                                        }
+                                        Err(e) => {
+                                            push_status_line(
+                                                &mut app,
+                                                format!("Save failed: {}", e),
+                                            );
+                                        }
+                                    }
                                     if let Some(sel) = app.env_store.selected {
                                         if let Some(e) = app.env_store.envs.get(sel) {
                                             app.host = e.host.clone();
@@ -667,6 +832,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         app.show_env_modal = false;
                                     }
                                 }
+                            } else if matches!(app.screen, Screen::AppConfig) {
+                                ensure_app_config_editor(&mut app);
+                                attempt_save_app_config(&mut app);
                             }
                         }
                         // New (F1)
@@ -705,6 +873,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         sync_env_editor_to_selection(&mut app);
                                     }
                                 }
+                            } else {
+                                app.screen = Screen::AppConfig;
+                                app.show_history_popup = false;
+                                ensure_app_config_editor(&mut app);
                             }
                         }
                         // F5 is context-sensitive: in env modal -> test connection; in results -> copy cell
@@ -726,6 +898,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                     };
                                     // Prefer CA PEM; do not auto-create ssl.ca.location if PEM is provided
                                     // Start debug log
+                                    app.env_test_log.clear();
+                                    app.env_conn_vscroll = 0;
                                     let _ = start_test_log(&host, &ssl);
                                     app.env_test_in_progress = true;
                                     app.env_test_message =
@@ -948,6 +1122,39 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                     sync_env_metadata_from_editor(&mut app);
                                 }
                                 continue;
+                            } else if matches!(app.screen, Screen::AppConfig) {
+                                ensure_app_config_editor(&mut app);
+                                if let Some(ed) = app.app_config_editor.as_mut() {
+                                    if ch == ' ' {
+                                        match ed.field_focus {
+                                            AppConfigFieldFocus::TimestampsUseUtc => {
+                                                ed.timestamps_use_utc = !ed.timestamps_use_utc;
+                                            }
+                                            AppConfigFieldFocus::Buttons => {
+                                                attempt_save_app_config(&mut app);
+                                            }
+                                            _ => {}
+                                        }
+                                        continue;
+                                    }
+                                    match ed.field_focus {
+                                        AppConfigFieldFocus::QueryScanMultiplier => {
+                                            ed.query_scan_multiplier.push(ch);
+                                        }
+                                        AppConfigFieldFocus::DefaultLimit => {
+                                            ed.default_limit.push(ch);
+                                        }
+                                        AppConfigFieldFocus::Buttons => {
+                                            if ch == 'r' || ch == 'R' {
+                                                perform_app_config_reset(&mut app);
+                                            } else if ch == 's' || ch == 'S' {
+                                                attempt_save_app_config(&mut app);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                continue;
                             }
                             match app.focus {
                                 super::app::Focus::Results => {
@@ -977,6 +1184,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         (KeyCode::Esc, _) => {
                             if app.show_env_modal {
                                 app.show_env_modal = false;
+                            } else if matches!(app.screen, Screen::AppConfig) {
+                                app.screen = Screen::Home;
                             } else if matches!(app.focus, super::app::Focus::Query)
                                 && app.autocomplete.as_ref().map(|a| a.active).unwrap_or(false)
                             {
@@ -1017,6 +1226,30 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 if !handled {
                                     move_env_selection(&mut app, -1);
                                 }
+                            } else if matches!(app.screen, Screen::AppConfig) {
+                                ensure_app_config_editor(&mut app);
+                                if let Some(ed) = app.app_config_editor.as_mut() {
+                                    ed.field_focus = match ed.field_focus {
+                                        AppConfigFieldFocus::QueryScanMultiplier => {
+                                            AppConfigFieldFocus::Buttons
+                                        }
+                                        AppConfigFieldFocus::DefaultLimit => {
+                                            AppConfigFieldFocus::QueryScanMultiplier
+                                        }
+                                        AppConfigFieldFocus::DefaultOrderField => {
+                                            AppConfigFieldFocus::DefaultLimit
+                                        }
+                                        AppConfigFieldFocus::DefaultOrderDir => {
+                                            AppConfigFieldFocus::DefaultOrderField
+                                        }
+                                        AppConfigFieldFocus::TimestampsUseUtc => {
+                                            AppConfigFieldFocus::DefaultOrderDir
+                                        }
+                                        AppConfigFieldFocus::Buttons => {
+                                            AppConfigFieldFocus::TimestampsUseUtc
+                                        }
+                                    };
+                                }
                             } else if matches!(app.focus, super::app::Focus::Results) {
                                 if app.selected_row > 0 {
                                     app.selected_row -= 1;
@@ -1050,6 +1283,30 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                 }
                                 if !handled {
                                     move_env_selection(&mut app, 1);
+                                }
+                            } else if matches!(app.screen, Screen::AppConfig) {
+                                ensure_app_config_editor(&mut app);
+                                if let Some(ed) = app.app_config_editor.as_mut() {
+                                    ed.field_focus = match ed.field_focus {
+                                        AppConfigFieldFocus::QueryScanMultiplier => {
+                                            AppConfigFieldFocus::DefaultLimit
+                                        }
+                                        AppConfigFieldFocus::DefaultLimit => {
+                                            AppConfigFieldFocus::DefaultOrderField
+                                        }
+                                        AppConfigFieldFocus::DefaultOrderField => {
+                                            AppConfigFieldFocus::DefaultOrderDir
+                                        }
+                                        AppConfigFieldFocus::DefaultOrderDir => {
+                                            AppConfigFieldFocus::TimestampsUseUtc
+                                        }
+                                        AppConfigFieldFocus::TimestampsUseUtc => {
+                                            AppConfigFieldFocus::Buttons
+                                        }
+                                        AppConfigFieldFocus::Buttons => {
+                                            AppConfigFieldFocus::QueryScanMultiplier
+                                        }
+                                    };
                                 }
                             } else if matches!(app.focus, super::app::Focus::Results) {
                                 let total = total_results_rows(&app);
@@ -1100,6 +1357,26 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         EnvFieldFocus::Buttons => {}
                                     }
                                 }
+                            } else if matches!(app.screen, Screen::AppConfig) {
+                                ensure_app_config_editor(&mut app);
+                                if let Some(ed) = app.app_config_editor.as_mut() {
+                                    match ed.field_focus {
+                                        AppConfigFieldFocus::DefaultOrderField => {
+                                            if ed.default_order_field_idx == 0 {
+                                                ed.default_order_field_idx = 2;
+                                            } else {
+                                                ed.default_order_field_idx -= 1;
+                                            }
+                                        }
+                                        AppConfigFieldFocus::DefaultOrderDir => {
+                                            ed.default_order_dir_idx = 0;
+                                        }
+                                        AppConfigFieldFocus::TimestampsUseUtc => {
+                                            ed.timestamps_use_utc = true;
+                                        }
+                                        _ => {}
+                                    }
+                                }
                             } else if matches!(app.focus, super::app::Focus::Results) {
                                 if matches!(app.results_mode, ResultsMode::Messages) {
                                     if app.selected_col > 0 {
@@ -1144,6 +1421,23 @@ pub async fn run(args: RunArgs) -> Result<()> {
                                         }
                                         EnvFieldFocus::Conn => {}
                                         EnvFieldFocus::Buttons => {}
+                                    }
+                                }
+                            } else if matches!(app.screen, Screen::AppConfig) {
+                                ensure_app_config_editor(&mut app);
+                                if let Some(ed) = app.app_config_editor.as_mut() {
+                                    match ed.field_focus {
+                                        AppConfigFieldFocus::DefaultOrderField => {
+                                            ed.default_order_field_idx =
+                                                (ed.default_order_field_idx + 1) % 3;
+                                        }
+                                        AppConfigFieldFocus::DefaultOrderDir => {
+                                            ed.default_order_dir_idx = 1;
+                                        }
+                                        AppConfigFieldFocus::TimestampsUseUtc => {
+                                            ed.timestamps_use_utc = false;
+                                        }
+                                        _ => {}
                                     }
                                 }
                             } else if matches!(app.focus, super::app::Focus::Results) {
@@ -1229,13 +1523,12 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     }
                 }
                 Event::Mouse(me) => {
-                    if app.show_help {
+                    if matches!(app.screen, Screen::About) {
                         match me.kind {
                             MouseEventKind::ScrollUp => scroll_help(&mut app, -3),
                             MouseEventKind::ScrollDown => scroll_help(&mut app, 3),
                             _ => {}
                         }
-                        continue;
                     }
                     // Also route to textareas in Envs screen for scroll/paste-like mouse actions
                     if matches!(app.screen, Screen::Envs) {
@@ -1246,12 +1539,29 @@ pub async fn run(args: RunArgs) -> Result<()> {
                             ed.ta_ca.input(inp);
                         }
                     }
-                    handle_mouse(&mut app, me);
+                    handle_mouse(&mut app, me, &tx_evt);
                 }
                 Event::Paste(s) => {
                     let mut handled = false;
                     if matches!(app.screen, Screen::Envs) || app.show_env_modal {
                         handled = handle_env_editor_paste(&mut app, &s);
+                    }
+                    if matches!(app.screen, Screen::AppConfig) && !handled {
+                        ensure_app_config_editor(&mut app);
+                        if let Some(ed) = app.app_config_editor.as_mut() {
+                            let text = normalize_plain_input(&s);
+                            match ed.field_focus {
+                                AppConfigFieldFocus::QueryScanMultiplier => {
+                                    ed.query_scan_multiplier.push_str(&text);
+                                    handled = true;
+                                }
+                                AppConfigFieldFocus::DefaultLimit => {
+                                    ed.default_limit.push_str(&text);
+                                    handled = true;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     if !handled && matches!(app.focus, super::app::Focus::Query) {
                         let inserted_non_ws = s.chars().any(|ch| !ch.is_whitespace());
@@ -1352,7 +1662,12 @@ async fn dispatch_query(
                 .selected_env()
                 .map(|e| e.host.clone())
                 .unwrap_or(app.host.clone());
-            let plan_desc = describe_query_plan(&ast);
+            let default_order_override = if ast.order.is_none() {
+                Some(app.app_config.default_order())
+            } else {
+                None
+            };
+            let plan_desc = describe_query_plan(&ast, default_order_override);
             let prefix = if is_rerun {
                 "Re-running last query"
             } else {
@@ -1369,8 +1684,15 @@ async fn dispatch_query(
             run_args.broker = env_host;
             app.clamp_selection();
             let ssl = app.current_ssl_config();
-            spawn_pipeline_with_ssl(run_args, query.clone(), *run_counter, tx_evt.clone(), ssl)
-                .await;
+            spawn_pipeline_with_ssl(
+                run_args,
+                query.clone(),
+                *run_counter,
+                tx_evt.clone(),
+                ssl,
+                app.app_config.clone(),
+            )
+            .await;
             app.record_query_history(&query);
             app.last_executed_query = Some(query);
         }
@@ -1460,9 +1782,12 @@ async fn spawn_pipeline_with_ssl(
     run_id: u64,
     tx: mpsc::UnboundedSender<TuiEvent>,
     ssl: Option<crate::models::SslConfig>,
+    app_config: AppConfig,
 ) {
     tokio::spawn(async move {
-        if let Err(e) = run_pipeline_with_ssl(args, query_text, run_id, tx.clone(), ssl).await {
+        if let Err(e) =
+            run_pipeline_with_ssl(args, query_text, run_id, tx.clone(), ssl, app_config).await
+        {
             let _ = tx.send(TuiEvent::Error {
                 run_id,
                 message: e.to_string(),
@@ -1477,11 +1802,11 @@ async fn run_pipeline_with_ssl(
     run_id: u64,
     tx: mpsc::UnboundedSender<TuiEvent>,
     ssl: Option<crate::models::SslConfig>,
+    app_config: AppConfig,
 ) -> Result<()> {
-    let ast = parse_query(&query_text).context("Failed to parse query")?;
+    let mut ast = parse_query(&query_text).context("Failed to parse query")?;
     let topic = ast.from.clone();
     let keys_only = !ast.select.iter().any(|i| matches!(i, SelectItem::Value));
-    let base_limit = ast.limit.or(args.max_messages);
 
     let mut cfg = ClientConfig::new();
     cfg.set("bootstrap.servers", &args.broker)
@@ -1523,6 +1848,15 @@ async fn run_pipeline_with_ssl(
         .ok_or_else(|| anyhow!("Topic not found: {}", topic))?;
     let partitions: Vec<i32> = topic_md.partitions().iter().map(|p| p.id()).collect();
     let partition_count = partitions.len().max(1);
+    if ast.order.is_none() {
+        let (field, dir) = app_config.default_order();
+        ast.order = Some(OrderSpec { field, dir });
+    }
+    let base_limit = ast
+        .limit
+        .or(args.max_messages)
+        .or_else(|| app_config.default_limit)
+        .or_else(|| Some(app_config.query_scan_multiplier * partition_count));
     let plan = ast.execution_plan(partition_count, base_limit);
     let max_messages_global = Some(plan.n_global);
     let order_desc = plan.order_desc;
@@ -1548,8 +1882,9 @@ async fn run_pipeline_with_ssl(
         let q = Some(query_arc.clone());
         let limit = query_limit;
         let ssl_clone = ssl.clone();
+        let multiplier = app_config.query_scan_multiplier;
         joinset.spawn(async move {
-            spawn_partition_consumer(a, p, offset_spec, txp, q, limit, ssl_clone).await
+            spawn_partition_consumer(a, p, offset_spec, txp, q, limit, ssl_clone, multiplier).await
         });
     }
     drop(tx_msg);
@@ -1637,9 +1972,7 @@ fn sanitize(name: &str) -> String {
 }
 
 fn logs_dir() -> std::path::PathBuf {
-    std::env::var("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".rkl").join("logs"))
-        .unwrap_or_else(|_| std::path::PathBuf::from(".rkl").join("logs"))
+    crate::paths::logs_dir()
 }
 
 fn append_test_log_line(line: &str) {
@@ -1686,20 +2019,31 @@ fn copy_to_clipboard(s: &str) -> Result<()> {
     Ok(())
 }
 
-fn describe_query_plan(ast: &SelectQuery) -> String {
-    let order_label = match ast.order.as_ref().map(|o| (o.field, o.dir)) {
-        Some((OrderField::Timestamp, OrderDir::Asc)) => "timestamp ASC".to_string(),
-        Some((OrderField::Timestamp, OrderDir::Desc)) => "timestamp DESC".to_string(),
-        Some((OrderField::Poffset, OrderDir::Asc)) => "poffset ASC".to_string(),
-        Some((OrderField::Poffset, OrderDir::Desc)) => "poffset DESC".to_string(),
-        Some((OrderField::PoffsetTs, OrderDir::Asc)) => {
+fn describe_query_plan(ast: &SelectQuery, default_order: Option<(OrderField, OrderDir)>) -> String {
+    let (field, dir, is_default, from_config) = match (ast.order.as_ref(), default_order) {
+        (Some(spec), _) => (spec.field, spec.dir, false, false),
+        (None, Some((f, d))) => (f, d, true, true),
+        (None, None) => (OrderField::Poffset, OrderDir::Desc, true, false),
+    };
+    let mut order_label = match (field, dir) {
+        (OrderField::Timestamp, OrderDir::Asc) => "timestamp ASC".to_string(),
+        (OrderField::Timestamp, OrderDir::Desc) => "timestamp DESC".to_string(),
+        (OrderField::Poffset, OrderDir::Asc) => "poffset ASC".to_string(),
+        (OrderField::Poffset, OrderDir::Desc) => "poffset DESC".to_string(),
+        (OrderField::PoffsetTs, OrderDir::Asc) => {
             "poffset_ts ASC (scan by offset, sort by timestamp)".to_string()
         }
-        Some((OrderField::PoffsetTs, OrderDir::Desc)) => {
+        (OrderField::PoffsetTs, OrderDir::Desc) => {
             "poffset_ts DESC (scan by offset, sort by timestamp)".to_string()
         }
-        None => "poffset DESC (default)".to_string(),
     };
+    if is_default {
+        if from_config {
+            order_label.push_str(" (default from config)");
+        } else {
+            order_label.push_str(" (default)");
+        }
+    }
     let mut parts = vec![format!("order={}", order_label)];
     if let Some(bounds) = ast
         .r#where
@@ -1855,6 +2199,102 @@ fn handle_env_editor_paste(app: &mut AppState, raw: &str) -> bool {
     handled
 }
 
+fn ensure_app_config_editor(app: &mut AppState) {
+    if app.app_config_editor.is_none() {
+        let ed = build_app_config_editor(&app.app_config);
+        app.app_config_editor = Some(ed);
+    }
+}
+
+fn ensure_env_editor(app: &mut AppState) {
+    if app.env_editor.is_none() {
+        let (idx, env) = if let Some(i) = app.env_store.selected {
+            if let Some(e) = app.env_store.envs.get(i) {
+                (Some(i), e.clone())
+            } else {
+                (None, Environment::default())
+            }
+        } else {
+            (None, Environment::default())
+        };
+        let mut editor = build_env_editor_from_env(&env, idx);
+        editor.name_cursor = editor.name.len();
+        editor.host_cursor = editor.host.len();
+        app.env_editor = Some(editor);
+    }
+}
+
+fn save_app_config_from_editor(app: &mut AppState) -> Result<()> {
+    let Some(ed) = app.app_config_editor.as_ref() else {
+        return Ok(());
+    };
+    let mul: usize = ed
+        .query_scan_multiplier
+        .trim()
+        .parse()
+        .context("query scan multiplier must be a positive number")?;
+    if mul == 0 {
+        anyhow::bail!("query scan multiplier must be > 0");
+    }
+    let default_limit = if ed.default_limit.trim().is_empty() {
+        None
+    } else {
+        let parsed: usize = ed
+            .default_limit
+            .trim()
+            .parse()
+            .context("default LIMIT must be a positive number")?;
+        Some(parsed)
+    };
+    let order_field = match ed.default_order_field_idx {
+        0 => DefaultOrderField::Timestamp,
+        1 => DefaultOrderField::Poffset,
+        _ => DefaultOrderField::PoffsetTs,
+    };
+    let order_dir = match ed.default_order_dir_idx {
+        0 => DefaultOrderDir::Asc,
+        _ => DefaultOrderDir::Desc,
+    };
+    let mut cfg = app.app_config.clone();
+    cfg.query_scan_multiplier = mul;
+    cfg.default_limit = default_limit;
+    cfg.default_order_field = order_field;
+    cfg.default_order_dir = order_dir;
+    cfg.default_timestamps_use_utc = ed.timestamps_use_utc;
+    cfg.save()?;
+    app.app_config = cfg;
+    app.timestamps_use_utc = app.app_config.default_timestamps_use_utc;
+    Ok(())
+}
+
+fn reset_app_config(app: &mut AppState) -> Result<()> {
+    app.app_config = AppConfig::default();
+    app.app_config.save()?;
+    app.app_config_editor = Some(build_app_config_editor(&app.app_config));
+    app.timestamps_use_utc = app.app_config.default_timestamps_use_utc;
+    Ok(())
+}
+
+fn attempt_save_app_config(app: &mut AppState) {
+    match save_app_config_from_editor(app) {
+        Ok(()) => {
+            app.app_config_save_pressed = true;
+            app.app_config_save_deadline = Some(Instant::now() + Duration::from_millis(150));
+            push_status_line(app, "✔ App config saved".to_string());
+        }
+        Err(e) => push_status_line(app, format!("App config error: {}", e)),
+    }
+}
+
+fn perform_app_config_reset(app: &mut AppState) {
+    match reset_app_config(app) {
+        Ok(()) => {
+            push_status_line(app, "App config reset to defaults".to_string());
+        }
+        Err(e) => push_status_line(app, format!("Reset failed: {}", e)),
+    }
+}
+
 fn move_env_selection(app: &mut AppState, delta: isize) {
     if app.env_store.envs.is_empty() {
         return;
@@ -1899,7 +2339,7 @@ fn load_env_into_editor(ed: &mut EnvEditor, env: &Environment, idx: usize) {
 }
 
 fn text_area_from_string(input: String) -> TextArea<'static> {
-    let decoded = decode_display(&input);
+    let decoded = decode_literal_backslash_n(&input);
     let mut ta = TextArea::from(decoded.lines());
     ta.set_tab_length(0);
     ta
@@ -2037,11 +2477,10 @@ fn find_history_query_position(haystack: &str, needle: &str) -> Option<usize> {
     None
 }
 
-fn handle_mouse(app: &mut AppState, me: MouseEvent) {
+fn handle_mouse(app: &mut AppState, me: MouseEvent, tx_evt: &mpsc::UnboundedSender<TuiEvent>) {
     if app.mouse_selection_mode {
         return;
     }
-    // Compute the layout rects like ui.rs to know where the table and json panes are
     let (w, h) = crossterm::terminal::size().unwrap_or((0, 0));
     let root = Rect {
         x: 0,
@@ -2049,70 +2488,117 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
         width: w,
         height: h,
     };
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(10),
-            Constraint::Fill(1),
-            Constraint::Length(3),
-        ])
-        .split(root);
-    let query_area = rows[1];
-    // Split row into editor and status
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-        .split(query_area);
-    let status_rect = cols[1];
-    let status_inner = Rect {
-        x: status_rect.x.saturating_add(1),
-        y: status_rect.y.saturating_add(1),
-        width: status_rect.width.saturating_sub(2),
-        height: status_rect.height.saturating_sub(2),
-    };
-    // Derive editor inner & content rects (gutter width 6, border 1)
-    let q_inner = Rect {
-        x: query_area.x.saturating_add(1),
-        y: query_area.y.saturating_add(1),
-        width: query_area.width.saturating_sub(2),
-        height: query_area.height.saturating_sub(2),
-    };
-    let q_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(6), Constraint::Min(1)])
-        .split(q_inner);
-    let _q_gutter = q_cols[0];
-    let q_content = q_cols[1];
-    let results_area = rows[2];
-    let (table_rect, json_rect_opt) = if matches!(app.results_mode, ResultsMode::Messages) {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-            .split(results_area);
-        (cols[0], Some(cols[1]))
-    } else {
-        (results_area, None)
-    };
-    let json_inner = json_rect_opt.map(|json_rect| Rect {
-        x: json_rect.x.saturating_add(1),
-        y: json_rect.y.saturating_add(1),
-        width: json_rect.width.saturating_sub(2),
-        height: json_rect.height.saturating_sub(2),
-    });
-
     let mx = me.column;
     let my = me.row;
+    let rows = match app.screen {
+        Screen::Home => Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(10),
+                Constraint::Fill(1),
+                Constraint::Length(3),
+            ])
+            .split(root),
+        Screen::Envs => Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Fill(1),
+                Constraint::Length(3),
+            ])
+            .split(root),
+        Screen::Info => Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Fill(1),
+                Constraint::Length(3),
+            ])
+            .split(root),
+        Screen::AppConfig | Screen::About => Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Fill(1),
+                Constraint::Length(3),
+            ])
+            .split(root),
+    };
 
-    match me.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(field_rects) = env_editor_fields(app, root) {
-                if handle_env_copy_paste_click(app, &field_rects, mx, my) {
-                    return;
+    if let MouseEventKind::Down(MouseButton::Left) = me.kind {
+        if let Some(screen) = super::ui::main_menu_hit_test(rows[0], mx, my) {
+            if screen != app.screen {
+                if matches!(screen, Screen::About) {
+                    app.last_screen_before_about = Some(app.screen);
+                    app.help_vscroll = 0;
+                }
+                app.screen = screen;
+                app.menu_pressed_screen = Some(screen);
+                app.menu_pressed_deadline = Some(Instant::now() + Duration::from_millis(150));
+                app.show_history_popup = false;
+                app.autocomplete = None;
+                if matches!(screen, Screen::Info) {
+                    app.topics_last_fetched_at = Some(Instant::now());
+                    fetch_topics_async(&app, tx_evt.clone());
+                }
+                if matches!(screen, Screen::AppConfig) {
+                    ensure_app_config_editor(app);
+                }
+                if matches!(screen, Screen::Envs) {
+                    ensure_env_editor(app);
                 }
             }
-            // Status copy button click
-            {
+            return;
+        }
+    }
+
+    match me.kind {
+        MouseEventKind::Down(MouseButton::Left) => match app.screen {
+            Screen::Home => {
+                let query_area = rows[2];
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+                    .split(query_area);
+                let status_rect = cols[1];
+                let status_inner = Rect {
+                    x: status_rect.x.saturating_add(1),
+                    y: status_rect.y.saturating_add(1),
+                    width: status_rect.width.saturating_sub(2),
+                    height: status_rect.height.saturating_sub(2),
+                };
+                let q_inner = Rect {
+                    x: query_area.x.saturating_add(1),
+                    y: query_area.y.saturating_add(1),
+                    width: query_area.width.saturating_sub(2),
+                    height: query_area.height.saturating_sub(2),
+                };
+                let q_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Length(6), Constraint::Min(1)])
+                    .split(q_inner);
+                let q_content = q_cols[1];
+                let results_area = rows[3];
+                let (table_rect, json_rect_opt) =
+                    if matches!(app.results_mode, ResultsMode::Messages) {
+                        let cols = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+                            .split(results_area);
+                        (cols[0], Some(cols[1]))
+                    } else {
+                        (results_area, None)
+                    };
+                let json_inner = json_rect_opt.map(|json_rect| Rect {
+                    x: json_rect.x.saturating_add(1),
+                    y: json_rect.y.saturating_add(1),
+                    width: json_rect.width.saturating_sub(2),
+                    height: json_rect.height.saturating_sub(2),
+                });
+
                 let label = "[ Copy ]";
                 let btn_w = label.chars().count() as u16;
                 if status_inner.width >= btn_w {
@@ -2137,284 +2623,413 @@ fn handle_mouse(app: &mut AppState, me: MouseEvent) {
                         return;
                     }
                 }
-            }
 
-            if point_in(mx, my, q_content) {
-                // Position cursor by click
-                let y_rel = my.saturating_sub(q_content.y) as usize;
-                let target_line = app.input_vscroll as usize + y_rel;
-                let line_starts = compute_line_starts(&app.input);
-                let line = target_line.min(line_starts.len().saturating_sub(1));
-                let line_start = line_starts[line];
-                let line_end = if line + 1 < line_starts.len() {
-                    line_starts[line + 1] - 1
-                } else {
-                    app.input.len()
-                };
-                let x_rel = mx.saturating_sub(q_content.x) as usize;
-                let col = x_rel.min(line_end.saturating_sub(line_start));
-                let prev_cursor = app.input_cursor;
-                app.input_cursor = line_start + col;
-                ensure_input_cursor_visible(app);
-                if app.input_cursor != prev_cursor {
-                    app.parse_status_dirty = true;
+                if point_in(mx, my, q_content) {
+                    let y_rel = my.saturating_sub(q_content.y) as usize;
+                    let target_line = app.input_vscroll as usize + y_rel;
+                    let line_starts = compute_line_starts(&app.input);
+                    let line = target_line.min(line_starts.len().saturating_sub(1));
+                    let line_start = line_starts[line];
+                    let line_end = if line + 1 < line_starts.len() {
+                        line_starts[line + 1] - 1
+                    } else {
+                        app.input.len()
+                    };
+                    let x_rel = mx.saturating_sub(q_content.x) as usize;
+                    let col = x_rel.min(line_end.saturating_sub(line_start));
+                    let prev_cursor = app.input_cursor;
+                    app.input_cursor = line_start + col;
+                    ensure_input_cursor_visible(app);
+                    if app.input_cursor != prev_cursor {
+                        app.parse_status_dirty = true;
+                    }
+                    return;
                 }
-                return;
-            }
-            if point_in(mx, my, table_rect) {
-                match app.results_mode {
-                    ResultsMode::Messages => {
-                        if let Some(rect) = timestamp_toggle_button_rect(table_rect, app) {
-                            if point_in(mx, my, rect) {
-                                toggle_timestamp_display(app);
-                                return;
-                            }
-                        }
-                        let data_rect = table_rect;
-                        let data_start_y = data_rect.y.saturating_add(2);
-                        if my >= data_start_y
-                            && my
-                                < data_rect
-                                    .y
-                                    .saturating_add(data_rect.height.saturating_sub(1))
-                            && !app.rows.is_empty()
-                        {
-                            let y_rel = (my - data_start_y) as usize;
-                            let visible_rows = data_rect.height.saturating_sub(3) as usize;
-                            let approx_first = app.selected_row.saturating_sub(visible_rows / 2);
-                            let new_row =
-                                (approx_first + y_rel).min(app.rows.len().saturating_sub(1));
-                            if new_row != app.selected_row {
-                                app.selected_row = new_row;
-                                app.json_vscroll = 0;
-                            }
-                        }
-
-                        let inner_x = data_rect.x.saturating_add(1);
-                        if mx >= inner_x {
-                            let mut x_rel = (mx - inner_x) as usize;
-                            let mut col = 0usize;
-                            let widths: Vec<usize> = app
-                                .selected_columns
-                                .iter()
-                                .enumerate()
-                                .map(|(i, c)| {
-                                    let mut w = runner_column_width_hint(*c);
-                                    if i + 1 < app.selected_columns.len() {
-                                        w = w.saturating_add(1);
-                                    }
-                                    w
-                                })
-                                .collect();
-                            if !widths.is_empty() {
-                                for (i, w) in widths.iter().enumerate() {
-                                    if *w == usize::MAX {
-                                        col = i;
-                                        break;
-                                    }
-                                    if x_rel < *w {
-                                        col = i;
-                                        break;
-                                    } else {
-                                        x_rel = x_rel.saturating_sub(*w);
-                                    }
+                if point_in(mx, my, table_rect) {
+                    match app.results_mode {
+                        ResultsMode::Messages => {
+                            if let Some(rect) = timestamp_toggle_button_rect(table_rect, app) {
+                                if point_in(mx, my, rect) {
+                                    toggle_timestamp_display(app);
+                                    return;
                                 }
-                                if col >= widths.len() {
-                                    col = widths.len() - 1;
-                                }
-                                if app.selected_col != col {
-                                    app.selected_col = col;
+                            }
+                            let data_rect = table_rect;
+                            let data_start_y = data_rect.y.saturating_add(2);
+                            if my >= data_start_y
+                                && my
+                                    < data_rect
+                                        .y
+                                        .saturating_add(data_rect.height.saturating_sub(1))
+                                && !app.rows.is_empty()
+                            {
+                                let y_rel = (my - data_start_y) as usize;
+                                let visible_rows = data_rect.height.saturating_sub(3) as usize;
+                                let approx_first =
+                                    app.selected_row.saturating_sub(visible_rows / 2);
+                                let new_row =
+                                    (approx_first + y_rel).min(app.rows.len().saturating_sub(1));
+                                if new_row != app.selected_row {
+                                    app.selected_row = new_row;
                                     app.json_vscroll = 0;
                                 }
                             }
-                        }
-                    }
-                    ResultsMode::TopicList => {
-                        let data_start_y = table_rect.y.saturating_add(2);
-                        if my >= data_start_y
-                            && my
-                                < table_rect
-                                    .y
-                                    .saturating_add(table_rect.height.saturating_sub(1))
-                            && !app.topics_with_partitions.is_empty()
-                        {
-                            let y_rel = (my - data_start_y) as usize;
-                            let visible_rows = table_rect.height.saturating_sub(3) as usize;
-                            let approx_first = app.selected_row.saturating_sub(visible_rows / 2);
-                            let new_row = (approx_first + y_rel)
-                                .min(app.topics_with_partitions.len().saturating_sub(1));
-                            app.selected_row = new_row;
-                        }
-                    }
-                }
-            } else if let Some(json_rect) = json_rect_opt {
-                if point_in(mx, my, json_rect) {
-                    if let Some(inner) = json_inner {
-                        let label = "[ Copy ]";
-                        let btn_w = label.chars().count() as u16;
-                        if inner.width >= btn_w {
-                            let btn_rect = Rect {
-                                x: inner.x + inner.width - btn_w,
-                                y: inner.y,
-                                width: btn_w,
-                                height: 1,
-                            };
-                            if point_in(mx, my, btn_rect) {
-                                if let Some(s) = selected_cell_text(app) {
-                                    if let Err(e) = copy_to_clipboard(&s) {
-                                        push_status_line(app, format!("Clipboard error: {}", e));
-                                    } else {
-                                        push_status_line(app, "Payload copied".to_string());
+
+                            let inner_x = data_rect.x.saturating_add(1);
+                            if mx >= inner_x {
+                                let mut x_rel = (mx - inner_x) as usize;
+                                let mut col = 0usize;
+                                let widths: Vec<usize> = app
+                                    .selected_columns
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, c)| {
+                                        let mut w = runner_column_width_hint(*c);
+                                        if i + 1 < app.selected_columns.len() {
+                                            w = w.saturating_add(1);
+                                        }
+                                        w
+                                    })
+                                    .collect();
+                                if !widths.is_empty() {
+                                    for (i, w) in widths.iter().enumerate() {
+                                        if *w == usize::MAX {
+                                            col = i;
+                                            break;
+                                        }
+                                        if x_rel < *w {
+                                            col = i;
+                                            break;
+                                        } else {
+                                            x_rel = x_rel.saturating_sub(*w);
+                                        }
                                     }
-                                    app.copy_btn_pressed = true;
-                                    app.copy_btn_deadline =
-                                        Some(Instant::now() + Duration::from_millis(150));
-                                } else {
-                                    push_status_line(app, "No payload to copy".to_string());
+                                    if col >= widths.len() {
+                                        col = widths.len() - 1;
+                                    }
+                                    if app.selected_col != col {
+                                        app.selected_col = col;
+                                        app.json_vscroll = 0;
+                                    }
                                 }
-                                return;
+                            }
+                        }
+                        ResultsMode::TopicList => {
+                            let data_start_y = table_rect.y.saturating_add(2);
+                            if my >= data_start_y
+                                && my
+                                    < table_rect
+                                        .y
+                                        .saturating_add(table_rect.height.saturating_sub(1))
+                                && !app.topics_with_partitions.is_empty()
+                            {
+                                let y_rel = (my - data_start_y) as usize;
+                                let visible_rows = table_rect.height.saturating_sub(3) as usize;
+                                let approx_first =
+                                    app.selected_row.saturating_sub(visible_rows / 2);
+                                let new_row = (approx_first + y_rel)
+                                    .min(app.topics_with_partitions.len().saturating_sub(1));
+                                app.selected_row = new_row;
                             }
                         }
                     }
-                    // Otherwise, ignore; allow native selection by terminal
+                } else if let Some(json_rect) = json_rect_opt {
+                    if point_in(mx, my, json_rect) {
+                        if let Some(inner) = json_inner {
+                            let label = "[ Copy ]";
+                            let btn_w = label.chars().count() as u16;
+                            if inner.width >= btn_w {
+                                let btn_rect = Rect {
+                                    x: inner.x + inner.width - btn_w,
+                                    y: inner.y,
+                                    width: btn_w,
+                                    height: 1,
+                                };
+                                if point_in(mx, my, btn_rect) {
+                                    if let Some(s) = selected_cell_text(app) {
+                                        if let Err(e) = copy_to_clipboard(&s) {
+                                            push_status_line(
+                                                app,
+                                                format!("Clipboard error: {}", e),
+                                            );
+                                        } else {
+                                            push_status_line(app, "Payload copied".to_string());
+                                        }
+                                        app.copy_btn_pressed = true;
+                                        app.copy_btn_deadline =
+                                            Some(Instant::now() + Duration::from_millis(150));
+                                    } else {
+                                        push_status_line(app, "No payload to copy".to_string());
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 }
             }
-        }
-        MouseEventKind::ScrollUp => {
-            if app.show_env_modal {
-                // Build modal fields again
-                let popup_rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Percentage(10),
-                        Constraint::Percentage(80),
-                        Constraint::Percentage(10),
-                    ])
-                    .split(root);
-                let center_v = popup_rows[1];
-                let popup_cols = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Percentage(10),
-                        Constraint::Percentage(80),
-                        Constraint::Percentage(10),
-                    ])
-                    .split(center_v);
-                let area = popup_cols[1];
-                let cols2 = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-                    .margin(1)
-                    .split(area);
-                let fields = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Length(3),
-                        Constraint::Min(5),
-                        Constraint::Min(5),
-                        Constraint::Min(5),
-                        Constraint::Length(3),
-                        Constraint::Length(3),
-                    ])
-                    .split(cols2[1]);
-                if let Some(ed) = app.env_editor.as_mut() {
-                    // route scroll to textareas
-                    let inp = ta_input_from_mouse(me);
-                    ed.ta_private.input(inp.clone());
-                    ed.ta_public.input(inp.clone());
-                    ed.ta_ca.input(inp);
-                }
-                if point_in(mx, my, fields[6]) {
-                    app.env_conn_vscroll = app.env_conn_vscroll.saturating_sub(1);
-                    return;
+            Screen::Envs => {
+                if let Some(field_rects) = env_editor_fields(app, rows[1]) {
+                    if handle_env_copy_paste_click(app, &field_rects, mx, my) {
+                        return;
+                    }
                 }
             }
-            if point_in(mx, my, q_content) {
-                app.input_vscroll = app.input_vscroll.saturating_sub(1);
-            } else if point_in(mx, my, table_rect) {
-                if app.selected_row > 0 {
-                    app.selected_row -= 1;
+            Screen::AppConfig => {
+                ensure_app_config_editor(app);
+                if let Some((fields, actions_rect)) = app_config_field_rects(rows[1]) {
+                    if let Some(ed) = app.app_config_editor.as_mut() {
+                        if detect_title_button(
+                            fields[0],
+                            mx,
+                            my,
+                            &[
+                                (TitleButton::Copy, ENV_COPY_LABEL),
+                                (TitleButton::Paste, ENV_PASTE_LABEL),
+                                (TitleButton::Clear, ENV_CLEAR_LABEL),
+                            ],
+                        )
+                        .map(|b| match b {
+                            TitleButton::Copy => {
+                                let _ = copy_to_clipboard(&ed.query_scan_multiplier);
+                            }
+                            TitleButton::Paste => {
+                                if let Some(text) = read_clipboard_text() {
+                                    ed.query_scan_multiplier
+                                        .push_str(&normalize_plain_input(&text));
+                                }
+                            }
+                            TitleButton::Clear => {
+                                ed.query_scan_multiplier.clear();
+                            }
+                        })
+                        .is_some()
+                        {
+                            ed.field_focus = AppConfigFieldFocus::QueryScanMultiplier;
+                            return;
+                        }
+                        if detect_title_button(
+                            fields[1],
+                            mx,
+                            my,
+                            &[
+                                (TitleButton::Copy, ENV_COPY_LABEL),
+                                (TitleButton::Paste, ENV_PASTE_LABEL),
+                                (TitleButton::Clear, ENV_CLEAR_LABEL),
+                            ],
+                        )
+                        .map(|b| match b {
+                            TitleButton::Copy => {
+                                let _ = copy_to_clipboard(&ed.default_limit);
+                            }
+                            TitleButton::Paste => {
+                                if let Some(text) = read_clipboard_text() {
+                                    ed.default_limit.push_str(&normalize_plain_input(&text));
+                                }
+                            }
+                            TitleButton::Clear => {
+                                ed.default_limit.clear();
+                            }
+                        })
+                        .is_some()
+                        {
+                            ed.field_focus = AppConfigFieldFocus::DefaultLimit;
+                            return;
+                        }
+                        if point_in(mx, my, fields[0]) {
+                            ed.field_focus = AppConfigFieldFocus::QueryScanMultiplier;
+                            return;
+                        }
+                        if point_in(mx, my, fields[1]) {
+                            ed.field_focus = AppConfigFieldFocus::DefaultLimit;
+                            return;
+                        }
+                        if point_in(mx, my, fields[2]) {
+                            let inner = Rect {
+                                x: fields[2].x.saturating_add(1),
+                                y: fields[2].y.saturating_add(1),
+                                width: fields[2].width.saturating_sub(2),
+                                height: fields[2].height.saturating_sub(2),
+                            };
+                            if inner.width > 0 {
+                                let seg = inner.width / 3;
+                                let rel = mx.saturating_sub(inner.x);
+                                let idx = if seg == 0 {
+                                    0
+                                } else {
+                                    (rel / seg).min(2) as usize
+                                };
+                                ed.default_order_field_idx = idx;
+                            }
+                            ed.field_focus = AppConfigFieldFocus::DefaultOrderField;
+                            return;
+                        }
+                        if point_in(mx, my, fields[3]) {
+                            let inner = Rect {
+                                x: fields[3].x.saturating_add(1),
+                                y: fields[3].y.saturating_add(1),
+                                width: fields[3].width.saturating_sub(2),
+                                height: fields[3].height.saturating_sub(2),
+                            };
+                            let rel = mx.saturating_sub(inner.x);
+                            if inner.width > 0 && rel < inner.width {
+                                ed.default_order_dir_idx =
+                                    if rel < inner.width / 2 { 0 } else { 1 };
+                            }
+                            ed.field_focus = AppConfigFieldFocus::DefaultOrderDir;
+                            return;
+                        }
+                        if point_in(mx, my, fields[4]) {
+                            let inner = Rect {
+                                x: fields[4].x.saturating_add(1),
+                                y: fields[4].y.saturating_add(1),
+                                width: fields[4].width.saturating_sub(2),
+                                height: fields[4].height.saturating_sub(2),
+                            };
+                            let rel = mx.saturating_sub(inner.x);
+                            if inner.width > 0 && rel < inner.width {
+                                ed.timestamps_use_utc = rel < inner.width / 2;
+                            }
+                            ed.field_focus = AppConfigFieldFocus::TimestampsUseUtc;
+                            return;
+                        }
+                        if let Some(action) = detect_app_config_action(actions_rect, mx, my) {
+                            match action {
+                                AppConfigAction::Save => attempt_save_app_config(app),
+                                AppConfigAction::Reset => perform_app_config_reset(app),
+                            }
+                            return;
+                        }
+                    }
                 }
-            } else if matches!(app.results_mode, ResultsMode::Messages) {
-                if let Some(json_rect) = json_rect_opt {
+            }
+            _ => {}
+        },
+        MouseEventKind::ScrollUp => match app.screen {
+            Screen::Home => {
+                let query_area = rows[2];
+                let q_inner = Rect {
+                    x: query_area.x.saturating_add(1),
+                    y: query_area.y.saturating_add(1),
+                    width: query_area.width.saturating_sub(2),
+                    height: query_area.height.saturating_sub(2),
+                };
+                let q_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Length(6), Constraint::Min(1)])
+                    .split(q_inner);
+                let q_content = q_cols[1];
+                let results_area = rows[3];
+                let (table_rect, json_rect_opt) =
+                    if matches!(app.results_mode, ResultsMode::Messages) {
+                        let cols = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+                            .split(results_area);
+                        (cols[0], Some(cols[1]))
+                    } else {
+                        (results_area, None)
+                    };
+                if point_in(mx, my, q_content) {
+                    app.input_vscroll = app.input_vscroll.saturating_sub(1);
+                } else if point_in(mx, my, table_rect) {
+                    if app.selected_row > 0 {
+                        app.selected_row -= 1;
+                    }
+                } else if let Some(json_rect) = json_rect_opt {
                     if point_in(mx, my, json_rect) {
                         app.json_vscroll = app.json_vscroll.saturating_sub(1);
                     }
                 }
             }
-        }
-        MouseEventKind::ScrollDown => {
-            if app.show_env_modal {
-                let popup_rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Percentage(10),
-                        Constraint::Percentage(80),
-                        Constraint::Percentage(10),
-                    ])
-                    .split(root);
-                let center_v = popup_rows[1];
-                let popup_cols = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Percentage(10),
-                        Constraint::Percentage(80),
-                        Constraint::Percentage(10),
-                    ])
-                    .split(center_v);
-                let area = popup_cols[1];
-                let cols2 = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-                    .margin(1)
-                    .split(area);
-                let fields = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Length(3),
-                        Constraint::Min(5),
-                        Constraint::Min(5),
-                        Constraint::Min(5),
-                        Constraint::Length(3),
-                        Constraint::Length(3),
-                    ])
-                    .split(cols2[1]);
-                if let Some(ed) = app.env_editor.as_mut() {
-                    let inp = ta_input_from_mouse(me);
-                    ed.ta_private.input(inp.clone());
-                    ed.ta_public.input(inp.clone());
-                    ed.ta_ca.input(inp);
-                }
-                if point_in(mx, my, fields[6]) {
-                    app.env_conn_vscroll = app.env_conn_vscroll.saturating_add(1);
-                    return;
+            Screen::Envs => {
+                if let Some(fields) = env_editor_fields(app, rows[1]) {
+                    if point_in(mx, my, fields[6]) {
+                        app.env_conn_vscroll = app.env_conn_vscroll.saturating_sub(1);
+                    }
                 }
             }
-            if point_in(mx, my, q_content) {
-                app.input_vscroll = app.input_vscroll.saturating_add(1);
-            } else if point_in(mx, my, table_rect) {
-                let total = total_results_rows(app);
-                if total > 0 && app.selected_row + 1 < total {
-                    app.selected_row += 1;
-                }
-            } else if matches!(app.results_mode, ResultsMode::Messages) {
-                if let Some(json_rect) = json_rect_opt {
+            _ => {}
+        },
+        MouseEventKind::ScrollDown => match app.screen {
+            Screen::Home => {
+                let query_area = rows[2];
+                let q_inner = Rect {
+                    x: query_area.x.saturating_add(1),
+                    y: query_area.y.saturating_add(1),
+                    width: query_area.width.saturating_sub(2),
+                    height: query_area.height.saturating_sub(2),
+                };
+                let q_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Length(6), Constraint::Min(1)])
+                    .split(q_inner);
+                let q_content = q_cols[1];
+                let results_area = rows[3];
+                let (table_rect, json_rect_opt) =
+                    if matches!(app.results_mode, ResultsMode::Messages) {
+                        let cols = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+                            .split(results_area);
+                        (cols[0], Some(cols[1]))
+                    } else {
+                        (results_area, None)
+                    };
+                if point_in(mx, my, q_content) {
+                    app.input_vscroll = app.input_vscroll.saturating_add(1);
+                } else if point_in(mx, my, table_rect) {
+                    let total = total_results_rows(app);
+                    if total > 0 && app.selected_row + 1 < total {
+                        app.selected_row += 1;
+                    }
+                } else if let Some(json_rect) = json_rect_opt {
                     if point_in(mx, my, json_rect) {
                         app.json_vscroll = app.json_vscroll.saturating_add(1);
                     }
                 }
             }
-        }
+            Screen::Envs => {
+                if let Some(fields) = env_editor_fields(app, rows[1]) {
+                    if point_in(mx, my, fields[6]) {
+                        app.env_conn_vscroll = app.env_conn_vscroll.saturating_add(1);
+                    }
+                }
+            }
+            _ => {}
+        },
         MouseEventKind::ScrollLeft => {
-            if point_in(mx, my, table_rect) {
-                app.table_hscroll = app.table_hscroll.saturating_sub(4);
+            if matches!(app.screen, Screen::Home) {
+                let results_area = rows[3];
+                let (table_rect, _) = if matches!(app.results_mode, ResultsMode::Messages) {
+                    let cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+                        .split(results_area);
+                    (cols[0], Some(cols[1]))
+                } else {
+                    (results_area, None)
+                };
+                if point_in(mx, my, table_rect) {
+                    app.table_hscroll = app.table_hscroll.saturating_sub(4);
+                }
             }
         }
         MouseEventKind::ScrollRight => {
-            if point_in(mx, my, table_rect) {
-                app.table_hscroll = app.table_hscroll.saturating_add(4);
+            if matches!(app.screen, Screen::Home) {
+                let results_area = rows[3];
+                let (table_rect, _) = if matches!(app.results_mode, ResultsMode::Messages) {
+                    let cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+                        .split(results_area);
+                    (cols[0], Some(cols[1]))
+                } else {
+                    (results_area, None)
+                };
+                if point_in(mx, my, table_rect) {
+                    app.table_hscroll = app.table_hscroll.saturating_add(4);
+                }
             }
         }
         _ => {}
@@ -2596,7 +3211,7 @@ fn fetch_topics_with_partitions_async(app: &AppState, tx: mpsc::UnboundedSender<
     });
 }
 
-fn env_editor_fields(app: &AppState, root: Rect) -> Option<Vec<Rect>> {
+fn env_editor_fields(app: &AppState, body: Rect) -> Option<Vec<Rect>> {
     let area = if app.show_env_modal {
         let popup_rows = Layout::default()
             .direction(Direction::Vertical)
@@ -2605,7 +3220,7 @@ fn env_editor_fields(app: &AppState, root: Rect) -> Option<Vec<Rect>> {
                 Constraint::Percentage(80),
                 Constraint::Percentage(10),
             ])
-            .split(root);
+            .split(body);
         let center_v = popup_rows.get(1)?.to_owned();
         let popup_cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -2617,23 +3232,21 @@ fn env_editor_fields(app: &AppState, root: Rect) -> Option<Vec<Rect>> {
             .split(center_v);
         popup_cols.get(1).copied()?
     } else if matches!(app.screen, Screen::Envs) {
-        if root.width <= 2 || root.height <= 2 {
-            return None;
-        }
-        Rect {
-            x: root.x.saturating_add(1),
-            y: root.y.saturating_add(1),
-            width: root.width.saturating_sub(2),
-            height: root.height.saturating_sub(2),
-        }
+        body
     } else {
         return None;
+    };
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
     };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .margin(1)
-        .split(area);
+        .split(inner);
     let editor = cols.get(1).copied()?;
     let fields = Layout::default()
         .direction(Direction::Vertical)
@@ -2648,6 +3261,69 @@ fn env_editor_fields(app: &AppState, root: Rect) -> Option<Vec<Rect>> {
         ])
         .split(editor);
     Some(fields.to_vec())
+}
+
+fn app_config_field_rects(body: Rect) -> Option<(Vec<Rect>, Rect)> {
+    if body.width <= 2 || body.height <= 2 {
+        return None;
+    }
+    let inner = Rect {
+        x: body.x.saturating_add(1),
+        y: body.y.saturating_add(1),
+        width: body.width.saturating_sub(2),
+        height: body.height.saturating_sub(2),
+    };
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(8),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+    let fields = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .split(sections[1]);
+    Some((fields.to_vec(), sections[2]))
+}
+
+#[derive(Copy, Clone)]
+enum AppConfigAction {
+    Save,
+    Reset,
+}
+
+fn detect_app_config_action(area: Rect, mx: u16, my: u16) -> Option<AppConfigAction> {
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if my != inner.y {
+        return None;
+    }
+    let labels = [
+        ("[Save]", AppConfigAction::Save),
+        ("[Reset to defaults]", AppConfigAction::Reset),
+    ];
+    let mut cursor = inner.x.saturating_add(1);
+    for (label, action) in labels {
+        let w = label.chars().count() as u16;
+        if mx >= cursor && mx < cursor + w {
+            return Some(action);
+        }
+        cursor = cursor.saturating_add(w + 3);
+    }
+    None
 }
 
 fn handle_env_copy_paste_click(app: &mut AppState, fields: &[Rect], mx: u16, my: u16) -> bool {
@@ -2906,15 +3582,6 @@ fn detect_title_button(
 fn read_clipboard_text() -> Option<String> {
     let mut cb = arboard::Clipboard::new().ok()?;
     cb.get_text().ok()
-}
-
-fn normalize_pem_input(raw: &str) -> String {
-    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
-    if normalized.contains('\n') {
-        normalized
-    } else {
-        decode_display(&normalized)
-    }
 }
 
 fn normalize_plain_input(raw: &str) -> String {
@@ -3262,14 +3929,14 @@ fn ensure_input_cursor_visible(app: &mut AppState) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // host
-            Constraint::Length(8), // editor
-            Constraint::Length(1), // status
-            Constraint::Fill(1),   // results
-            Constraint::Length(3), // footer
+            Constraint::Length(3),  // menu
+            Constraint::Length(3),  // env bar
+            Constraint::Length(10), // editor + status
+            Constraint::Fill(1),    // results
+            Constraint::Length(3),  // footer
         ])
         .split(root);
-    let query_area = rows[1];
+    let query_area = rows[2];
     let inner = Rect {
         x: query_area.x.saturating_add(1),
         y: query_area.y.saturating_add(1),

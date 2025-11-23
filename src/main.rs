@@ -1,12 +1,15 @@
+mod app_config;
 mod args;
 mod consumer;
 mod merger;
 mod models;
 mod output;
+mod paths;
 mod query;
 mod tui;
 
 use anyhow::{Context, Result};
+use app_config::AppConfig;
 use args::{Cli, Commands, RunArgs};
 use clap::Parser;
 use colored::*;
@@ -14,6 +17,7 @@ use consumer::spawn_partition_consumer;
 use merger::run_merger;
 use models::{MessageEnvelope, OffsetSpec, SslConfig};
 use output::TableOutput;
+use query::ast::OrderSpec;
 use query::{SelectItem, parse_query};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -46,7 +50,8 @@ async fn main() -> Result<()> {
                 "{}",
                 format!("Connecting to Kafka broker: {}", args.broker).cyan()
             );
-            let (query_ast, topic, columns) = if let Some(ref q) = args.query {
+            let app_config = AppConfig::load();
+            let (mut query_ast, topic, columns) = if let Some(ref q) = args.query {
                 let ast = parse_query(q).context("Failed to parse --query")?;
                 let columns = ast.select.clone();
                 println!("{}", format!("Using query: {}", q).cyan());
@@ -115,9 +120,19 @@ async fn main() -> Result<()> {
             println!("{}", "Starting readers (one per partition)...".yellow());
 
             let partition_count = partitions.len().max(1);
+            if let Some(ast) = query_ast.as_mut() {
+                if ast.order.is_none() {
+                    let (field, dir) = app_config.default_order();
+                    ast.order = Some(OrderSpec { field, dir });
+                }
+            }
             let (max_messages, order_desc, query_limit, global_sort_by_timestamp) =
                 if let Some(ast) = query_ast.as_ref() {
-                    let base_limit = ast.limit.or(args.max_messages);
+                    let base_limit = ast
+                        .limit
+                        .or(args.max_messages)
+                        .or_else(|| app_config.default_limit)
+                        .or_else(|| Some(app_config.query_scan_multiplier * partition_count));
                     let plan = ast.execution_plan(partition_count, base_limit);
                     (
                         Some(plan.n_global),
@@ -159,8 +174,10 @@ async fn main() -> Result<()> {
                 } else {
                     None
                 };
+                let multiplier = app_config.query_scan_multiplier;
                 joinset.spawn(async move {
-                    spawn_partition_consumer(a, p, offset_spec, txp, q, limit, ssl).await
+                    spawn_partition_consumer(a, p, offset_spec, txp, q, limit, ssl, multiplier)
+                        .await
                 });
             }
             drop(tx); // merger will know when producers are done
@@ -195,9 +212,7 @@ async fn main() -> Result<()> {
 }
 
 fn logs_dir() -> std::path::PathBuf {
-    std::env::var("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".rkl").join("logs"))
-        .unwrap_or_else(|_| std::path::PathBuf::from(".rkl").join("logs"))
+    crate::paths::logs_dir()
 }
 
 fn log_cli_error(err: &str) {
@@ -250,8 +265,9 @@ fn parse_runargs_from_argv() -> RunArgs {
 async fn run_once_cli(args: RunArgs) -> Result<()> {
     // Run the same pipeline as the Run subcommand and log errors
     let res = async {
+        let app_config = AppConfig::load();
         // One-time consumer just to fetch metadata / partitions
-        let (query_ast, topic, columns) = if let Some(ref q) = args.query {
+        let (mut query_ast, topic, columns) = if let Some(ref q) = args.query {
             let ast = parse_query(q).context("Failed to parse --query")?;
             let columns = ast.select.clone();
             let topic_name = ast.from.clone();
@@ -309,11 +325,21 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
             topic_md.partitions().iter().map(|p| p.id()).collect()
         };
         let partition_count = partitions.len().max(1);
+        if let Some(ast) = query_ast.as_mut() {
+            if ast.order.is_none() {
+                let (field, dir) = app_config.default_order();
+                ast.order = Some(OrderSpec { field, dir });
+            }
+        }
 
         let (tx, rx) = mpsc::channel::<MessageEnvelope>(args.channel_capacity);
         let (max_messages, order_desc, query_limit, global_sort_by_timestamp) =
             if let Some(ast) = query_ast.as_ref() {
-                let base_limit = ast.limit.or(args.max_messages);
+                let base_limit = ast
+                    .limit
+                    .or(args.max_messages)
+                    .or_else(|| app_config.default_limit)
+                    .or_else(|| Some(app_config.query_scan_multiplier * partition_count));
                 let plan = ast.execution_plan(partition_count, base_limit);
                 (
                     Some(plan.n_global),
@@ -350,7 +376,17 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
                 None
             };
             joinset.spawn(async move {
-                spawn_partition_consumer(a, p, offset_spec, txp, q, limit, ssl).await
+                spawn_partition_consumer(
+                    a,
+                    p,
+                    offset_spec,
+                    txp,
+                    q,
+                    limit,
+                    ssl,
+                    app_config.query_scan_multiplier,
+                )
+                .await
             });
         }
         drop(tx);

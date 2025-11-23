@@ -13,8 +13,6 @@ use std::io::Write as _;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
-const QUERY_SCAN_MULTIPLIER: usize = 5;
-
 pub async fn spawn_partition_consumer(
     args: RunArgs,
     partition: i32,
@@ -23,6 +21,7 @@ pub async fn spawn_partition_consumer(
     query: Option<std::sync::Arc<SelectQuery>>,
     query_limit: Option<usize>,
     ssl: Option<SslConfig>,
+    query_scan_multiplier: usize,
 ) -> Result<()> {
     // unique group id (we never commit)
     let group_id = format!("rkl-{}-p{}", uuid::Uuid::new_v4(), partition);
@@ -56,7 +55,17 @@ pub async fn spawn_partition_consumer(
         .clone();
 
     if let Some(query) = query {
-        run_query_partition_consumer(args, partition, consumer, topic, query, query_limit, tx).await
+        run_query_partition_consumer(
+            args,
+            partition,
+            consumer,
+            topic,
+            query,
+            query_limit,
+            tx,
+            query_scan_multiplier,
+        )
+        .await
     } else {
         run_search_partition_consumer(args, partition, offset_spec, consumer, topic, tx).await
     }
@@ -179,6 +188,7 @@ async fn run_query_partition_consumer(
     query: std::sync::Arc<SelectQuery>,
     query_limit: Option<usize>,
     tx: Sender<MessageEnvelope>,
+    query_scan_multiplier: usize,
 ) -> Result<()> {
     let (low_watermark, high_watermark) = consumer
         .fetch_watermarks(&topic, partition, Duration::from_secs(5))
@@ -242,7 +252,7 @@ async fn run_query_partition_consumer(
             let limit_global = per_partition_limit.or(query.limit);
             let window_size = limit_global.map(|n| n as i64).unwrap_or(256).max(1);
             let per_partition_cap =
-                limit_global.map(|n| n.saturating_mul(QUERY_SCAN_MULTIPLIER).max(n));
+                limit_global.map(|n| n.saturating_mul(query_scan_multiplier.max(1)).max(n));
             let mut matched_rows = 0usize;
 
             if matches!(scan_kind, ScanKind::TimestampDesc) {

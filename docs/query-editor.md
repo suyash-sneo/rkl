@@ -8,7 +8,7 @@ The query editor in RKL behaves more like a lightweight IDE than a single-line p
 - Use Up/Down (and PageUp/PageDown) to select a previous query.
 - Press `Enter` to jump to that query if it already exists in the buffer, or append it as a new query at the end and move the cursor there.
 - Press `Esc` to close the popup without changing the editor.
-- History is saved under `~/.rkl/envs/query-history.txt` so your queries are available in future runs.
+- History is saved under `~/.rkl/history/query-history.txt` so your queries are available in future runs (legacy `~/.rkl/envs/query-history.txt` is still read).
 
 ## Multi-line editing
 
@@ -37,4 +37,3 @@ When you have already run a `SELECT` successfully, you can re-run it without tou
 - `Ctrl-Shift-Enter` or `Ctrl-Shift-R` re-runs the last successfully executed query.
 - The re-run uses the exact text from the last run, regardless of where the cursor currently is.
 - This is especially handy when tweaking environments or running the same query repeatedly.
-

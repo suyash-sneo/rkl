@@ -1,4 +1,6 @@
-use super::env_store::{EnvStore, Environment, config_dir};
+use super::env_store::{EnvStore, Environment};
+use super::pem_utils::decode_literal_backslash_n;
+use crate::app_config::{AppConfig, DefaultOrderDir, DefaultOrderField};
 use crate::models::{MessageEnvelope, SslConfig};
 use crate::query::SelectItem;
 use std::fs;
@@ -8,7 +10,6 @@ use tui_textarea::TextArea;
 
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-const QUERY_HISTORY_FILE: &str = "query-history.txt";
 pub const QUERY_HISTORY_LIMIT: usize = 200;
 
 #[derive(Default)]
@@ -32,6 +33,10 @@ pub struct AppState {
     pub env_store: EnvStore,
     pub show_env_modal: bool,
     pub env_editor: Option<EnvEditor>,
+    pub app_config: AppConfig,
+    pub app_config_editor: Option<AppConfigEditor>,
+    pub app_config_save_pressed: bool,
+    pub app_config_save_deadline: Option<Instant>,
     // Results/table view state
     pub table_hscroll: usize,
     pub json_vscroll: u16,
@@ -41,12 +46,17 @@ pub struct AppState {
     // Env test status within the modal
     pub env_test_in_progress: bool,
     pub env_test_message: Option<String>,
+    pub env_test_log: String,
     pub env_conn_vscroll: u16,
+    pub env_save_pressed: bool,
+    pub env_save_deadline: Option<Instant>,
     pub mouse_selection_mode: bool,
     // Screens
     pub screen: Screen,
-    pub show_help: bool,
     pub help_vscroll: u32,
+    pub last_screen_before_about: Option<Screen>,
+    pub menu_pressed_screen: Option<Screen>,
+    pub menu_pressed_deadline: Option<Instant>,
     pub timestamps_use_utc: bool,
     pub timestamp_switch_pressed: bool,
     pub timestamp_switch_deadline: Option<Instant>,
@@ -72,6 +82,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(initial_input: String, host: String) -> Self {
+        let app_config = AppConfig::load();
         let mut env_store = EnvStore::load();
         if env_store.envs.is_empty() {
             env_store.envs.push(Environment {
@@ -106,6 +117,10 @@ impl AppState {
             env_store,
             show_env_modal: false,
             env_editor: None,
+            app_config: app_config.clone(),
+            app_config_editor: Some(build_app_config_editor(&app_config)),
+            app_config_save_pressed: false,
+            app_config_save_deadline: None,
             table_hscroll: 0,
             json_vscroll: 0,
             copy_btn_pressed: false,
@@ -113,12 +128,17 @@ impl AppState {
             last_run_query_range: None,
             env_test_in_progress: false,
             env_test_message: None,
+            env_test_log: String::new(),
             env_conn_vscroll: 0,
+            env_save_pressed: false,
+            env_save_deadline: None,
             mouse_selection_mode: false,
             screen: Screen::Home,
-            show_help: false,
             help_vscroll: 0,
-            timestamps_use_utc: true,
+            last_screen_before_about: None,
+            menu_pressed_screen: None,
+            menu_pressed_deadline: None,
+            timestamps_use_utc: app_config.default_timestamps_use_utc,
             timestamp_switch_pressed: false,
             timestamp_switch_deadline: None,
             topics: Vec::new(),
@@ -159,6 +179,30 @@ impl AppState {
 
     pub fn update_query_progress_rows(&mut self, total_emitted: usize) {
         self.query_rows_seen = total_emitted;
+    }
+}
+
+pub fn build_app_config_editor(config: &AppConfig) -> AppConfigEditor {
+    let default_limit = config
+        .default_limit
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    let default_order_field_idx = match config.default_order_field {
+        DefaultOrderField::Timestamp => 0,
+        DefaultOrderField::Poffset => 1,
+        DefaultOrderField::PoffsetTs => 2,
+    };
+    let default_order_dir_idx = match config.default_order_dir {
+        DefaultOrderDir::Asc => 0,
+        DefaultOrderDir::Desc => 1,
+    };
+    AppConfigEditor {
+        query_scan_multiplier: config.query_scan_multiplier.to_string(),
+        default_limit,
+        default_order_field_idx,
+        default_order_dir_idx,
+        timestamps_use_utc: config.default_timestamps_use_utc,
+        field_focus: AppConfigFieldFocus::QueryScanMultiplier,
     }
 }
 
@@ -258,7 +302,8 @@ impl AppState {
     pub fn current_ssl_config(&self) -> Option<SslConfig> {
         self.selected_env().map(|e| {
             // Ensure we pass actual newlines to librdkafka
-            let decode = |s: &Option<String>| s.as_ref().map(|v| v.replace("\\n", "\n"));
+            let decode =
+                |s: &Option<String>| s.as_ref().map(|v| decode_literal_backslash_n(v.as_str()));
             SslConfig {
                 ca_pem: decode(&e.ssl_ca_pem),
                 cert_pem: decode(&e.public_key_pem),
@@ -324,6 +369,16 @@ pub struct EnvEditor {
     pub field_focus: EnvFieldFocus,
 }
 
+#[derive(Debug, Clone)]
+pub struct AppConfigEditor {
+    pub query_scan_multiplier: String,
+    pub default_limit: String,
+    pub default_order_field_idx: usize,
+    pub default_order_dir_idx: usize,
+    pub timestamps_use_utc: bool,
+    pub field_focus: AppConfigFieldFocus,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum EnvFieldFocus {
     Name,
@@ -332,6 +387,16 @@ pub enum EnvFieldFocus {
     PublicKey,
     Ca,
     Conn,
+    Buttons,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum AppConfigFieldFocus {
+    QueryScanMultiplier,
+    DefaultLimit,
+    DefaultOrderField,
+    DefaultOrderDir,
+    TimestampsUseUtc,
     Buttons,
 }
 
@@ -348,31 +413,37 @@ pub enum Screen {
     Home,
     Envs,
     Info,
+    AppConfig,
+    About,
 }
 
 fn history_file_path() -> PathBuf {
-    config_dir().join(QUERY_HISTORY_FILE)
+    crate::paths::history_file_path()
+}
+
+fn legacy_history_file_path() -> PathBuf {
+    crate::paths::legacy_history_file_path()
 }
 
 fn load_query_history_from_disk() -> Vec<String> {
-    let path = history_file_path();
-    if let Ok(raw) = fs::read_to_string(path) {
-        let mut entries: Vec<String> = raw
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(decode_history_entry)
-            .collect();
-        if entries.len() > QUERY_HISTORY_LIMIT {
-            let drop_n = entries.len() - QUERY_HISTORY_LIMIT;
-            entries.drain(0..drop_n);
-        }
-        entries
-            .into_iter()
-            .map(|e| normalize_history_entry(&e))
-            .collect()
-    } else {
-        Vec::new()
+    let raw = fs::read_to_string(history_file_path())
+        .or_else(|_| fs::read_to_string(legacy_history_file_path()));
+    let Ok(raw) = raw else {
+        return Vec::new();
+    };
+    let mut entries: Vec<String> = raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(decode_history_entry)
+        .collect();
+    if entries.len() > QUERY_HISTORY_LIMIT {
+        let drop_n = entries.len() - QUERY_HISTORY_LIMIT;
+        entries.drain(0..drop_n);
     }
+    entries
+        .into_iter()
+        .map(|e| normalize_history_entry(&e))
+        .collect()
 }
 
 fn save_query_history_to_disk(entries: &[String]) -> std::io::Result<()> {

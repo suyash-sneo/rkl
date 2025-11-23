@@ -19,7 +19,7 @@ RKL lets you manage multiple Kafka environments (hosts + credentials) from the T
 
 RKL persists environments as JSON files so they are available across runs and can be scripted or checked into dotfiles.
 
-- The directory is `~/.rkl/envs` (or `$HOME/.rkl/envs`).
+- The directory is `~/.rkl/configs/envs` (or `$HOME/.rkl/configs/envs`). Legacy configs under `~/.rkl/envs` are still loaded for compatibility.
 - Each environment lives in its own `*.json` file.
 - The **file name** does not need to match the environment name, but should end in `.json`.
 
@@ -27,7 +27,7 @@ On startup, RKL scans this directory, loads every JSON file that matches the for
 
 ## Editing environment JSON directly
 
-Instead of using only the TUI, you can create or edit environment files directly under `~/.rkl/envs`.
+Instead of using only the TUI, you can create or edit environment files directly under `~/.rkl/configs/envs`.
 
 ### JSON schema
 
@@ -95,11 +95,10 @@ You can supply PEMs in two ways:
 1. Create the directory if it does not exist:
 
    ```sh
-   mkdir -p ~/.rkl/envs
+   mkdir -p ~/.rkl/configs/envs
    ```
 
-2. Add a file like `~/.rkl/envs/dev.json` with the JSON schema above.
+2. Add a file like `~/.rkl/configs/envs/dev.json` with the JSON schema above.
 3. Start or restart `rkl` and open `F2 Envs`; the new environment should appear under the `name` you set.
 
 You can mix TUI-edited environments and manually created JSON files; RKL will load all of them.
-

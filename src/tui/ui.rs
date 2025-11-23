@@ -9,11 +9,89 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 
-use super::app::{AppState, EnvFieldFocus, Focus, ResultsMode, SPINNER_FRAMES, Screen};
+use super::app::{
+    AppConfigFieldFocus, AppState, EnvFieldFocus, Focus, ResultsMode, SPINNER_FRAMES, Screen,
+};
 use super::query_bounds::{find_query_range, strip_trailing_semicolon};
 use super::timefmt::fmt_ts;
 
 pub(super) const COPY_BTN_LABEL: &str = "[ Copy ]";
+const MAIN_MENU_ITEMS: &[(Screen, &str)] = &[
+    (Screen::Home, "Query"),
+    (Screen::Envs, "Envs"),
+    (Screen::AppConfig, "App Config"),
+    (Screen::About, "About"),
+];
+
+pub fn draw_main_menu(frame: &mut Frame, area: Rect, app: &AppState) {
+    let block = Block::default().borders(Borders::ALL).title("RKL");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut x = inner.x.saturating_add(1);
+    let y = inner.y;
+    for (screen, label) in MAIN_MENU_ITEMS.iter() {
+        let text = format!(" {} ", label);
+        let width = text.chars().count() as u16;
+        if x + width > inner.x + inner.width {
+            break;
+        }
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height: 1,
+        };
+        let is_current = app.screen == *screen;
+        let is_pressed = app.menu_pressed_screen == Some(*screen);
+        let style = if is_pressed {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if is_current {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let para = Paragraph::new(text).style(style);
+        frame.render_widget(para, rect);
+        x = x.saturating_add(width + 1);
+    }
+}
+
+pub fn main_menu_hit_test(area: Rect, mx: u16, my: u16) -> Option<Screen> {
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if my != inner.y {
+        return None;
+    }
+    let mut x = inner.x.saturating_add(1);
+    for (screen, label) in MAIN_MENU_ITEMS.iter() {
+        let text = format!(" {} ", label);
+        let width = text.chars().count() as u16;
+        if x + width > inner.x + inner.width {
+            break;
+        }
+        let rect = Rect {
+            x,
+            y: inner.y,
+            width,
+            height: 1,
+        };
+        if mx >= rect.x && mx < rect.x + rect.width {
+            return Some(*screen);
+        }
+        x = x.saturating_add(width + 1);
+    }
+    None
+}
 
 pub fn draw(frame: &mut Frame, app: &AppState) {
     let size = frame.area();
@@ -22,6 +100,7 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
+                    Constraint::Length(3),  // menu
                     Constraint::Length(3),  // env bar
                     Constraint::Length(10), // editor + status
                     Constraint::Fill(1),    // results
@@ -29,47 +108,75 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
                 ])
                 .split(size);
 
-            draw_env_bar(frame, chunks[0], app);
+            draw_main_menu(frame, chunks[0], app);
+            draw_env_bar(frame, chunks[1], app);
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                .split(chunks[1]);
+                .split(chunks[2]);
             draw_input(frame, cols[0], app);
             draw_status_panel(frame, cols[1], app);
-            draw_results(frame, chunks[2], app);
-            draw_footer(frame, chunks[3], app);
+            draw_results(frame, chunks[3], app);
+            draw_footer(frame, chunks[4], app);
         }
         Screen::Envs => {
-            // Full-screen environments UI
-            let block = Block::default()
-                .title("Environments (F8 Home  F2 Envs  F12 Info  F10 Help)")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan));
-            let area = block.inner(size);
-            frame.render_widget(block, size);
-            draw_env_modal(frame, area, app);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3), // menu
+                    Constraint::Fill(1),   // body
+                    Constraint::Length(3), // footer
+                ])
+                .split(size);
+            draw_main_menu(frame, chunks[0], app);
+            draw_env_modal(frame, chunks[1], app);
+            draw_footer(frame, chunks[2], app);
         }
         Screen::Info => {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),
-                    Constraint::Fill(1),
-                    Constraint::Length(3),
+                    Constraint::Length(3), // menu
+                    Constraint::Length(3), // env bar
+                    Constraint::Fill(1),   // body
+                    Constraint::Length(3), // footer
                 ])
                 .split(size);
-            draw_env_bar(frame, chunks[0], app);
-            draw_topics(frame, chunks[1], app);
+            draw_main_menu(frame, chunks[0], app);
+            draw_env_bar(frame, chunks[1], app);
+            draw_topics(frame, chunks[2], app);
+            draw_footer(frame, chunks[3], app);
+        }
+        Screen::AppConfig => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3), // menu
+                    Constraint::Fill(1),   // body
+                    Constraint::Length(3), // footer
+                ])
+                .split(size);
+            draw_main_menu(frame, chunks[0], app);
+            draw_app_config_screen(frame, chunks[1], app);
+            draw_footer(frame, chunks[2], app);
+        }
+        Screen::About => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3), // menu
+                    Constraint::Fill(1),   // body
+                    Constraint::Length(3), // footer
+                ])
+                .split(size);
+            draw_main_menu(frame, chunks[0], app);
+            draw_about_screen(frame, chunks[1], app);
             draw_footer(frame, chunks[2], app);
         }
     }
 
     if app.show_history_popup {
         draw_history_popup(frame, size, app);
-    }
-
-    if app.show_help {
-        draw_help_overlay(frame, size, app);
     }
 }
 
@@ -449,22 +556,36 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
 fn footer_legend(app: &AppState) -> String {
     match app.screen {
         Screen::Home => match app.focus {
-            Focus::Query => "Tab focus | Query: Enter newline, Ctrl-Enter run, Right accept autocomplete, Ctrl-N/P navigate autocomplete | F10 Help | Ctrl-Q/C quit".to_string(),
-            Focus::Results => "Tab focus | Results: arrows select, Shift-←/→ h-scroll, F5 copy value, F7 copy status | F10 Help | Ctrl-Q/C quit".to_string(),
-            Focus::Host => "Tab focus | Host: Enter open envs, F2 Envs | F10 Help | Ctrl-Q/C quit".to_string(),
+            Focus::Query => "Tab focus | Query: Enter newline, Ctrl-Enter run, Right accept autocomplete, Ctrl-N/P navigate autocomplete, Ctrl-R history | F3 App Config | F10 About | Ctrl-Q/C quit".to_string(),
+            Focus::Results => "Tab focus | Results: arrows select, Shift-←/→ h-scroll, F5 copy value, F7 copy status | F3 App Config | F10 About | Ctrl-Q/C quit".to_string(),
+            Focus::Host => "Tab focus | Host: Enter open envs, F2 Envs | F3 App Config | F10 About | Ctrl-Q/C quit".to_string(),
         },
-        Screen::Envs => "F4 Save, F5 Test, Tab move, Up/Down select, Esc Close | F10 Help".to_string(),
-        Screen::Info => "F6 Refresh, F8 Home | F10 Help | Ctrl-Q/C quit".to_string(),
+        Screen::Envs => "F4 Save, F5 Test, Tab move, Up/Down select, Esc Close | F10 About | Ctrl-Q/C quit".to_string(),
+        Screen::Info => "F6 Refresh, F8 Home, F3 App Config | F10 About | Ctrl-Q/C quit".to_string(),
+        Screen::AppConfig => {
+            "Tab focus | Left/Right change ORDER fields | Enter toggles timestamps or saves on Buttons | F4 Save | Esc Home | Ctrl-Q/C quit"
+                .to_string()
+        }
+        Screen::About => {
+            "Scroll Up/Down/PageUp/PageDown/Home/End | F10 back | Ctrl-Q/C quit".to_string()
+        }
     }
 }
 
 fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
+    let outer = Block::default()
+        .title("Environments")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner_area = outer.inner(area);
+    frame.render_widget(outer, area);
+
     // Split modal into left list and right editor
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .margin(1)
-        .split(area);
+        .split(inner_area);
 
     // Left: environments list
     let items: Vec<ListItem> = app
@@ -547,23 +668,22 @@ fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
         fields[1],
     );
     // Render multi-line fields using tui-textarea
+    let block_pk = Block::default()
+        .borders(Borders::ALL)
+        .title(title_pk.clone());
+    let block_pub = Block::default()
+        .borders(Borders::ALL)
+        .title(title_cert.clone());
+    let block_ca = Block::default()
+        .borders(Borders::ALL)
+        .title(title_ca.clone());
+    let inner_pk = block_pk.inner(fields[2]);
+    let inner_pub = block_pub.inner(fields[3]);
+    let inner_ca = block_ca.inner(fields[4]);
+    frame.render_widget(block_pk, fields[2]);
+    frame.render_widget(block_pub, fields[3]);
+    frame.render_widget(block_ca, fields[4]);
     if let Some(edm) = app.env_editor.as_ref() {
-        // Draw outer blocks for titles and copy affordance
-        let block_pk = Block::default()
-            .borders(Borders::ALL)
-            .title(title_pk.clone());
-        let block_pub = Block::default()
-            .borders(Borders::ALL)
-            .title(title_cert.clone());
-        let block_ca = Block::default()
-            .borders(Borders::ALL)
-            .title(title_ca.clone());
-        let inner_pk = block_pk.inner(fields[2]);
-        let inner_pub = block_pub.inner(fields[3]);
-        let inner_ca = block_ca.inner(fields[4]);
-        frame.render_widget(block_pk, fields[2]);
-        frame.render_widget(block_pub, fields[3]);
-        frame.render_widget(block_ca, fields[4]);
         frame.render_widget(&edm.ta_private, inner_pk);
         frame.render_widget(&edm.ta_public, inner_pub);
         frame.render_widget(&edm.ta_ca, inner_ca);
@@ -583,20 +703,45 @@ fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
             frame.set_cursor_position(Position::new(x, y));
         }
     }
-    let help = "F1 New | F2 Edit | F3 Delete | F4 Save | F5 Test | F6 Next | F7 Prev | F9 Mouse select on/off | Tab/Shift-Tab Move | Up/Down Select | Shift-←/→ H-scroll | Esc Close";
+    let mut action_spans = Vec::new();
+    action_spans.push(Span::raw("F1 New | F2 Edit | F3 Delete | "));
+    let save_style = if app.env_save_pressed {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    action_spans.push(Span::styled("F4 Save", save_style));
+    action_spans.push(Span::raw(
+        " | F5 Test | F6 Next | F7 Prev | F9 Mouse select on/off | Tab/Shift-Tab Move | Up/Down Select | Shift-←/→ H-scroll | Esc Close",
+    ));
     frame.render_widget(
-        Paragraph::new(help).block(Block::default().borders(Borders::ALL).title("Actions")),
+        Paragraph::new(Line::from(action_spans))
+            .block(Block::default().borders(Borders::ALL).title("Actions")),
         fields[5],
     );
 
     // Connection status/progress area (scrollable)
-    let status_text = if app.env_test_in_progress {
-        // Simple spinner based on time
-        let ch = match (std::time::SystemTime::now()
+    let mut log_lines: Vec<String> = if app.env_test_log.trim().is_empty() {
+        vec![
+            app.env_test_message
+                .clone()
+                .unwrap_or_else(|| "No env test run yet".to_string()),
+        ]
+    } else {
+        app.env_test_log.lines().map(|l| l.to_string()).collect()
+    };
+    if log_lines.is_empty() {
+        log_lines.push("No env test run yet".to_string());
+    }
+    if app.env_test_in_progress {
+        let spinner = match (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis()
-            / 250)
+            / 200)
             % 4
         {
             0 => "⠋",
@@ -604,16 +749,12 @@ fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
             2 => "⠸",
             _ => "⠴",
         };
-        let msg = app
-            .env_test_message
-            .as_deref()
-            .unwrap_or("Testing connection...");
-        format!("{} {}", ch, msg)
-    } else {
-        app.env_test_message
-            .clone()
-            .unwrap_or_else(|| "Ready".to_string())
-    };
+        if let Some(last) = log_lines.last_mut() {
+            *last = format!("{} {}", spinner, last);
+        }
+    }
+    let total_lines = log_lines.len().max(1);
+    let conn_lines: Vec<Line> = log_lines.into_iter().map(Line::from).collect();
     let conn_title = if matches!(
         app.env_editor.as_ref().map(|e| e.field_focus),
         Some(EnvFieldFocus::Conn)
@@ -623,10 +764,231 @@ fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
         "Connection  [Copy] [Paste/F9 Select]"
     };
     let conn_block = Block::default().borders(Borders::ALL).title(conn_title);
-    let conn_para = Paragraph::new(status_text)
+    let conn_inner = conn_block.inner(fields[6]);
+    let conn_para = Paragraph::new(Text::from(conn_lines))
         .block(conn_block)
         .scroll((app.env_conn_vscroll, 0));
     frame.render_widget(conn_para, fields[6]);
+    if total_lines > conn_inner.height as usize {
+        let mut vs = ScrollbarState::new(total_lines).position(app.env_conn_vscroll as usize);
+        let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(vbar, conn_inner, &mut vs);
+    }
+}
+
+fn draw_app_config_screen(frame: &mut Frame, area: Rect, app: &AppState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("App Config")
+        .border_style(Style::default().fg(Color::LightCyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(8),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+
+    let (order_field, order_dir) = app.app_config.default_order();
+    let order_label = match order_field {
+        crate::query::ast::OrderField::Timestamp => "timestamp",
+        crate::query::ast::OrderField::Poffset => "poffset",
+        crate::query::ast::OrderField::PoffsetTs => "poffset_ts",
+    };
+    let order_dir_label = match order_dir {
+        crate::query::ast::OrderDir::Asc => "ASC",
+        crate::query::ast::OrderDir::Desc => "DESC",
+    };
+    let summary = format!(
+        "Configure defaults when queries omit ORDER/LIMIT. Query scan multiplier (currently {}) controls how deep each partition is scanned when no explicit LIMIT is provided. Effective default order: {} {}.",
+        app.app_config.query_scan_multiplier, order_label, order_dir_label
+    );
+    frame.render_widget(
+        Paragraph::new(summary).wrap(Wrap { trim: false }),
+        sections[0],
+    );
+
+    let Some(ed) = app.app_config_editor.as_ref() else {
+        return;
+    };
+    let fields = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .split(sections[1]);
+
+    let title_mul = if matches!(ed.field_focus, AppConfigFieldFocus::QueryScanMultiplier) {
+        "Query scan multiplier [FOCUSED]  [Copy] [Paste] [Clear]"
+    } else {
+        "Query scan multiplier  [Copy] [Paste] [Clear]"
+    };
+    frame.render_widget(
+        Paragraph::new(ed.query_scan_multiplier.clone())
+            .block(Block::default().borders(Borders::ALL).title(title_mul)),
+        fields[0],
+    );
+
+    let title_limit = if matches!(ed.field_focus, AppConfigFieldFocus::DefaultLimit) {
+        "Default LIMIT (empty = auto) [FOCUSED]  [Copy] [Paste] [Clear]"
+    } else {
+        "Default LIMIT (empty = auto)  [Copy] [Paste] [Clear]"
+    };
+    frame.render_widget(
+        Paragraph::new(ed.default_limit.clone())
+            .block(Block::default().borders(Borders::ALL).title(title_limit)),
+        fields[1],
+    );
+
+    let title_order_field = if matches!(ed.field_focus, AppConfigFieldFocus::DefaultOrderField) {
+        "Default ORDER BY [FOCUSED]"
+    } else {
+        "Default ORDER BY"
+    };
+    let mut spans_field = Vec::new();
+    for (i, label) in ["timestamp", "poffset", "poffset_ts"].iter().enumerate() {
+        let style = if ed.default_order_field_idx == i {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans_field.push(Span::styled(*label, style));
+        if i + 1 < 3 {
+            spans_field.push(Span::raw("  |  "));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans_field)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title_order_field),
+        ),
+        fields[2],
+    );
+
+    let title_order_dir = if matches!(ed.field_focus, AppConfigFieldFocus::DefaultOrderDir) {
+        "Default ORDER direction [FOCUSED]"
+    } else {
+        "Default ORDER direction"
+    };
+    let mut spans_dir = Vec::new();
+    for (i, label) in ["ASC", "DESC"].iter().enumerate() {
+        let style = if ed.default_order_dir_idx == i {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans_dir.push(Span::styled(*label, style));
+        if i + 1 < 2 {
+            spans_dir.push(Span::raw("  |  "));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans_dir)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title_order_dir),
+        ),
+        fields[3],
+    );
+
+    let title_ts = if matches!(ed.field_focus, AppConfigFieldFocus::TimestampsUseUtc) {
+        "Default timestamp display [FOCUSED]"
+    } else {
+        "Default timestamp display"
+    };
+    let mut ts_spans = Vec::new();
+    let options = [
+        ("UTC", ed.timestamps_use_utc),
+        ("Local", !ed.timestamps_use_utc),
+    ];
+    for (idx, (label, active)) in options.iter().enumerate() {
+        let style = if *active {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        ts_spans.push(Span::styled(*label, style));
+        if idx + 1 < options.len() {
+            ts_spans.push(Span::raw("  |  "));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(ts_spans))
+            .block(Block::default().borders(Borders::ALL).title(title_ts)),
+        fields[4],
+    );
+
+    let limit_note = if ed.default_limit.trim().is_empty() {
+        "auto (multiplier applies)"
+    } else {
+        ed.default_limit.as_str()
+    };
+    let order_label_edit = match ed.default_order_field_idx {
+        0 => "timestamp",
+        1 => "poffset",
+        _ => "poffset_ts",
+    };
+    let order_dir_label_edit = if ed.default_order_dir_idx == 0 {
+        "ASC"
+    } else {
+        "DESC"
+    };
+    let note = format!(
+        "Edited values: ORDER {} {}, LIMIT {}, timestamps {}, scan multiplier {}",
+        order_label_edit,
+        order_dir_label_edit,
+        limit_note,
+        if ed.timestamps_use_utc {
+            "UTC"
+        } else {
+            "Local"
+        },
+        ed.query_scan_multiplier
+    );
+    frame.render_widget(
+        Paragraph::new(note)
+            .style(Style::default().fg(Color::Gray))
+            .wrap(Wrap { trim: false }),
+        fields[5],
+    );
+
+    let mut action_spans = Vec::new();
+    let save_style = if app.app_config_save_pressed {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    action_spans.push(Span::styled("[Save]", save_style));
+    action_spans.push(Span::raw("    "));
+    action_spans.push(Span::styled(
+        "[Reset to defaults]",
+        Style::default().fg(Color::Gray),
+    ));
+    action_spans.push(Span::raw("    (Enter/click to apply)"));
+    frame.render_widget(
+        Paragraph::new(Line::from(action_spans))
+            .block(Block::default().borders(Borders::ALL).title("Actions")),
+        sections[2],
+    );
 }
 
 fn caret_pos_in(area: Rect, text: &str, cursor: usize) -> (u16, u16) {
@@ -944,17 +1306,15 @@ fn draw_topics(frame: &mut Frame, area: Rect, app: &AppState) {
     frame.render_widget(list, area);
 }
 
-fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &AppState) {
-    let popup = centered_rect(70, 70, area);
-    frame.render_widget(Clear, popup);
+fn draw_about_screen(frame: &mut Frame, area: Rect, app: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Help")
+        .title("About & Help")
         .border_style(Style::default().fg(Color::Yellow));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let lines = build_help_lines();
+    let lines = build_about_lines();
     let total_lines = lines.len();
     let visible = inner.height.max(1) as usize;
     let max_scroll = total_lines.saturating_sub(visible);
@@ -1039,50 +1399,55 @@ fn draw_history_popup(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 pub fn help_content_line_count() -> usize {
-    build_help_lines().len()
+    build_about_lines().len()
 }
 
-fn build_help_lines() -> Vec<Line<'static>> {
+fn build_about_lines() -> Vec<Line<'static>> {
     vec![
-        heading_line("Global"),
-        Line::from("- F8 Home, F2 Envs, F12 Info, F10 Help"),
-        Line::from("- Ctrl-Q/C quit"),
+        heading_line("About RKL"),
+        Line::from(
+            "Kafka TUI for SQL-like queries with JSON preview, env manager, and topic browser.",
+        ),
+        Line::from(
+            "Run ad-hoc SELECTs, filter on JSON paths, explore partitions, and copy payloads quickly.",
+        ),
+        Line::from("Designed for on-call debugging and lightweight exploration."),
         Line::from(""),
-        heading_line("Home - Host bar"),
-        Line::from("- Tab focus; Enter open envs; F2 Envs for full screen"),
+        heading_line("License & goals"),
+        Line::from(
+            "Community-centric copyleft (see LICENSE): share improvements and avoid closed-source forks.",
+        ),
+        Line::from(
+            "Friendly to small developers; enterprises are expected to upstream fixes and keep changes open.",
+        ),
+        Line::from(
+            "Goals: transparent defaults, safe-by-design querying, ergonomic environment handling.",
+        ),
         Line::from(""),
-        heading_line("Home - Query"),
-        Line::from("- Ctrl-Enter run current SELECT; Enter newline"),
-        Line::from("- Right accept autocomplete; Ctrl-N/P navigate autocomplete"),
-        Line::from("- Ctrl/Alt+Left/Right move word; Ctrl/Alt+Backspace/Delete delete word"),
-        Line::from("- Ctrl+Home/End jump buffer; PageUp/PageDown scroll editor"),
-        Line::from(""),
-        heading_line("Home - Results"),
-        Line::from("- Arrows move selection; PageUp/PageDown step; Home/End jump"),
-        Line::from("- Shift-Left/Right horizontal scroll; F5 copy value; F7 copy status"),
-        Line::from("- Mouse wheel scroll supported"),
-        Line::from(""),
-        heading_line("Environments"),
-        Line::from("- F1 New, F2 Edit, F3 Delete"),
-        Line::from("- F4 Save, F5 Test, Tab/Shift-Tab move fields"),
-        Line::from("- Up/Down select; F9 toggle mouse select; Esc close"),
-        Line::from("- Text areas accept typing and paste"),
-        Line::from(""),
-        heading_line("Info screen"),
-        Line::from("- F6 Refresh topics"),
+        heading_line("Key controls"),
+        Line::from("- Top menu: Query / Envs / App Config / About (clickable, mouse supported)."),
+        Line::from(
+            "- Ctrl-Enter runs query; Tab moves focus; Ctrl-Q/C quits; Ctrl-R opens history popup.",
+        ),
+        Line::from(
+            "- F2 Envs, F8 Home, F12 Info, F10 About. Autocomplete Right or Ctrl-Y; Ctrl-N/P navigate.",
+        ),
+        Line::from(
+            "- Results: arrows move selection; Shift-Left/Right horizontal scroll; PageUp/PageDown/Home/End move.",
+        ),
+        Line::from(
+            "- Env editor: Tab/Shift-Tab move fields; titles expose [Copy]/[Paste]/[Clear]; mouse scroll in PEMs.",
+        ),
         Line::from(""),
         heading_line("Query syntax"),
         Line::from(
-            "- SELECT columns FROM topic [WHERE expr] [ORDER BY timestamp|poffset|poffset_ts ASC|DESC] [LIMIT n]",
+            "- SELECT cols FROM topic [WHERE expr] [ORDER BY timestamp|poffset|poffset_ts ASC|DESC] [LIMIT n]",
         ),
-        Line::from("- ORDER BY poffset DESC is assumed when omitted"),
         Line::from(
-            "- poffset = per-partition offsets; poffset_ts = same scan but globally sorted by timestamp",
+            "- ORDER BY poffset DESC applies when omitted; timestamp filters accept ISO-8601 or millis.",
         ),
-        Line::from("- JSON path via value->field->subfield; key and timestamp supported"),
-        Line::from("- Operators: =, !=, <>, CONTAINS, <, <=, >, >="),
         Line::from(
-            "- Timestamp filters accept ISO-8601 strings (UTC with Z, system timezone otherwise)",
+            "- JSON paths use value->field->subfield; key and timestamp roots are supported; CONTAINS matches substrings.",
         ),
         Line::from(""),
         heading_line("Examples"),
@@ -1099,13 +1464,8 @@ fn build_help_lines() -> Vec<Line<'static>> {
         ),
         Line::from("- Special command: LIST topics;"),
         Line::from(""),
-        heading_line("Autocomplete"),
-        Line::from("- Triggered after typing FROM and a space in a SELECT"),
-        Line::from("- Fuzzy-matched suggestions for topics"),
-        Line::from("- Right accepts; Ctrl-N/Ctrl-P move; Esc dismiss"),
-        Line::from(""),
         heading_line("Help navigation"),
-        Line::from("- Scroll with Up/Down or PageUp/PageDown; Home/End jump"),
+        Line::from("- Scroll with Up/Down/PageUp/PageDown; Home/End jump."),
     ]
 }
 

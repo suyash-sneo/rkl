@@ -4,6 +4,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
+use super::pem_utils::encode_pem_for_storage;
+use crate::paths;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Environment {
     pub name: String,
@@ -21,20 +24,24 @@ pub struct EnvStore {
 
 impl EnvStore {
     pub fn load() -> Self {
-        let dir = config_dir();
         let mut envs: Vec<Environment> = Vec::new();
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for ent in entries.flatten() {
-                let path = ent.path();
-                if path.is_file() {
-                    if let Some(ext) = path.extension() {
-                        if ext != "json" {
-                            continue;
+        let mut seen = HashSet::new();
+        for dir in [paths::envs_dir_new(), paths::envs_dir_legacy()] {
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for ent in entries.flatten() {
+                    let path = ent.path();
+                    if path.is_file() {
+                        if let Some(ext) = path.extension() {
+                            if ext != "json" {
+                                continue;
+                            }
                         }
-                    }
-                    if let Ok(s) = fs::read_to_string(&path) {
-                        if let Ok(e) = serde_json::from_str::<Environment>(&s) {
-                            envs.push(e);
+                        if let Ok(s) = fs::read_to_string(&path) {
+                            if let Ok(e) = serde_json::from_str::<Environment>(&s) {
+                                if seen.insert(e.name.clone()) {
+                                    envs.push(e);
+                                }
+                            }
                         }
                     }
                 }
@@ -53,11 +60,16 @@ impl EnvStore {
             let fname = format!("{}.json", sanitize(&e.name));
             desired.insert(fname.clone());
             let path = dir.join(fname);
-            // Encode newlines in PEMs so the file contains a single-line string with literal \n
             let mut e_enc = e.clone();
-            e_enc.private_key_pem = e_enc.private_key_pem.map(encode_newlines);
-            e_enc.public_key_pem = e_enc.public_key_pem.map(encode_newlines);
-            e_enc.ssl_ca_pem = e_enc.ssl_ca_pem.map(encode_newlines);
+            e_enc.private_key_pem = e_enc
+                .private_key_pem
+                .as_ref()
+                .map(|s| encode_pem_for_storage(s));
+            e_enc.public_key_pem = e_enc
+                .public_key_pem
+                .as_ref()
+                .map(|s| encode_pem_for_storage(s));
+            e_enc.ssl_ca_pem = e_enc.ssl_ca_pem.as_ref().map(|s| encode_pem_for_storage(s));
             let s = serde_json::to_string_pretty(&e_enc).context("serialize env")?;
             fs::write(path, s).context("write env file")?;
         }
@@ -79,9 +91,7 @@ impl EnvStore {
 }
 
 pub fn config_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".rkl").join("envs"))
-        .unwrap_or_else(|_| PathBuf::from(".rkl").join("envs"))
+    paths::envs_dir_new()
 }
 
 fn sanitize(name: &str) -> String {
@@ -91,16 +101,4 @@ fn sanitize(name: &str) -> String {
 }
 fn is_safe(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
-}
-
-fn encode_newlines(s: String) -> String {
-    // Ensure result is a single line with literal \n sequences
-    s.replace('\n', "\\n")
-}
-
-#[allow(dead_code)]
-fn decode_newlines(s: String) -> String {
-    // Convert literal \n sequences back to newline characters
-    // Note: we only replace unescaped sequences; a naive replace works for our config inputs
-    s.replace("\\n", "\n")
 }
