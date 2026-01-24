@@ -9,7 +9,7 @@ RKL (pronounced "racle", like "oracle" with a silent "o") is a terminal UI for e
 - SQL-inspired query engine (`SELECT`, `WHERE`, `ORDER BY timestamp|poffset|poffset_ts`, `LIMIT`) with JSON-path filtering via `value->field->subfield`.
 - Real-time results table with horizontal scrolling plus a right-side JSON pane for the focused record.
 - Topic inspection with the `LIST topics;` command and an Info screen (F12) that caches broker metadata.
-- Fuzzy topic autocomplete triggered after `FROM`, accepted with `Ctrl-Y` (or Right arrow), and navigated with `Ctrl-N`/`Ctrl-P`.
+- Fuzzy topic picker with a dedicated filter panel; `Ctrl-Y` drops the selected topic into the advanced editor.
 - Environment manager for hosts, credentials, and PEM-encoded CA/cert/key material with a built-in connectivity test.
 - Dedicated CLI mode for one-shot queries (`rkl run ...`) when you need to script output or run inside CI.
 
@@ -26,7 +26,7 @@ If you're new to RKL, start here and follow these docs in order:
 3. **Using the TUI** – editor behavior and navigation
    - [TUI controls (concise key reference)](docs/tui-controls.md)
    - [Query editor features (history, multi-line editing, parse status, quick re-run)](docs/query-editor.md)
-   - [Autocomplete](docs/autocomplete.md)
+   - [Topic picker](docs/autocomplete.md)
    - [Environments & SSL](docs/environments-and-ssl.md)
 4. **CLI mode** – scripting and non-interactive use
    - [CLI usage](docs/cli.md)
@@ -44,7 +44,7 @@ For a fast path:
 
 1. Install RKL using the script in [Getting started](docs/getting-started.md).
 2. Configure an environment for your broker:
-   - Easiest: start `rkl`, press `F2` to open the Environments screen, create a new environment, and set `host` to your Kafka `bootstrap.servers` (for example `localhost:9092`). Paste PEMs into the CA/cert/key fields if your broker requires TLS.
+   - Easiest: start `rkl`, press `F2` (or `:` → **Open Environments**), create a new environment (`/n`), and set `host` to your Kafka `bootstrap.servers` (for example `localhost:9092`). Paste PEMs into the CA/cert/key fields if your broker requires TLS, then save with `/s`.
   - Alternative: create a JSON file under `~/.rkl/configs/envs` (for example `~/.rkl/configs/envs/dev.json`) using the schema in [Environments & SSL](docs/environments-and-ssl.md); RKL will load it on startup (legacy `~/.rkl/envs` is still read).
    - Note: a client certificate and private key PEM are **only** required when your broker enforces mutual TLS (mTLS). For plain TLS, a CA PEM is usually sufficient; for non-TLS clusters you can omit all PEM fields.
 3. Run `rkl` and:
@@ -56,6 +56,6 @@ For a fast path:
      ```
 
    - Press `Ctrl-Enter` to run it.
-4. Use the arrow keys to explore the results table, and `F10` to open the built-in help for a full keymap.
+4. Use the arrow keys to explore the results table, and `?` to open the built-in help for a full keymap.
 
 From there, use the documentation map above to deepen your understanding.

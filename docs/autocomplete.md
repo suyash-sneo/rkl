@@ -1,10 +1,8 @@
-# Autocomplete
+# Topic picker
 
-RKL includes fuzzy topic autocomplete in the query editor.
+RKL keeps a topic picker on the left side of the Home screen.
 
-- Trigger: type `FROM ` inside a valid `SELECT` statement.
-- Suggestions are fuzzy-matched against the cached topic list; refresh the list from the Info screen with `F6`.
-- `Right` arrow accepts the highlighted topic.
-- `Ctrl-N`/`Ctrl-P` move through the list.
-- `Esc` dismisses the popup.
-
+- Type in the filter box to fuzzy-match the cached topic list.
+- Up/Down moves selection; `Enter` jumps focus into the query inputs.
+- `Ctrl-Y` inserts the selected topic into the Advanced SQL editor.
+- Press `F12` to open the Info screen and refresh topics (`F6` or `r` inside Info).

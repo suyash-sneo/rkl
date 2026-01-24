@@ -5,8 +5,8 @@ RKL (pronounced "racle", like "oracle" with a silent "o") is a terminal UI for e
 ## Quickstart
 
 1. Install the binary with one of the scripts below (no sudo required).
-2. Launch `rkl` to open the Home screen, tab into the Query editor, and press `Ctrl-Enter` to run your `SELECT`.
-3. Switch environments with `F2` or Enter on the host bar, and use `LIST topics;` or the sample queries in the query language docs to explore data.
+2. Launch `rkl` to open the Home screen, use `Tab` to move into the query inputs, and press `Ctrl-Enter` to run your `SELECT`.
+3. Switch environments with `F2` (or `:` → **Open Environments**), and use `LIST topics;` or the sample queries in the query language docs to explore data.
 
 ## Install
 
@@ -41,4 +41,3 @@ Uninstall from a custom location:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/suyash-sneo/rkl/HEAD/scripts/uninstall.sh | RKL_INSTALL_DIR="$HOME/bin" bash
 ```
-

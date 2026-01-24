@@ -2,12 +2,13 @@
 
 This is a concise reference to the primary TUI key bindings.
 
-- `Tab` cycles focus between Host bar, Query editor, and Results. The footer displays context-aware hints for each focus.
-- `Ctrl-Enter` runs the current `SELECT`. Plain `Enter` inserts a newline.
-- `Right` accepts autocomplete suggestions, while `Ctrl-N`/`Ctrl-P` navigate within them.
-- `Shift-Left/Right` horizontally scrolls the results table; `F5` copies the value column and `F7` copies the status panel.
-- `F2` opens the Environments screen, `F3` opens App Config, `F8` jumps Home, `F12` opens the Info screen, and `F10` toggles the About/Help screen. The top menu (Query / Envs / App Config / About) is clickable with the mouse.
-- `Ctrl-Q`/`Ctrl-C` exits at any time.
+- `Tab` / `Shift-Tab` cycle focus between the topic filter and query inputs. After a run completes, focus jumps to Results; `Esc` resets focus to the topic filter.
+- `Ctrl-Enter` runs the current query; `Ctrl-Shift-Enter` or `Ctrl-Shift-R` reruns the last successful query.
+- `/r` reruns, `/.` cycles ORDER field, `/,` toggles ORDER direction, `/d` opens record detail, `/c` or `/v` copies the selected cell, `/p` opens the command palette.
+- `//` at the start of a text area line opens the command palette; `Ctrl-R` opens query history.
+- Arrow keys move the results selection; `Shift-Left/Right` scrolls columns; `Enter` opens record detail.
+- `:` or `Ctrl-P` opens the command palette, `?` opens Help, `F2` opens Environments, `F3` opens App Config, `F8` jumps Home, and `F12` opens the Info screen.
+- `Ctrl-Q` / `Ctrl-C` exits at any time.
 
 See also:
 
