@@ -1406,26 +1406,26 @@ async fn handle_home_key(
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
     let shift = modifiers.contains(KeyModifiers::SHIFT);
 
-    // Slash leader commands from anywhere (non-text focus) for quick actions
+    let text_focus = matches!(
+        app.home_focus,
+        HomeFocus::TopicFilter
+            | HomeFocus::BasicSearch
+            | HomeFocus::BasicWhere
+            | HomeFocus::BasicLimit
+            | HomeFocus::AdvancedQuery
+    );
+    let mut inject_slash_and_key = false;
+
+    // Slash leader commands from anywhere for quick actions
     if key.modifiers.is_empty() {
         if matches!(code, KeyCode::Char('/')) {
-            if matches!(
-                app.home_focus,
-                HomeFocus::TopicFilter
-                    | HomeFocus::BasicSearch
-                    | HomeFocus::BasicWhere
-                    | HomeFocus::BasicLimit
-                    | HomeFocus::AdvancedQuery
-            ) {
-                // For text areas, let their handler do the double-slash detection
-            } else if app.slash_pending {
+            if app.slash_pending {
                 app.slash_pending = false;
                 open_command_palette(app);
                 return;
-            } else {
-                app.slash_pending = true;
-                return;
             }
+            app.slash_pending = true;
+            return;
         }
         if app.slash_pending {
             app.slash_pending = false;
@@ -1439,7 +1439,8 @@ async fn handle_home_key(
                     return;
                 }
                 KeyCode::Char(',') => {
-                    app.basic_query.order_dir_idx = if app.basic_query.order_dir_idx == 0 { 1 } else { 0 };
+                    app.basic_query.order_dir_idx =
+                        if app.basic_query.order_dir_idx == 0 { 1 } else { 0 };
                     return;
                 }
                 KeyCode::Char('d') => {
@@ -1461,9 +1462,34 @@ async fn handle_home_key(
                 }
                 _ => {}
             }
+            if text_focus && matches!(code, KeyCode::Char(_)) {
+                inject_slash_and_key = true;
+            }
         }
     } else if !matches!(code, KeyCode::Char('/')) {
         app.slash_pending = false;
+    }
+
+    if inject_slash_and_key {
+        if let Some(ta) = home_focus_textarea_mut(app, app.home_focus) {
+            let mut modified = false;
+            modified |= ta.input(TAInput {
+                key: TAKey::Char('/'),
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
+            modified |= ta.input(ta_input_from_key(key));
+            if modified {
+                if matches!(app.home_focus, HomeFocus::TopicFilter) {
+                    refresh_topic_matches(app);
+                }
+                if matches!(app.home_focus, HomeFocus::AdvancedQuery) {
+                    app.parse_status_dirty = true;
+                }
+            }
+        }
+        return;
     }
 
     if ctrl && matches!(code, KeyCode::Char('r')) {
