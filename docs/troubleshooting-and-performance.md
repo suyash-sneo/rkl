@@ -2,8 +2,8 @@
 
 ## Common issues
 
-- **SSL or SASL handshake errors**: confirm the CA, certificate, and private key PEMs belong to the selected broker; use `F5 Test` inside the Environments screen to validate before running queries.
-- **Metadata timeouts or empty topic lists**: verify the broker address, firewall rules, and authentication; run `LIST topics;` after pressing `F6` (Info screen) to refresh metadata.
+- **SSL or SASL handshake errors**: confirm the CA, certificate, and private key PEMs belong to the selected broker; use `/t` (or `F5`) inside the Environments screen to validate before running queries.
+- **Metadata timeouts or empty topic lists**: verify the broker address, firewall rules, and authentication; run `LIST topics;` after pressing `F6` or `r` in the Info screen to refresh metadata.
 - **Queries returning no rows**: remove `LIMIT`, double-check `WHERE` clauses (case-sensitive `CONTAINS`), and ensure the timestamp ordering matches your expectation.
 - **CLI output wrapping oddly**: tweak `--max-cell-width` or supply `--no-color` when piping into other tools.
 
@@ -29,4 +29,3 @@
 - If you just need "what's happening now", prefer:
   - `SELECT ... FROM topic ORDER BY timestamp DESC LIMIT n;`
   - This uses the optimized backward windowing from the end of the log and avoids scanning from the beginning.
-

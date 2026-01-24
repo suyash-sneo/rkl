@@ -7,6 +7,5 @@
 In the TUI:
 
 - Use the arrow keys or mouse wheel to inspect partitions.
-- Press `F5` to copy the selected value.
-- Press `Tab` to return to the query editor for the next command.
-
+- Press `/c` or `/v` (or `F5`) to copy the selected cell.
+- Press `Esc` to return focus to the topic filter, then `Tab` into the query inputs for the next command.

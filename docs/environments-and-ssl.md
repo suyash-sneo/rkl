@@ -4,15 +4,16 @@ RKL lets you manage multiple Kafka environments (hosts + credentials) from the T
 
 ## Managing environments
 
-- Press `F2` or hit `Enter` on the Host bar to open the Environments manager.
+- Press `F2` (or use `:` and pick **Open Environments**) to open the Environments manager.
 - The left list stores named hosts; the right pane contains fields for broker URL plus optional PEM fields for private key, certificate, and CA.
-- Use `F1` to create, `F2` to edit, `F3` to delete, and `F4` to save environments.
+- Slash leader shortcuts: `/n` new, `/d` delete, `/s` save, `/t` test, `/]` `/[` cycle environments. Function keys still work (`F1`, `F3`, `F4`, `F5`, `F6`, `F7`).
 - Use `Tab` / `Shift-Tab` to move between fields.
+- When the PEM editor is focused, use `/]` `/[` (or `Ctrl-Left/Right`) to switch PEM tabs.
 
 ## SSL and connectivity
 
 - Fields accept pasted PEM blobs.
-- `F5` tests connectivity with the currently edited credentials before returning to the Home screen.
+- Use `/t` (or `F5`) to test connectivity with the currently edited credentials; output streams into the Connection log panel.
 - For end-to-end TLS experiments (including mTLS), see `local-test/README.md` for a docker-compose scenario.
 
 ## Where environments are stored
@@ -99,6 +100,6 @@ You can supply PEMs in two ways:
    ```
 
 2. Add a file like `~/.rkl/configs/envs/dev.json` with the JSON schema above.
-3. Start or restart `rkl` and open `F2 Envs`; the new environment should appear under the `name` you set.
+3. Start or restart `rkl` and open `F2` (Envs); the new environment should appear under the `name` you set.
 
 You can mix TUI-edited environments and manually created JSON files; RKL will load all of them.
