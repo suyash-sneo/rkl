@@ -21,14 +21,9 @@ pub enum QueryMode {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum HomeFocus {
     TopicFilter,
-    TopicList,
     BasicSearch,
     BasicWhere,
-    BasicSince,
-    BasicUntil,
     BasicLimit,
-    BasicOrderField,
-    BasicOrderDir,
     AdvancedQuery,
     Results,
     Details,
@@ -45,8 +40,6 @@ pub struct TopicPickerState {
 pub struct BasicQueryState {
     pub search: TextArea<'static>,
     pub where_clause: TextArea<'static>,
-    pub since: TextArea<'static>,
-    pub until: TextArea<'static>,
     pub limit: TextArea<'static>,
     pub order_field_idx: usize,
     pub order_dir_idx: usize,
@@ -193,6 +186,7 @@ pub struct AppState {
     pub parse_status_dirty: bool,
     pub last_executed_query: Option<String>,
     pub record_detail_scroll: u16,
+    pub slash_pending: bool,
 }
 
 impl AppState {
@@ -230,8 +224,6 @@ impl AppState {
         let basic_query = BasicQueryState {
             search: build_single_line_input("Search value contains..."),
             where_clause: build_single_line_input("WHERE clause (optional)"),
-            since: build_single_line_input("Since timestamp (optional)"),
-            until: build_single_line_input("Until timestamp (optional)"),
             limit: build_single_line_input("Limit (optional)"),
             order_field_idx,
             order_dir_idx,
@@ -298,6 +290,7 @@ impl AppState {
             parse_status_dirty: false,
             last_executed_query: None,
             record_detail_scroll: 0,
+            slash_pending: false,
         }
     }
 

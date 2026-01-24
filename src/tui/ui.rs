@@ -16,12 +16,15 @@ use super::app::{
 };
 use super::timefmt::fmt_ts;
 
-const PANEL: Color = Color::Rgb(24, 27, 35);
-const RAISED: Color = Color::Rgb(32, 36, 46);
-const ACCENT: Color = Color::Rgb(120, 190, 255);
-const ACCENT_FADED: Color = Color::Rgb(90, 130, 180);
-const POSITIVE: Color = Color::Rgb(140, 220, 140);
-const NEGATIVE: Color = Color::Rgb(250, 130, 140);
+// 256-color-friendly palette to avoid odd tints across terminals.
+const PANEL: Color = Color::Indexed(236); // dark gray
+const RAISED: Color = Color::Indexed(238); // slightly lighter gray
+const ROW_HL: Color = Color::Indexed(240); // row highlight
+const CELL_HL: Color = Color::Indexed(220); // bright yellow for selected cell
+const ACCENT: Color = Color::Cyan; // buttons/pills
+const ACCENT_FADED: Color = Color::Gray;
+const POSITIVE: Color = Color::Green;
+const NEGATIVE: Color = Color::Red;
 
 static HELP_LINES: &[&str] = &[
     "Home",
@@ -72,11 +75,7 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
 fn draw_home(frame: &mut Frame, area: Rect, app: &AppState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(14),
-            Constraint::Length(6),
-        ])
+        .constraints([Constraint::Length(2), Constraint::Min(14), Constraint::Length(6)])
         .split(area);
 
     draw_header(frame, layout[0], app);
@@ -104,54 +103,31 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &AppState) {
         QueryMode::Basic => "Basic lookup",
         QueryMode::Advanced => "Advanced SQL",
     };
-    let focus = match app.home_focus {
-        HomeFocus::TopicFilter => "Topic filter",
-        HomeFocus::TopicList => "Topic list",
-        HomeFocus::BasicSearch => "Search contains",
-        HomeFocus::BasicWhere => "WHERE",
-        HomeFocus::BasicSince => "Since",
-        HomeFocus::BasicUntil => "Until",
-        HomeFocus::BasicLimit => "Limit",
-        HomeFocus::BasicOrderField => "Order field",
-        HomeFocus::BasicOrderDir => "Order dir",
-        HomeFocus::AdvancedQuery => "Editor",
-        HomeFocus::Results => "Results",
-        HomeFocus::Details => "Detail",
-    };
     let spinner = if app.query_in_progress {
         format!(
             "{} running… {}",
             SPINNER_FRAMES[app.query_spinner_idx % SPINNER_FRAMES.len()],
             app.query_rows_seen
         )
-    } else if let Some(last) = app.last_executed_query.as_ref() {
-        format!("Last: {}", truncate_with_ellipsis(last, 40))
     } else {
-        "Idle".to_string()
+        "Ready".to_string()
     };
 
     let content = Line::from(vec![
         Span::styled("Env ", Style::default().fg(ACCENT_FADED)),
-        Span::styled(env_name, Style::default().fg(ACCENT)),
+        Span::styled(env_name, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled("Host ", Style::default().fg(ACCENT_FADED)),
         Span::styled(host, Style::default().fg(Color::White)),
         Span::raw("  "),
         Span::styled("Mode ", Style::default().fg(ACCENT_FADED)),
         Span::styled(mode, Style::default().fg(Color::White)),
-        Span::raw("  "),
-        Span::styled("Focus ", Style::default().fg(ACCENT_FADED)),
-        Span::styled(focus, Style::default().fg(Color::White)),
         Span::raw("    "),
-        Span::styled(spinner, Style::default().fg(Color::Gray)),
+        Span::styled("Ctrl-P palette  ? help  /r rerun  Ctrl-Enter run", Style::default().fg(Color::Gray)),
         Span::raw("    "),
-        Span::styled("Ctrl-P palette • ? help • Ctrl-Enter run", Style::default().fg(Color::Gray)),
+        Span::styled(spinner, Style::default().fg(ACCENT_FADED)),
     ]);
 
-    let block = Block::default()
-        .borders(Borders::NONE)
-        .style(Style::default().bg(RAISED));
-    frame.render_widget(block, area);
     frame.render_widget(
         Paragraph::new(content)
             .alignment(Alignment::Left)
@@ -244,9 +220,8 @@ fn draw_basic_query(frame: &mut Frame, area: Rect, app: &AppState) {
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(1),
+            Constraint::Length(2),
+            Constraint::Length(2),
         ])
         .split(inner);
 
@@ -258,100 +233,64 @@ fn draw_basic_query(frame: &mut Frame, area: Rect, app: &AppState) {
         layout[0],
     );
 
-    render_textarea(
+    render_labeled_textarea(
         frame,
         layout[1],
+        "Value",
         &app.basic_query.search,
-        "Value contains",
         matches!(app.home_focus, HomeFocus::BasicSearch),
     );
-    render_textarea(
+    render_labeled_textarea(
         frame,
         layout[2],
-        &app.basic_query.where_clause,
         "WHERE (optional)",
+        &app.basic_query.where_clause,
         matches!(app.home_focus, HomeFocus::BasicWhere),
     );
 
-    let time_row = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(layout[3]);
-    render_textarea(
+    let limit_row = layout[3];
+    render_labeled_textarea(
         frame,
-        time_row[0],
-        &app.basic_query.since,
-        "Since (ts or date)",
-        matches!(app.home_focus, HomeFocus::BasicSince),
-    );
-    render_textarea(
-        frame,
-        time_row[1],
-        &app.basic_query.until,
-        "Until (ts or date)",
-        matches!(app.home_focus, HomeFocus::BasicUntil),
-    );
-
-    let limit_row = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(layout[4]);
-    render_textarea(
-        frame,
-        limit_row[0],
-        &app.basic_query.limit,
+        limit_row,
         "Limit (empty = auto)",
+        &app.basic_query.limit,
         matches!(app.home_focus, HomeFocus::BasicLimit),
     );
     draw_order_pills(
         frame,
-        limit_row[1],
+        layout[4],
         app.basic_query.order_field_idx,
         app.basic_query.order_dir_idx,
-        app,
     );
 
-    let tips = "Ctrl-Enter to run • Tab to move • Ctrl-/ to open palette";
+    let tips = "Tab: topic → value → where → limit  •  /. order  •  /, dir  •  /r rerun last";
     frame.render_widget(
         Paragraph::new(tips)
             .style(Style::default().fg(Color::Gray))
             .alignment(Alignment::Left),
-        layout[6],
+        layout[5],
     );
 }
 
-fn draw_order_pills(
-    frame: &mut Frame,
-    area: Rect,
-    field_idx: usize,
-    dir_idx: usize,
-    app: &AppState,
-) {
-    let focused_field = matches!(app.home_focus, HomeFocus::BasicOrderField);
-    let focused_dir = matches!(app.home_focus, HomeFocus::BasicOrderDir);
-    let row = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(2)])
-        .split(area);
-
+fn draw_order_pills(frame: &mut Frame, area: Rect, field_idx: usize, dir_idx: usize) {
     let mut spans = Vec::new();
-    spans.push(Span::styled("Order by ", Style::default().fg(Color::Gray)));
+    spans.push(Span::styled("Order ", Style::default().fg(ACCENT_FADED)));
     for (i, label) in ["timestamp", "poffset", "poffset_ts"].iter().enumerate() {
         let active = i == field_idx;
         spans.push(Span::raw(" "));
-        spans.push(pill(label, active, focused_field));
+        spans.push(pill(label, active, true));
     }
     spans.push(Span::raw("   "));
-    spans.push(Span::styled("Dir ", Style::default().fg(Color::Gray)));
+    spans.push(Span::styled("Dir ", Style::default().fg(ACCENT_FADED)));
     for (i, label) in ["ASC", "DESC"].iter().enumerate() {
         let active = i == dir_idx;
         spans.push(Span::raw(" "));
-        spans.push(pill(label, active, focused_dir));
+        spans.push(pill(label, active, true));
     }
 
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
-        row[1],
+        area,
     );
 }
 
@@ -414,6 +353,30 @@ fn render_textarea(frame: &mut Frame, area: Rect, ta: &TextArea<'_>, label: &str
     }
 }
 
+fn render_labeled_textarea(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    ta: &TextArea<'_>,
+    focused: bool,
+) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(24), Constraint::Min(1)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(label)
+            .alignment(Alignment::Right)
+            .style(
+                Style::default()
+                    .fg(if focused { ACCENT } else { ACCENT_FADED })
+                    .bg(if focused { RAISED } else { PANEL }),
+            ),
+        cols[0],
+    );
+    render_textarea(frame, cols[1], ta, "", focused);
+}
+
 fn draw_results(frame: &mut Frame, area: Rect, app: &AppState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -458,8 +421,9 @@ fn draw_results_header(frame: &mut Frame, area: Rect, app: &AppState) {
         spans.push(Span::styled(
             app.timestamp_toggle_label(),
             Style::default()
-                .fg(if app.timestamps_use_utc { Color::White } else { Color::LightCyan })
-                .bg(RAISED),
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     let line = Line::from(spans);
@@ -497,12 +461,7 @@ fn draw_topic_table(frame: &mut Frame, area: Rect, app: &AppState) {
 
     let table = Table::new(rows, [Constraint::Percentage(70), Constraint::Percentage(30)])
         .column_spacing(2)
-        .row_highlight_style(
-            Style::default()
-                .bg(ACCENT)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        )
+        .row_highlight_style(Style::default().bg(ROW_HL))
         .style(Style::default().bg(PANEL));
     frame.render_stateful_widget(table, area, &mut state);
 }
@@ -540,12 +499,7 @@ fn draw_message_table(frame: &mut Frame, area: Rect, app: &AppState) {
                 .style(Style::default().fg(Color::Gray))
                 .height(1),
         )
-        .row_highlight_style(
-            Style::default()
-                .bg(ACCENT)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        )
+        .row_highlight_style(Style::default().bg(ROW_HL))
         .column_spacing(1)
         .style(Style::default().bg(PANEL));
 
@@ -560,9 +514,10 @@ fn draw_message_table(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn build_row(idx: usize, env: &MessageEnvelope, app: &AppState) -> Row<'static> {
+    let row_selected = app.selected_row == idx;
     let mut cells = Vec::new();
     for (col_idx, col) in app.selected_columns.iter().enumerate() {
-        let text = match col {
+        let base_text = match col {
             SelectItem::Value => {
                 let raw = env.value.as_deref().unwrap_or("null");
                 let preview = json_preview(raw);
@@ -570,15 +525,24 @@ fn build_row(idx: usize, env: &MessageEnvelope, app: &AppState) -> Row<'static> 
             }
             _ => column_text(env, *col, app),
         };
-        let style = if app.selected_row == idx && app.selected_col == col_idx {
-            Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
+        let base_fg = match col {
+            SelectItem::Partition => Color::Gray,
+            SelectItem::Offset => Color::Cyan,
+            SelectItem::Timestamp => ACCENT_FADED,
+            SelectItem::Key => Color::Yellow,
+            SelectItem::Value => Color::White,
         };
-        cells.push(Cell::from(Span::styled(text, style)));
+        let mut style = Style::default().fg(base_fg);
+        if row_selected {
+            style = style.bg(ROW_HL);
+        }
+        if app.selected_row == idx && app.selected_col == col_idx {
+            style = Style::default()
+                .fg(Color::Black)
+                .bg(CELL_HL)
+                .add_modifier(Modifier::BOLD);
+        }
+        cells.push(Cell::from(Span::styled(base_text, style)));
     }
     Row::new(cells).height(1)
 }
@@ -615,6 +579,17 @@ fn draw_detail_preview(frame: &mut Frame, area: Rect, app: &AppState) {
 
 fn draw_status_log(frame: &mut Frame, area: Rect, app: &AppState) {
     let mut lines: Vec<Line> = Vec::new();
+    if let Some(last) = app.last_executed_query.as_ref() {
+        lines.push(
+            Line::from(vec![
+                Span::styled("Last (/r): ", Style::default().fg(Color::Black).bg(ACCENT)),
+                Span::styled(
+                    truncate_with_ellipsis(last, 120),
+                    Style::default().fg(Color::Black).bg(ACCENT),
+                ),
+            ]),
+        );
+    }
     if !app.status.is_empty() {
         lines.push(Line::from(app.status.clone()));
     }
@@ -1131,14 +1106,25 @@ fn draw_history_popup(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn pill(label: &str, active: bool, focused: bool) -> Span<'static> {
-    let (fg, bg) = if active {
-        (Color::Black, ACCENT)
+    if active {
+        Span::styled(
+            format!(" {} ", label),
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
     } else if focused {
-        (ACCENT_FADED, RAISED)
+        Span::styled(
+            format!(" {} ", label),
+            Style::default().fg(ACCENT_FADED).bg(RAISED),
+        )
     } else {
-        (Color::Gray, PANEL)
-    };
-    Span::styled(format!(" {} ", label), Style::default().fg(fg).bg(bg))
+        Span::styled(
+            format!(" {} ", label),
+            Style::default().fg(ACCENT_FADED).bg(PANEL),
+        )
+    }
 }
 
 fn inset(area: Rect, margin: u16) -> Rect {
@@ -1336,15 +1322,15 @@ fn record_detail_text(app: &AppState) -> (Vec<Line<'static>>, Vec<Line<'static>>
     let env = &app.rows[app.selected_row];
     let mut meta = Vec::new();
     meta.push(Line::from(vec![
-        Span::styled("Partition ", Style::default().fg(ACCENT_FADED)),
-        Span::raw(env.partition.to_string()),
+        Span::styled("Partition ", Style::default().fg(ACCENT_FADED).add_modifier(Modifier::BOLD)),
+        Span::styled(env.partition.to_string(), Style::default().fg(Color::White)),
         Span::raw("   "),
-        Span::styled("Offset ", Style::default().fg(ACCENT_FADED)),
-        Span::raw(env.offset.to_string()),
+        Span::styled("Offset ", Style::default().fg(ACCENT_FADED).add_modifier(Modifier::BOLD)),
+        Span::styled(env.offset.to_string(), Style::default().fg(Color::White)),
     ]));
     meta.push(Line::from(vec![
-        Span::styled("Timestamp ", Style::default().fg(ACCENT_FADED)),
-        Span::raw(fmt_ts(env.timestamp_ms, app.timestamps_use_utc)),
+        Span::styled("Timestamp ", Style::default().fg(ACCENT_FADED).add_modifier(Modifier::BOLD)),
+        Span::styled(fmt_ts(env.timestamp_ms, app.timestamps_use_utc), Style::default().fg(ACCENT)),
     ]));
     let key_text = if env.key.is_empty() {
         "(empty)".to_string()
@@ -1352,8 +1338,8 @@ fn record_detail_text(app: &AppState) -> (Vec<Line<'static>>, Vec<Line<'static>>
         env.key.clone()
     };
     meta.push(Line::from(vec![
-        Span::styled("Key ", Style::default().fg(ACCENT_FADED)),
-        Span::raw(key_text),
+        Span::styled("Key ", Style::default().fg(ACCENT_FADED).add_modifier(Modifier::BOLD)),
+        Span::styled(key_text, Style::default().fg(Color::Yellow)),
     ]));
 
     let body = if let Some(v) = env.value.as_ref() {

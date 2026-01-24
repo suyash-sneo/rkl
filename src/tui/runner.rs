@@ -182,6 +182,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     if Some(run_id) == app.current_run {
                         app.query_in_progress = false;
                         app.query_started_at = None;
+                        if matches!(app.screen, Screen::Home) {
+                            app.home_focus = HomeFocus::Results;
+                        }
                         push_status_line(&mut app, format!("✔ Completed run {run_id}"));
                     }
                 }
@@ -502,7 +505,8 @@ async fn run_pipeline_with_ssl(
     ssl: Option<crate::models::SslConfig>,
     app_config: AppConfig,
 ) -> Result<()> {
-    let mut ast = parse_query(&query_text).context("Failed to parse query")?;
+    let cleaned = strip_trailing_semicolon(&query_text);
+    let mut ast = parse_query(cleaned).context("Failed to parse query")?;
     let topic = ast.from.clone();
     let keys_only = !ast.select.iter().any(|i| matches!(i, SelectItem::Value));
 
@@ -1334,6 +1338,66 @@ async fn handle_home_key(
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
     let shift = modifiers.contains(KeyModifiers::SHIFT);
 
+    // Slash leader commands from anywhere (non-text focus) for quick actions
+    if key.modifiers.is_empty() {
+        if matches!(code, KeyCode::Char('/')) {
+            if matches!(
+                app.home_focus,
+                HomeFocus::TopicFilter
+                    | HomeFocus::BasicSearch
+                    | HomeFocus::BasicWhere
+                    | HomeFocus::BasicLimit
+                    | HomeFocus::AdvancedQuery
+            ) {
+                // For text areas, let their handler do the double-slash detection
+            } else if app.slash_pending {
+                app.slash_pending = false;
+                open_command_palette(app);
+                return;
+            } else {
+                app.slash_pending = true;
+                return;
+            }
+        }
+        if app.slash_pending {
+            app.slash_pending = false;
+            match code {
+                KeyCode::Char('r') => {
+                    rerun_last_query(app, args, tx_evt, run_counter).await;
+                    return;
+                }
+                KeyCode::Char('.') => {
+                    app.basic_query.order_field_idx = (app.basic_query.order_field_idx + 1) % 3;
+                    return;
+                }
+                KeyCode::Char(',') => {
+                    app.basic_query.order_dir_idx = if app.basic_query.order_dir_idx == 0 { 1 } else { 0 };
+                    return;
+                }
+                KeyCode::Char('d') => {
+                    if !app.rows.is_empty() {
+                        app.screen = Screen::RecordDetail;
+                        app.record_detail_scroll = 0;
+                    }
+                    return;
+                }
+                KeyCode::Char('c') | KeyCode::Char('v') => {
+                    if let Some(s) = selected_cell_text(app) {
+                        let _ = copy_to_clipboard(&s);
+                    }
+                    return;
+                }
+                KeyCode::Char('p') => {
+                    open_command_palette(app);
+                    return;
+                }
+                _ => {}
+            }
+        }
+    } else if !matches!(code, KeyCode::Char('/')) {
+        app.slash_pending = false;
+    }
+
     if ctrl && matches!(code, KeyCode::Char('r')) {
         if shift {
             rerun_last_query(app, args, tx_evt, run_counter).await;
@@ -1369,11 +1433,16 @@ async fn handle_home_key(
     }
 
     if matches!(code, KeyCode::Tab | KeyCode::Char('\t')) {
-        cycle_home_focus(app, true);
+        // Ignore tab in results mode to keep user anchored
+        if !matches!(app.home_focus, HomeFocus::Results) {
+            cycle_home_focus(app, true);
+        }
         return;
     }
     if matches!(code, KeyCode::BackTab) {
-        cycle_home_focus(app, false);
+        if !matches!(app.home_focus, HomeFocus::Results) {
+            cycle_home_focus(app, false);
+        }
         return;
     }
 
@@ -1395,9 +1464,37 @@ async fn handle_home_key(
 
     match app.home_focus {
         HomeFocus::TopicFilter => {
-            if matches!(code, KeyCode::Enter | KeyCode::Down) {
-                app.home_focus = HomeFocus::TopicList;
-                return;
+            match code {
+                KeyCode::Down => {
+                    if app.topic_picker.selected + 1 < app.topic_picker.matches.len() {
+                        app.topic_picker.selected += 1;
+                    }
+                    return;
+                }
+                KeyCode::Up => {
+                    if app.topic_picker.selected > 0 {
+                        app.topic_picker.selected -= 1;
+                    }
+                    return;
+                }
+                KeyCode::PageDown => {
+                    let step = 5.min(app.topic_picker.matches.len());
+                    let next = app.topic_picker.selected.saturating_add(step);
+                    app.topic_picker.selected =
+                        next.min(app.topic_picker.matches.len().saturating_sub(1));
+                    return;
+                }
+                KeyCode::PageUp => {
+                    let step = 5.min(app.topic_picker.matches.len());
+                    app.topic_picker.selected =
+                        app.topic_picker.selected.saturating_sub(step);
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Char('\t') | KeyCode::Enter => {
+                    app.home_focus = HomeFocus::BasicSearch;
+                    return;
+                }
+                _ => {}
             }
             let (open_palette, modified) = {
                 let Some(ta) = home_focus_textarea_mut(app, HomeFocus::TopicFilter) else {
@@ -1417,48 +1514,7 @@ async fn handle_home_key(
                 refresh_topic_matches(app);
             }
         }
-        HomeFocus::TopicList => {
-            let total = app.topic_picker.matches.len();
-            match code {
-                KeyCode::Up => {
-                    if app.topic_picker.selected > 0 {
-                        app.topic_picker.selected -= 1;
-                    }
-                }
-                KeyCode::Down => {
-                    if app.topic_picker.selected + 1 < total {
-                        app.topic_picker.selected += 1;
-                    }
-                }
-                KeyCode::PageUp => {
-                    let step = 5.min(total);
-                    app.topic_picker.selected = app.topic_picker.selected.saturating_sub(step);
-                }
-                KeyCode::PageDown => {
-                    if total > 0 {
-                        let step = 5.min(total);
-                        let next = app.topic_picker.selected.saturating_add(step);
-                        app.topic_picker.selected = next.min(total.saturating_sub(1));
-                    }
-                }
-                KeyCode::Left => {
-                    app.home_focus = HomeFocus::TopicFilter;
-                }
-                KeyCode::Right | KeyCode::Enter => {
-                    app.home_focus = if matches!(app.query_mode, QueryMode::Basic) {
-                        HomeFocus::BasicSearch
-                    } else {
-                        HomeFocus::AdvancedQuery
-                    };
-                }
-                _ => {}
-            }
-        }
-        HomeFocus::BasicSearch
-        | HomeFocus::BasicWhere
-        | HomeFocus::BasicSince
-        | HomeFocus::BasicUntil
-        | HomeFocus::BasicLimit => {
+        HomeFocus::BasicSearch | HomeFocus::BasicWhere | HomeFocus::BasicLimit => {
             if matches!(code, KeyCode::Enter) {
                 cycle_home_focus(app, true);
                 return;
@@ -1477,39 +1533,6 @@ async fn handle_home_key(
             if open_palette {
                 open_command_palette(app);
                 return;
-            }
-        }
-        HomeFocus::BasicOrderField => {
-            match code {
-                KeyCode::Left => {
-                    if app.basic_query.order_field_idx > 0 {
-                        app.basic_query.order_field_idx -= 1;
-                    }
-                }
-                KeyCode::Right => {
-                    if app.basic_query.order_field_idx < 2 {
-                        app.basic_query.order_field_idx += 1;
-                    }
-                }
-                KeyCode::Enter => {
-                    cycle_home_focus(app, true);
-                }
-                _ => {}
-            }
-        }
-        HomeFocus::BasicOrderDir => {
-            match code {
-                KeyCode::Left | KeyCode::Right => {
-                    app.basic_query.order_dir_idx = if app.basic_query.order_dir_idx == 0 {
-                        1
-                    } else {
-                        0
-                    };
-                }
-                KeyCode::Enter => {
-                    cycle_home_focus(app, true);
-                }
-                _ => {}
             }
         }
         HomeFocus::AdvancedQuery => {
@@ -1536,6 +1559,12 @@ async fn handle_home_key(
                 return;
             }
             match code {
+                KeyCode::Char('f') => {
+                    if !app.rows.is_empty() {
+                        app.screen = Screen::RecordDetail;
+                        app.record_detail_scroll = 0;
+                    }
+                }
                 KeyCode::Up => {
                     if app.selected_row > 0 {
                         app.selected_row -= 1;
@@ -1603,6 +1632,7 @@ async fn handle_home_key(
                 }
                 KeyCode::Enter => {
                     if !app.rows.is_empty() {
+                        app.home_focus = HomeFocus::Details;
                         app.screen = Screen::RecordDetail;
                         app.record_detail_scroll = 0;
                     }
@@ -2069,26 +2099,12 @@ fn should_open_palette_on_double_slash(ta: &mut TextArea, key: KeyEvent) -> bool
     true
 }
 
-const BASIC_FOCUS_ORDER: &[HomeFocus] = &[
-    HomeFocus::TopicFilter,
-    HomeFocus::TopicList,
-    HomeFocus::BasicSearch,
-    HomeFocus::BasicWhere,
-    HomeFocus::BasicSince,
-    HomeFocus::BasicUntil,
-    HomeFocus::BasicLimit,
-    HomeFocus::BasicOrderField,
-    HomeFocus::BasicOrderDir,
-    HomeFocus::Results,
-    HomeFocus::Details,
-];
+const BASIC_FOCUS_ORDER: &[HomeFocus] =
+    &[HomeFocus::TopicFilter, HomeFocus::BasicSearch, HomeFocus::BasicWhere, HomeFocus::BasicLimit];
 
 const ADVANCED_FOCUS_ORDER: &[HomeFocus] = &[
     HomeFocus::TopicFilter,
-    HomeFocus::TopicList,
     HomeFocus::AdvancedQuery,
-    HomeFocus::Results,
-    HomeFocus::Details,
 ];
 
 fn home_focus_order(mode: QueryMode) -> &'static [HomeFocus] {
@@ -2119,8 +2135,6 @@ fn home_focus_textarea_mut(
         HomeFocus::TopicFilter => Some(&mut app.topic_picker.filter),
         HomeFocus::BasicSearch => Some(&mut app.basic_query.search),
         HomeFocus::BasicWhere => Some(&mut app.basic_query.where_clause),
-        HomeFocus::BasicSince => Some(&mut app.basic_query.since),
-        HomeFocus::BasicUntil => Some(&mut app.basic_query.until),
         HomeFocus::BasicLimit => Some(&mut app.basic_query.limit),
         HomeFocus::AdvancedQuery => Some(&mut app.query_editor),
         _ => None,
@@ -2197,23 +2211,12 @@ fn escape_sql_literal(raw: &str) -> String {
     raw.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
-fn normalize_timestamp_literal(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.chars().all(|c| c.is_ascii_digit()) {
-        trimmed.to_string()
-    } else {
-        format!("'{}'", escape_sql_literal(trimmed))
-    }
-}
-
 fn build_basic_query_text(app: &AppState) -> Result<String, String> {
     let Some(topic) = selected_topic_name(app) else {
         return Err("Select a topic first".to_string());
     };
     let search = textarea_text(&app.basic_query.search).trim().to_string();
     let where_raw = textarea_text(&app.basic_query.where_clause).trim().to_string();
-    let since = textarea_text(&app.basic_query.since).trim().to_string();
-    let until = textarea_text(&app.basic_query.until).trim().to_string();
     let limit_raw = textarea_text(&app.basic_query.limit).trim().to_string();
 
     let mut clauses: Vec<String> = Vec::new();
@@ -2226,18 +2229,6 @@ fn build_basic_query_text(app: &AppState) -> Result<String, String> {
     let where_clause = normalize_where_clause(&where_raw);
     if !where_clause.is_empty() {
         clauses.push(format!("({})", where_clause));
-    }
-    if !since.is_empty() {
-        clauses.push(format!(
-            "timestamp >= {}",
-            normalize_timestamp_literal(&since)
-        ));
-    }
-    if !until.is_empty() {
-        clauses.push(format!(
-            "timestamp <= {}",
-            normalize_timestamp_literal(&until)
-        ));
     }
 
     let where_sql = if clauses.is_empty() {
