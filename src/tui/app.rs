@@ -12,11 +12,134 @@ pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 
 pub const QUERY_HISTORY_LIMIT: usize = 200;
 
-#[derive(Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum QueryMode {
+    Basic,
+    Advanced,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum HomeFocus {
+    TopicFilter,
+    TopicList,
+    BasicSearch,
+    BasicWhere,
+    BasicSince,
+    BasicUntil,
+    BasicLimit,
+    BasicOrderField,
+    BasicOrderDir,
+    AdvancedQuery,
+    Results,
+    Details,
+}
+
+#[derive(Debug, Clone)]
+pub struct TopicPickerState {
+    pub filter: TextArea<'static>,
+    pub matches: Vec<usize>,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct BasicQueryState {
+    pub search: TextArea<'static>,
+    pub where_clause: TextArea<'static>,
+    pub since: TextArea<'static>,
+    pub until: TextArea<'static>,
+    pub limit: TextArea<'static>,
+    pub order_field_idx: usize,
+    pub order_dir_idx: usize,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum CommandId {
+    SwitchToBasic,
+    SwitchToAdvanced,
+    OpenEnvs,
+    OpenAppConfig,
+    OpenInfo,
+    OpenHelp,
+    OpenHistory,
+    RefreshTopics,
+    ToggleTimestampMode,
+    ClearResults,
+}
+
+pub struct CommandSpec {
+    pub id: CommandId,
+    pub label: &'static str,
+    pub hint: &'static str,
+}
+
+pub const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        id: CommandId::SwitchToBasic,
+        label: "Switch to Basic mode",
+        hint: "Browse topics with filters",
+    },
+    CommandSpec {
+        id: CommandId::SwitchToAdvanced,
+        label: "Switch to Advanced mode",
+        hint: "Full SQL editor",
+    },
+    CommandSpec {
+        id: CommandId::OpenEnvs,
+        label: "Open Environments",
+        hint: "Edit hosts and SSL",
+    },
+    CommandSpec {
+        id: CommandId::OpenAppConfig,
+        label: "Open App Config",
+        hint: "Defaults and tuning",
+    },
+    CommandSpec {
+        id: CommandId::OpenInfo,
+        label: "Open Topics Info",
+        hint: "Refresh metadata",
+    },
+    CommandSpec {
+        id: CommandId::OpenHelp,
+        label: "Open Help",
+        hint: "Key map and tips",
+    },
+    CommandSpec {
+        id: CommandId::OpenHistory,
+        label: "Open Query History",
+        hint: "Search executed queries",
+    },
+    CommandSpec {
+        id: CommandId::RefreshTopics,
+        label: "Refresh topic list",
+        hint: "Reload broker metadata",
+    },
+    CommandSpec {
+        id: CommandId::ToggleTimestampMode,
+        label: "Toggle timestamps (UTC/Local)",
+        hint: "Switch display mode",
+    },
+    CommandSpec {
+        id: CommandId::ClearResults,
+        label: "Clear results",
+        hint: "Drop table output",
+    },
+];
+
+#[derive(Debug, Clone)]
+pub struct CommandPaletteState {
+    pub open: bool,
+    pub input: TextArea<'static>,
+    pub matches: Vec<usize>,
+    pub selected: usize,
+}
+
 pub struct AppState {
-    pub input: String,
-    pub input_cursor: usize,
-    pub input_vscroll: u16,
+    pub query_mode: QueryMode,
+    pub home_focus: HomeFocus,
+    pub query_editor: TextArea<'static>,
+    pub topic_picker: TopicPickerState,
+    pub basic_query: BasicQueryState,
+    pub command_palette: CommandPaletteState,
     pub status: String,
     pub status_buffer: String,
     pub status_vscroll: u16,
@@ -27,11 +150,9 @@ pub struct AppState {
     pub current_run: Option<u64>,
     pub max_rows_in_memory: usize,
     pub host: String,
-    pub focus: Focus,
     pub selected_row: usize,
     pub selected_col: usize,
     pub env_store: EnvStore,
-    pub show_env_modal: bool,
     pub env_editor: Option<EnvEditor>,
     pub app_config: AppConfig,
     pub app_config_editor: Option<AppConfigEditor>,
@@ -42,7 +163,6 @@ pub struct AppState {
     pub json_vscroll: u16,
     pub copy_btn_pressed: bool,
     pub copy_btn_deadline: Option<Instant>,
-    pub last_run_query_range: Option<(usize, usize)>,
     // Env test status within the modal
     pub env_test_in_progress: bool,
     pub env_test_message: Option<String>,
@@ -50,22 +170,16 @@ pub struct AppState {
     pub env_conn_vscroll: u16,
     pub env_save_pressed: bool,
     pub env_save_deadline: Option<Instant>,
-    pub mouse_selection_mode: bool,
     // Screens
     pub screen: Screen,
     pub help_vscroll: u32,
-    pub last_screen_before_about: Option<Screen>,
-    pub menu_pressed_screen: Option<Screen>,
-    pub menu_pressed_deadline: Option<Instant>,
+    pub last_screen_before_help: Option<Screen>,
     pub timestamps_use_utc: bool,
     pub timestamp_switch_pressed: bool,
     pub timestamp_switch_deadline: Option<Instant>,
     // Info screen
     pub topics: Vec<String>,
-    pub autocomplete: Option<AutoCompleteState>,
     pub topics_last_fetched_at: Option<Instant>,
-    pub autocomplete_frozen_token: Option<(usize, usize, String)>,
-    pub autocomplete_dirty: bool,
     pub query_in_progress: bool,
     pub query_limit: Option<usize>,
     pub query_rows_seen: usize,
@@ -78,6 +192,7 @@ pub struct AppState {
     pub parse_error_msg: Option<String>,
     pub parse_status_dirty: bool,
     pub last_executed_query: Option<String>,
+    pub record_detail_scroll: u16,
 }
 
 impl AppState {
@@ -97,10 +212,43 @@ impl AppState {
         }
         let history = load_query_history_from_disk();
         let history_idx = history.len().saturating_sub(1);
+        let query_editor = build_query_editor(&initial_input);
+        let topic_picker = TopicPickerState {
+            filter: build_single_line_input("Filter topics"),
+            matches: Vec::new(),
+            selected: 0,
+        };
+        let order_dir_idx = match app_config.default_order_dir {
+            DefaultOrderDir::Asc => 0,
+            DefaultOrderDir::Desc => 1,
+        };
+        let order_field_idx = match app_config.default_order_field {
+            DefaultOrderField::Timestamp => 0,
+            DefaultOrderField::Poffset => 1,
+            DefaultOrderField::PoffsetTs => 2,
+        };
+        let basic_query = BasicQueryState {
+            search: build_single_line_input("Search value contains..."),
+            where_clause: build_single_line_input("WHERE clause (optional)"),
+            since: build_single_line_input("Since timestamp (optional)"),
+            until: build_single_line_input("Until timestamp (optional)"),
+            limit: build_single_line_input("Limit (optional)"),
+            order_field_idx,
+            order_dir_idx,
+        };
+        let command_palette = CommandPaletteState {
+            open: false,
+            input: build_single_line_input("Type a command"),
+            matches: Vec::new(),
+            selected: 0,
+        };
         Self {
-            input: initial_input.clone(),
-            input_cursor: initial_input.len(),
-            input_vscroll: 0,
+            query_mode: QueryMode::Basic,
+            home_focus: HomeFocus::TopicFilter,
+            query_editor,
+            topic_picker,
+            basic_query,
+            command_palette,
             status: String::from("Enter a query and press Ctrl-Enter to run"),
             status_buffer: String::new(),
             status_vscroll: 0,
@@ -111,11 +259,9 @@ impl AppState {
             current_run: None,
             max_rows_in_memory: 2000,
             host,
-            focus: Focus::Host,
             selected_row: 0,
             selected_col: 0,
             env_store,
-            show_env_modal: false,
             env_editor: None,
             app_config: app_config.clone(),
             app_config_editor: Some(build_app_config_editor(&app_config)),
@@ -125,27 +271,20 @@ impl AppState {
             json_vscroll: 0,
             copy_btn_pressed: false,
             copy_btn_deadline: None,
-            last_run_query_range: None,
             env_test_in_progress: false,
             env_test_message: None,
             env_test_log: String::new(),
             env_conn_vscroll: 0,
             env_save_pressed: false,
             env_save_deadline: None,
-            mouse_selection_mode: false,
             screen: Screen::Home,
             help_vscroll: 0,
-            last_screen_before_about: None,
-            menu_pressed_screen: None,
-            menu_pressed_deadline: None,
+            last_screen_before_help: None,
             timestamps_use_utc: app_config.default_timestamps_use_utc,
             timestamp_switch_pressed: false,
             timestamp_switch_deadline: None,
             topics: Vec::new(),
-            autocomplete: None,
             topics_last_fetched_at: None,
-            autocomplete_frozen_token: None,
-            autocomplete_dirty: false,
             query_in_progress: false,
             query_limit: None,
             query_rows_seen: 0,
@@ -158,6 +297,7 @@ impl AppState {
             parse_error_msg: None,
             parse_status_dirty: false,
             last_executed_query: None,
+            record_detail_scroll: 0,
         }
     }
 
@@ -180,6 +320,24 @@ impl AppState {
     pub fn update_query_progress_rows(&mut self, total_emitted: usize) {
         self.query_rows_seen = total_emitted;
     }
+}
+
+fn build_query_editor(initial: &str) -> TextArea<'static> {
+    let mut ta = if initial.trim().is_empty() {
+        TextArea::default()
+    } else {
+        TextArea::from(initial.lines())
+    };
+    ta.set_tab_length(2);
+    ta.set_placeholder_text("Write a SELECT query...");
+    ta
+}
+
+fn build_single_line_input(placeholder: &str) -> TextArea<'static> {
+    let mut ta = TextArea::default();
+    ta.set_tab_length(2);
+    ta.set_placeholder_text(placeholder);
+    ta
 }
 
 pub fn build_app_config_editor(config: &AppConfig) -> AppConfigEditor {
@@ -240,38 +398,10 @@ pub enum TuiEvent {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
-pub enum Focus {
-    #[default]
-    Host,
-    Query,
-    Results,
-}
-
-impl AppState {
-    pub fn next_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Host => Focus::Query,
-            Focus::Query => Focus::Results,
-            Focus::Results => Focus::Host,
-        };
-    }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub enum ResultsMode {
     #[default]
     Messages,
     TopicList,
-}
-
-#[derive(Debug, Clone)]
-pub struct AutoCompleteState {
-    pub active: bool,
-    pub filter: String,
-    pub suggestions: Vec<String>,
-    pub selected: usize,
-    pub token_abs_start: usize,
-    pub token_abs_end: usize,
 }
 
 impl AppState {
@@ -364,8 +494,7 @@ pub struct EnvEditor {
     pub ta_private: TextArea<'static>,
     pub ta_public: TextArea<'static>,
     pub ta_ca: TextArea<'static>,
-    #[allow(dead_code)]
-    pub ssl_ca_cursor: usize,
+    pub active_pem: EnvPemField,
     pub field_focus: EnvFieldFocus,
 }
 
@@ -381,13 +510,19 @@ pub struct AppConfigEditor {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum EnvFieldFocus {
+    List,
     Name,
     Host,
+    PemEditor,
+    Conn,
+    Buttons,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum EnvPemField {
     PrivateKey,
     PublicKey,
     Ca,
-    Conn,
-    Buttons,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -414,7 +549,8 @@ pub enum Screen {
     Envs,
     Info,
     AppConfig,
-    About,
+    Help,
+    RecordDetail,
 }
 
 fn history_file_path() -> PathBuf {

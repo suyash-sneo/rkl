@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -11,7 +11,6 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, terminal};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use tokio::sync::mpsc;
 
 use crate::app_config::{AppConfig, DefaultOrderDir, DefaultOrderField};
@@ -34,20 +33,15 @@ use rdkafka::consumer::ConsumerContext;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 
 use super::app::{
-    AppConfigFieldFocus, AppState, AutoCompleteState, EnvEditor, EnvFieldFocus, ResultsMode,
-    SPINNER_FRAMES, Screen, TuiEvent, build_app_config_editor,
+    AppConfigFieldFocus, AppState, CommandId, EnvEditor, EnvFieldFocus, EnvPemField, HomeFocus,
+    QueryMode, ResultsMode, SPINNER_FRAMES, Screen, TuiEvent, COMMAND_SPECS,
+    build_app_config_editor,
 };
 use super::env_store::Environment;
-use super::env_store::config_dir;
 use super::pem_utils::{decode_literal_backslash_n, normalize_pem_input};
 use super::query_bounds::{find_query_range, strip_trailing_semicolon};
 use super::timefmt::fmt_ts;
 use super::ui::{draw, help_content_line_count};
-
-const ENV_COPY_LABEL: &str = "[Copy]";
-const ENV_PASTE_LABEL: &str = "[Paste]";
-const ENV_CLEAR_LABEL: &str = "[Clear]";
-const ENV_CONN_PASTE_LABEL: &str = "[Paste/F9 Select]";
 
 fn next_unique_env_name(envs: &[Environment]) -> String {
     let base = "New Env";
@@ -60,11 +54,6 @@ fn next_unique_env_name(envs: &[Environment]) -> String {
         n += 1;
     }
 }
-use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write as _;
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 use tui_textarea::{Input as TAInput, Key as TAKey, TextArea};
 
 pub async fn run(args: RunArgs) -> Result<()> {
@@ -75,7 +64,6 @@ pub async fn run(args: RunArgs) -> Result<()> {
     execute!(
         stdout,
         terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::REPORT_EVENT_TYPES
                 | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -88,6 +76,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
     let (tx_evt, mut rx_evt) = mpsc::unbounded_channel::<TuiEvent>();
     let mut app = AppState::new(args.query.clone().unwrap_or_default(), args.broker.clone());
     update_parse_status(&mut app);
+    app.topics_last_fetched_at = Some(Instant::now());
+    fetch_topics_async(&app, tx_evt.clone());
 
     let mut run_counter: u64 = 0;
 
@@ -137,13 +127,6 @@ pub async fn run(args: RunArgs) -> Result<()> {
                 app.app_config_save_pressed = false;
             }
         }
-        if let Some(deadline) = app.menu_pressed_deadline {
-            if Instant::now() >= deadline {
-                app.menu_pressed_screen = None;
-                app.menu_pressed_deadline = None;
-            }
-        }
-
         if app.query_in_progress {
             app.query_spinner_idx = (app.query_spinner_idx + 1) % SPINNER_FRAMES.len();
         }
@@ -233,9 +216,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                 }
                 TuiEvent::Topics(list) => {
                     app.topics = list;
-                    if app.autocomplete.is_some() {
-                        maybe_update_autocomplete(&mut app, &tx_evt, true);
-                    }
+                    refresh_topic_matches(&mut app);
                 }
                 TuiEvent::TopicsWithPartitions(list) => {
                     app.topics_with_partitions = list;
@@ -260,1324 +241,50 @@ pub async fn run(args: RunArgs) -> Result<()> {
         if crossterm::event::poll(Duration::from_millis(50))? {
             match crossterm::event::read()? {
                 Event::Key(key) => {
-                    // Honor both Press and Repeat so held keys accelerate movement/editing.
                     if !(key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat) {
                         continue;
                     }
-                    let KeyEvent {
-                        code, modifiers, ..
-                    } = key;
-                    if (matches!(code, KeyCode::Char('c') | KeyCode::Char('q'))
-                        && modifiers.contains(KeyModifiers::CONTROL))
+                    let KeyEvent { code, modifiers, .. } = key;
+                    if matches!(code, KeyCode::Char('c') | KeyCode::Char('q'))
+                        && modifiers.contains(KeyModifiers::CONTROL)
                     {
                         break Ok(());
+                    }
+                    if app.command_palette.open {
+                        handle_command_palette_key(&mut app, key, &tx_evt);
+                        continue;
                     }
                     if app.show_history_popup {
                         handle_history_popup_key(&mut app, code, modifiers);
                         continue;
                     }
-                    if matches!(app.screen, Screen::About) {
-                        match code {
-                            KeyCode::Esc | KeyCode::F(10) => {
-                                app.screen = app.last_screen_before_about.unwrap_or(Screen::Home);
-                                continue;
-                            }
-                            KeyCode::Up => {
-                                scroll_help(&mut app, -1);
-                                continue;
-                            }
-                            KeyCode::Down => {
-                                scroll_help(&mut app, 1);
-                                continue;
-                            }
-                            KeyCode::PageUp => {
-                                scroll_help(&mut app, -10);
-                                continue;
-                            }
-                            KeyCode::PageDown => {
-                                scroll_help(&mut app, 10);
-                                continue;
-                            }
-                            KeyCode::Home => {
-                                app.help_vscroll = 0;
-                                continue;
-                            }
-                            KeyCode::End => {
-                                jump_help_to_end(&mut app);
-                                continue;
-                            }
-                            _ => {}
-                        }
+                    if handle_global_shortcuts(&mut app, key, &tx_evt) {
+                        continue;
                     }
-                    match (code, modifiers) {
-                        (KeyCode::F(10), _) => {
-                            if matches!(app.screen, Screen::About) {
-                                app.screen = app.last_screen_before_about.unwrap_or(Screen::Home);
-                            } else {
-                                app.last_screen_before_about = Some(app.screen);
-                                app.screen = Screen::About;
-                                app.help_vscroll = 0;
-                                app.show_history_popup = false;
-                            }
+                    match app.screen {
+                        Screen::Home => {
+                            handle_home_key(&mut app, &args, &tx_evt, &mut run_counter, key).await;
                         }
-                        (KeyCode::F(8), _) => {
-                            app.screen = Screen::Home;
-                            app.show_history_popup = false;
+                        Screen::Envs => {
+                            handle_env_key(&mut app, key, &tx_evt);
                         }
-                        (KeyCode::F(2), _) => {
-                            app.screen = Screen::Envs;
-                            app.show_history_popup = false;
-                            app.autocomplete = None;
-                            if app.env_editor.is_none() {
-                                if let Some(i) = app.env_store.selected {
-                                    if let Some(e) = app.env_store.envs.get(i) {
-                                        app.env_editor =
-                                            Some(build_env_editor_from_env(e, Some(i)));
-                                    }
-                                }
-                            }
+                        Screen::Info => {
+                            handle_info_key(&mut app, key, &tx_evt);
                         }
-                        (KeyCode::F(12), _) => {
-                            app.screen = Screen::Info;
-                            app.show_history_popup = false;
-                            app.autocomplete = None;
-                            app.topics_last_fetched_at = Some(Instant::now());
-                            fetch_topics_async(&app, tx_evt.clone());
+                        Screen::AppConfig => {
+                            handle_app_config_key(&mut app, key);
                         }
-                        (KeyCode::F(6), _) => {
-                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                                move_env_selection(&mut app, 1);
-                            } else if matches!(app.screen, Screen::Info) {
-                                app.topics_last_fetched_at = Some(Instant::now());
-                                fetch_topics_async(&app, tx_evt.clone());
-                            }
+                        Screen::Help => {
+                            handle_help_key(&mut app, key);
                         }
-                        (KeyCode::F(7), _) => {
-                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                                move_env_selection(&mut app, -1);
-                            } else {
-                                let txt = if app.status_buffer.is_empty() {
-                                    app.status.clone()
-                                } else {
-                                    app.status_buffer.clone()
-                                };
-                                if !txt.trim().is_empty() {
-                                    let _ = copy_to_clipboard(&txt);
-                                }
-                            }
+                        Screen::RecordDetail => {
+                            handle_record_detail_key(&mut app, key);
                         }
-                        (KeyCode::Char('r'), m)
-                            if m.contains(KeyModifiers::CONTROL)
-                                && m.contains(KeyModifiers::SHIFT) =>
-                        {
-                            if matches!(app.screen, Screen::Home)
-                                && !app.show_env_modal
-                                && matches!(app.focus, super::app::Focus::Query)
-                            {
-                                rerun_last_query(&mut app, &args, &tx_evt, &mut run_counter).await;
-                            }
-                        }
-                        (KeyCode::Char('r'), m)
-                            if m.contains(KeyModifiers::CONTROL)
-                                && !m.contains(KeyModifiers::SHIFT) =>
-                        {
-                            if matches!(app.screen, Screen::Home)
-                                && !app.show_env_modal
-                                && matches!(app.focus, super::app::Focus::Query)
-                            {
-                                if app.query_history.is_empty() {
-                                    push_status_line(&mut app, "No query history yet".to_string());
-                                } else {
-                                    app.show_history_popup = true;
-                                    app.history_selected_index =
-                                        app.query_history.len().saturating_sub(1);
-                                }
-                            }
-                        }
-                        // Some macOS terminals send Ctrl-Enter as Ctrl-J (LF) or Ctrl-M (CR)
-                        // Ctrl-Enter (and common terminal fallbacks) → run
-                        (KeyCode::Char('j'), m) | (KeyCode::Char('m'), m)
-                            if m.contains(KeyModifiers::CONTROL) =>
-                        {
-                            if matches!(app.screen, Screen::Home)
-                                && !app.show_env_modal
-                                && matches!(app.focus, super::app::Focus::Query)
-                            {
-                                if m.contains(KeyModifiers::SHIFT) {
-                                    rerun_last_query(&mut app, &args, &tx_evt, &mut run_counter)
-                                        .await;
-                                } else {
-                                    run_query_from_editor(
-                                        &mut app,
-                                        &args,
-                                        &tx_evt,
-                                        &mut run_counter,
-                                    )
-                                    .await;
-                                }
-                            }
-                        }
-                        (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
-                            if matches!(app.screen, Screen::Home)
-                                && !app.show_env_modal
-                                && matches!(app.focus, super::app::Focus::Query)
-                            {
-                                if m.contains(KeyModifiers::SHIFT) {
-                                    rerun_last_query(&mut app, &args, &tx_evt, &mut run_counter)
-                                        .await;
-                                } else {
-                                    run_query_from_editor(
-                                        &mut app,
-                                        &args,
-                                        &tx_evt,
-                                        &mut run_counter,
-                                    )
-                                    .await;
-                                }
-                            }
-                        }
-                        // Enter: editor newline; open env screen from host bar
-                        (KeyCode::Enter, _) => {
-                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                                if let Some(ed) = app.env_editor.as_mut() {
-                                    match ed.field_focus {
-                                        EnvFieldFocus::PrivateKey => {
-                                            ed.ta_private.input(ta_input_from_key(key));
-                                        }
-                                        EnvFieldFocus::PublicKey => {
-                                            ed.ta_public.input(ta_input_from_key(key));
-                                        }
-                                        EnvFieldFocus::Ca => {
-                                            ed.ta_ca.input(ta_input_from_key(key));
-                                        }
-                                        EnvFieldFocus::Name => {}
-                                        EnvFieldFocus::Host => {}
-                                        _ => {}
-                                    }
-                                }
-                            } else if matches!(app.screen, Screen::AppConfig) {
-                                ensure_app_config_editor(&mut app);
-                                if let Some(ed) = app.app_config_editor.as_mut() {
-                                    match ed.field_focus {
-                                        AppConfigFieldFocus::TimestampsUseUtc => {
-                                            ed.timestamps_use_utc = !ed.timestamps_use_utc;
-                                        }
-                                        AppConfigFieldFocus::Buttons => {
-                                            attempt_save_app_config(&mut app);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Host) {
-                                // Open env screen
-                                let (idx, env) = if let Some(env) = app.selected_env() {
-                                    (app.env_store.selected, env.clone())
-                                } else {
-                                    (
-                                        None,
-                                        Environment {
-                                            name: String::new(),
-                                            host: app.host.clone(),
-                                            private_key_pem: None,
-                                            public_key_pem: None,
-                                            ssl_ca_pem: None,
-                                        },
-                                    )
-                                };
-                                let mut editor = build_env_editor_from_env(&env, idx);
-                                editor.name_cursor = editor.name.len();
-                                editor.host_cursor = editor.host.len();
-                                app.env_editor = Some(editor);
-                                app.screen = Screen::Envs;
-                                app.autocomplete = None;
-                            } else if matches!(app.focus, super::app::Focus::Query) {
-                                // Enter inserts newline in editor, ensure caret stays visible
-                                app.input.insert(app.input_cursor, '\n');
-                                app.input_cursor += 1;
-                                ensure_input_cursor_visible(&mut app);
-                                app.parse_status_dirty = true;
-                                app.autocomplete = None;
-                                app.autocomplete_dirty = false;
-                            } else {
-                                // Results: ignore Enter
-                            }
-                        }
-                        (KeyCode::Char('n'), m) if m.contains(KeyModifiers::CONTROL) => {
-                            if matches!(app.focus, super::app::Focus::Query) {
-                                move_autocomplete_selection(&mut app, true);
-                            }
-                        }
-                        (KeyCode::Char('p'), m) if m.contains(KeyModifiers::CONTROL) => {
-                            if matches!(app.focus, super::app::Focus::Query) {
-                                move_autocomplete_selection(&mut app, false);
-                            }
-                        }
-                        (KeyCode::Char('y'), m) if m.contains(KeyModifiers::CONTROL) => {
-                            if matches!(app.focus, super::app::Focus::Query)
-                                && try_accept_autocomplete(&mut app)
-                            {
-                                continue;
-                            }
-                        }
-                        (KeyCode::Backspace, m) => {
-                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                                let mut meta_changed = false;
-                                if let Some(ed) = app.env_editor.as_mut() {
-                                    match ed.field_focus {
-                                        EnvFieldFocus::Name => {
-                                            if ed.name_cursor > 0 {
-                                                ed.name.remove(ed.name_cursor - 1);
-                                                ed.name_cursor -= 1;
-                                                meta_changed = true;
-                                            }
-                                        }
-                                        EnvFieldFocus::Host => {
-                                            if ed.host_cursor > 0 {
-                                                ed.host.remove(ed.host_cursor - 1);
-                                                ed.host_cursor -= 1;
-                                                meta_changed = true;
-                                            }
-                                        }
-                                        EnvFieldFocus::PrivateKey => {
-                                            ed.ta_private.input(ta_input_from_key(key));
-                                        }
-                                        EnvFieldFocus::PublicKey => {
-                                            ed.ta_public.input(ta_input_from_key(key));
-                                        }
-                                        EnvFieldFocus::Ca => {
-                                            ed.ta_ca.input(ta_input_from_key(key));
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                if meta_changed {
-                                    sync_env_metadata_from_editor(&mut app);
-                                }
-                                continue;
-                            }
-                            if matches!(app.screen, Screen::AppConfig) {
-                                ensure_app_config_editor(&mut app);
-                                if let Some(ed) = app.app_config_editor.as_mut() {
-                                    match ed.field_focus {
-                                        AppConfigFieldFocus::QueryScanMultiplier => {
-                                            ed.query_scan_multiplier.pop();
-                                        }
-                                        AppConfigFieldFocus::DefaultLimit => {
-                                            ed.default_limit.pop();
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                continue;
-                            }
-                            match app.focus {
-                                super::app::Focus::Host => { /* no-op */ }
-                                super::app::Focus::Query => {
-                                    let mut dirty = false;
-                                    if has_ctrl_or_alt(m) {
-                                        if delete_prev_word(&mut app) {
-                                            dirty = true;
-                                        }
-                                    } else if app.input_cursor > 0 {
-                                        if let Some(prev_char) =
-                                            app.input[..app.input_cursor].chars().next_back()
-                                        {
-                                            dirty = !prev_char.is_whitespace();
-                                        }
-                                        app.input.remove(app.input_cursor - 1);
-                                        app.input_cursor -= 1;
-                                        ensure_input_cursor_visible(&mut app);
-                                        app.parse_status_dirty = true;
-                                    }
-                                    if dirty {
-                                        app.autocomplete_dirty = true;
-                                        maybe_update_autocomplete(&mut app, &tx_evt, false);
-                                    }
-                                }
-                                super::app::Focus::Results => {}
-                            }
-                        }
-                        (KeyCode::Delete, m) => {
-                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                                let mut meta_changed = false;
-                                if let Some(ed) = app.env_editor.as_mut() {
-                                    match ed.field_focus {
-                                        EnvFieldFocus::Name => {
-                                            if ed.name_cursor < ed.name.len() {
-                                                ed.name.remove(ed.name_cursor);
-                                                meta_changed = true;
-                                            }
-                                        }
-                                        EnvFieldFocus::Host => {
-                                            if ed.host_cursor < ed.host.len() {
-                                                ed.host.remove(ed.host_cursor);
-                                                meta_changed = true;
-                                            }
-                                        }
-                                        EnvFieldFocus::PrivateKey => {
-                                            ed.ta_private.input(ta_input_from_key(key));
-                                        }
-                                        EnvFieldFocus::PublicKey => {
-                                            ed.ta_public.input(ta_input_from_key(key));
-                                        }
-                                        EnvFieldFocus::Ca => {
-                                            ed.ta_ca.input(ta_input_from_key(key));
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                if meta_changed {
-                                    sync_env_metadata_from_editor(&mut app);
-                                }
-                            } else if matches!(app.screen, Screen::AppConfig) {
-                                ensure_app_config_editor(&mut app);
-                                if let Some(ed) = app.app_config_editor.as_mut() {
-                                    match ed.field_focus {
-                                        AppConfigFieldFocus::QueryScanMultiplier => {
-                                            ed.query_scan_multiplier.pop();
-                                        }
-                                        AppConfigFieldFocus::DefaultLimit => {
-                                            ed.default_limit.pop();
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Query) {
-                                let mut dirty = false;
-                                if has_ctrl_or_alt(m) {
-                                    if delete_next_word(&mut app) {
-                                        dirty = true;
-                                    }
-                                } else if app.input_cursor < app.input.len() {
-                                    if let Some(next_char) =
-                                        app.input[app.input_cursor..].chars().next()
-                                    {
-                                        dirty = !next_char.is_whitespace();
-                                    }
-                                    app.input.remove(app.input_cursor);
-                                    ensure_input_cursor_visible(&mut app);
-                                    app.parse_status_dirty = true;
-                                }
-                                if dirty {
-                                    app.autocomplete_dirty = true;
-                                    maybe_update_autocomplete(&mut app, &tx_evt, false);
-                                }
-                            }
-                        }
-                        (KeyCode::Char('\t'), _) | (KeyCode::Tab, _) => {
-                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                                if let Some(ed) = app.env_editor.as_mut() {
-                                    ed.field_focus = match ed.field_focus {
-                                        EnvFieldFocus::Name => EnvFieldFocus::Host,
-                                        EnvFieldFocus::Host => EnvFieldFocus::PrivateKey,
-                                        EnvFieldFocus::PrivateKey => EnvFieldFocus::PublicKey,
-                                        EnvFieldFocus::PublicKey => EnvFieldFocus::Ca,
-                                        EnvFieldFocus::Ca => EnvFieldFocus::Conn,
-                                        EnvFieldFocus::Conn => EnvFieldFocus::Buttons,
-                                        EnvFieldFocus::Buttons => EnvFieldFocus::Name,
-                                    };
-                                }
-                            } else if matches!(app.screen, Screen::AppConfig) {
-                                ensure_app_config_editor(&mut app);
-                                if let Some(ed) = app.app_config_editor.as_mut() {
-                                    ed.field_focus = match ed.field_focus {
-                                        AppConfigFieldFocus::QueryScanMultiplier => {
-                                            AppConfigFieldFocus::DefaultLimit
-                                        }
-                                        AppConfigFieldFocus::DefaultLimit => {
-                                            AppConfigFieldFocus::DefaultOrderField
-                                        }
-                                        AppConfigFieldFocus::DefaultOrderField => {
-                                            AppConfigFieldFocus::DefaultOrderDir
-                                        }
-                                        AppConfigFieldFocus::DefaultOrderDir => {
-                                            AppConfigFieldFocus::TimestampsUseUtc
-                                        }
-                                        AppConfigFieldFocus::TimestampsUseUtc => {
-                                            AppConfigFieldFocus::Buttons
-                                        }
-                                        AppConfigFieldFocus::Buttons => {
-                                            AppConfigFieldFocus::QueryScanMultiplier
-                                        }
-                                    };
-                                }
-                            } else {
-                                app.next_focus();
-                                if !matches!(app.focus, super::app::Focus::Query) {
-                                    app.autocomplete = None;
-                                }
-                            }
-                        }
-                        (KeyCode::BackTab, _) => {
-                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                                if let Some(ed) = app.env_editor.as_mut() {
-                                    ed.field_focus = match ed.field_focus {
-                                        EnvFieldFocus::Name => EnvFieldFocus::Buttons,
-                                        EnvFieldFocus::Host => EnvFieldFocus::Name,
-                                        EnvFieldFocus::PrivateKey => EnvFieldFocus::Host,
-                                        EnvFieldFocus::PublicKey => EnvFieldFocus::PrivateKey,
-                                        EnvFieldFocus::Ca => EnvFieldFocus::PublicKey,
-                                        EnvFieldFocus::Conn => EnvFieldFocus::Ca,
-                                        EnvFieldFocus::Buttons => EnvFieldFocus::Conn,
-                                    };
-                                }
-                            } else if matches!(app.screen, Screen::AppConfig) {
-                                ensure_app_config_editor(&mut app);
-                                if let Some(ed) = app.app_config_editor.as_mut() {
-                                    ed.field_focus = match ed.field_focus {
-                                        AppConfigFieldFocus::QueryScanMultiplier => {
-                                            AppConfigFieldFocus::Buttons
-                                        }
-                                        AppConfigFieldFocus::DefaultLimit => {
-                                            AppConfigFieldFocus::QueryScanMultiplier
-                                        }
-                                        AppConfigFieldFocus::DefaultOrderField => {
-                                            AppConfigFieldFocus::DefaultLimit
-                                        }
-                                        AppConfigFieldFocus::DefaultOrderDir => {
-                                            AppConfigFieldFocus::DefaultOrderField
-                                        }
-                                        AppConfigFieldFocus::TimestampsUseUtc => {
-                                            AppConfigFieldFocus::DefaultOrderDir
-                                        }
-                                        AppConfigFieldFocus::Buttons => {
-                                            AppConfigFieldFocus::TimestampsUseUtc
-                                        }
-                                    };
-                                }
-                            }
-                        }
-                        // Save (F4)
-                        (KeyCode::F(4), _) => {
-                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                                if let Some(ed) = app.env_editor.as_mut() {
-                                    let pk = ed.ta_private.lines().join("\n");
-                                    let cert = ed.ta_public.lines().join("\n");
-                                    let ca = ed.ta_ca.lines().join("\n");
-                                    let exists_name =
-                                        app.env_store.envs.iter().enumerate().any(|(i, e)| {
-                                            i != ed.idx.unwrap_or(usize::MAX)
-                                                && e.name.eq_ignore_ascii_case(&ed.name)
-                                        });
-                                    if ed.name.trim().is_empty() {
-                                        push_status_line(
-                                            &mut app,
-                                            "Environment name cannot be empty".to_string(),
-                                        );
-                                        continue;
-                                    }
-                                    if ed.idx.is_none() && exists_name {
-                                        push_status_line(
-                                            &mut app,
-                                            "Environment name already exists. Choose a unique name."
-                                                .to_string(),
-                                        );
-                                        continue;
-                                    }
-                                    let new_env = Environment {
-                                        name: ed.name.clone(),
-                                        host: ed.host.clone(),
-                                        private_key_pem: if pk.trim().is_empty() {
-                                            None
-                                        } else {
-                                            Some(pk)
-                                        },
-                                        public_key_pem: if cert.trim().is_empty() {
-                                            None
-                                        } else {
-                                            Some(cert)
-                                        },
-                                        ssl_ca_pem: if ca.trim().is_empty() {
-                                            None
-                                        } else {
-                                            Some(ca)
-                                        },
-                                    };
-                                    if let Some(i) = ed.idx {
-                                        if i < app.env_store.envs.len() {
-                                            app.env_store.envs[i] = new_env.clone();
-                                            app.env_store.selected = Some(i);
-                                        } else {
-                                            app.env_store.envs.push(new_env.clone());
-                                            app.env_store.selected =
-                                                Some(app.env_store.envs.len() - 1);
-                                        }
-                                    } else {
-                                        app.env_store.envs.push(new_env.clone());
-                                        app.env_store.selected = Some(app.env_store.envs.len() - 1);
-                                    }
-                                    match app.env_store.save() {
-                                        Ok(_) => {
-                                            app.env_save_pressed = true;
-                                            app.env_save_deadline =
-                                                Some(Instant::now() + Duration::from_millis(150));
-                                            push_status_line(
-                                                &mut app,
-                                                "✔ Environments saved".to_string(),
-                                            );
-                                        }
-                                        Err(e) => {
-                                            push_status_line(
-                                                &mut app,
-                                                format!("Save failed: {}", e),
-                                            );
-                                        }
-                                    }
-                                    if let Some(sel) = app.env_store.selected {
-                                        if let Some(e) = app.env_store.envs.get(sel) {
-                                            app.host = e.host.clone();
-                                        }
-                                    }
-                                    if app.show_env_modal {
-                                        app.show_env_modal = false;
-                                    }
-                                }
-                            } else if matches!(app.screen, Screen::AppConfig) {
-                                ensure_app_config_editor(&mut app);
-                                attempt_save_app_config(&mut app);
-                            }
-                        }
-                        // New (F1)
-                        (KeyCode::F(1), _) => {
-                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                                let name = next_unique_env_name(&app.env_store.envs);
-                                app.env_store.envs.push(Environment {
-                                    name: name.clone(),
-                                    host: String::new(),
-                                    private_key_pem: None,
-                                    public_key_pem: None,
-                                    ssl_ca_pem: None,
-                                });
-                                let idx = app.env_store.envs.len().saturating_sub(1);
-                                app.env_store.selected = Some(idx);
-                                if let Some(env) = app.env_store.envs.get(idx) {
-                                    let mut editor = build_env_editor_from_env(env, Some(idx));
-                                    editor.name_cursor = editor.name.len();
-                                    editor.host_cursor = editor.host.len();
-                                    app.env_editor = Some(editor);
-                                }
-                            }
-                        }
-                        // Delete (F3)
-                        (KeyCode::F(3), _) => {
-                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                                if let Some(i) = app.env_store.selected {
-                                    if i < app.env_store.envs.len() {
-                                        app.env_store.envs.remove(i);
-                                        app.env_store.selected = if app.env_store.envs.is_empty() {
-                                            None
-                                        } else {
-                                            Some((i).min(app.env_store.envs.len() - 1))
-                                        };
-                                        let _ = app.env_store.save();
-                                        sync_env_editor_to_selection(&mut app);
-                                    }
-                                }
-                            } else {
-                                app.screen = Screen::AppConfig;
-                                app.show_history_popup = false;
-                                ensure_app_config_editor(&mut app);
-                            }
-                        }
-                        // F5 is context-sensitive: in env modal -> test connection; in results -> copy cell
-                        (KeyCode::F(5), _) => {
-                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                                if let Some(ed) = app.env_editor.as_ref() {
-                                    let host = ed.host.clone();
-                                    let pk = ed.ta_private.lines().join("\n");
-                                    let cert = ed.ta_public.lines().join("\n");
-                                    let ca = ed.ta_ca.lines().join("\n");
-                                    let ssl = crate::models::SslConfig {
-                                        ca_pem: if ca.trim().is_empty() { None } else { Some(ca) },
-                                        cert_pem: if cert.trim().is_empty() {
-                                            None
-                                        } else {
-                                            Some(cert)
-                                        },
-                                        key_pem: if pk.trim().is_empty() { None } else { Some(pk) },
-                                    };
-                                    // Prefer CA PEM; do not auto-create ssl.ca.location if PEM is provided
-                                    // Start debug log
-                                    app.env_test_log.clear();
-                                    app.env_conn_vscroll = 0;
-                                    let _ = start_test_log(&host, &ssl);
-                                    app.env_test_in_progress = true;
-                                    app.env_test_message =
-                                        Some(format!("Connecting to {}...", host));
-                                    let txp = tx_evt.clone();
-                                    tokio::spawn(async move {
-                                        // Ensure anything printed by the SSL libs is redirected to log file only.
-                                        #[cfg(unix)]
-                                        let _guard = redirect_stdio_to_file(
-                                            &logs_dir().join("test-connection.out"),
-                                        )
-                                        .ok();
-                                        let _ = txp.send(TuiEvent::EnvTestProgress {
-                                            message: format!("Configuring client for {}", host),
-                                        });
-                                        append_test_log_line(&format!(
-                                            "[step] configure client for host={}",
-                                            host
-                                        ));
-                                        let mut cfg = ClientConfig::new();
-                                        cfg.set("bootstrap.servers", &host)
-                                            .set(
-                                                "group.id",
-                                                format!("rkl-test-{}", uuid::Uuid::new_v4()),
-                                            )
-                                            .set("enable.auto.commit", "false")
-                                            .set("auto.offset.reset", "earliest")
-                                            .set("enable.partition.eof", "true");
-                                        if ssl.ca_pem.is_some()
-                                            || ssl.cert_pem.is_some()
-                                            || ssl.key_pem.is_some()
-                                        {
-                                            cfg.set("security.protocol", "ssl");
-                                            if let Some(ref s) = ssl.ca_pem {
-                                                cfg.set("ssl.ca.pem", s);
-                                            }
-                                            if let Some(ref s) = ssl.cert_pem {
-                                                cfg.set("ssl.certificate.pem", s);
-                                            }
-                                            if let Some(ref s) = ssl.key_pem {
-                                                cfg.set("ssl.key.pem", s);
-                                            }
-                                            // Use supported debug contexts; omit "ssl" token (not recognized in some builds)
-                                            cfg.set("debug", "security,broker,protocol");
-                                        }
-                                        // Record effective TLS params (redacted)
-                                        append_test_log_line(&format!(
-                                            "[params] security.protocol=ssl, using_ca=pem, ca.pem_len={}, cert.pem_len={}, key.pem_len={}",
-                                            ssl.ca_pem.as_ref().map(|s| s.len()).unwrap_or(0),
-                                            ssl.cert_pem.as_ref().map(|s| s.len()).unwrap_or(0),
-                                            ssl.key_pem.as_ref().map(|s| s.len()).unwrap_or(0)
-                                        ));
-                                        if let Some(ref s) = ssl.ca_pem {
-                                            append_test_log_line(&format!(
-                                                "[params] ssl.ca.pem head={}.. len={}",
-                                                &s.chars().take(24).collect::<String>(),
-                                                s.len()
-                                            ));
-                                        }
-                                        if let Some(ref s) = ssl.cert_pem {
-                                            append_test_log_line(&format!(
-                                                "[params] ssl.certificate.pem head={}.. len={}",
-                                                &s.chars().take(24).collect::<String>(),
-                                                s.len()
-                                            ));
-                                        }
-                                        if let Some(ref s) = ssl.key_pem {
-                                            append_test_log_line(&format!(
-                                                "[params] ssl.key.pem head={}.. len={}",
-                                                &s.chars().take(24).collect::<String>(),
-                                                s.len()
-                                            ));
-                                        }
-                                        cfg.set("log_level", "1");
-                                        let _ = txp.send(TuiEvent::EnvTestProgress {
-                                            message: "Creating consumer".to_string(),
-                                        });
-                                        append_test_log_line("[step] create consumer");
-                                        let consumer: Result<StreamConsumer, _> = cfg.create();
-                                        match consumer {
-                                            Ok(c) => {
-                                                append_test_log_line("[ok] consumer created");
-                                                let _ = txp.send(TuiEvent::EnvTestProgress {
-                                                    message: "Fetching metadata".to_string(),
-                                                });
-                                                append_test_log_line(
-                                                    "[step] fetch metadata (timeout=5s)",
-                                                );
-                                                match c.fetch_metadata(None, Duration::from_secs(5))
-                                                {
-                                                    Ok(md) => {
-                                                        append_test_log_line(&format!(
-                                                            "[ok] metadata: brokers={}, topics={}",
-                                                            md.brokers().len(),
-                                                            md.topics().len()
-                                                        ));
-                                                        let _ = txp.send(TuiEvent::EnvTestDone {
-                                                            message: format!(
-                                                                "Connection OK: {}",
-                                                                host
-                                                            ),
-                                                        });
-                                                    }
-                                                    Err(e) => {
-                                                        append_test_log_line(&format!(
-                                                            "[err] metadata fetch: {:?}",
-                                                            e
-                                                        ));
-                                                        let _ = txp.send(TuiEvent::EnvTestDone {
-                                                            message: format!(
-                                                                "Metadata error: {}",
-                                                                e
-                                                            ),
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                append_test_log_line(&format!(
-                                                    "[err] consumer create: {:?}",
-                                                    e
-                                                ));
-                                                let _ = txp.send(TuiEvent::EnvTestDone {
-                                                    message: format!("Create error: {}", e),
-                                                });
-                                            }
-                                        }
-                                    });
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Results) {
-                                if let Some(s) = selected_cell_text(&app) {
-                                    match copy_to_clipboard(&s) {
-                                        Ok(()) => push_status_line(
-                                            &mut app,
-                                            "Copied to clipboard".to_string(),
-                                        ),
-                                        Err(e) => push_status_line(
-                                            &mut app,
-                                            format!("Clipboard error: {}", e),
-                                        ),
-                                    }
-                                }
-                            }
-                        }
-                        // (F8 removed)
-                        // Toggle mouse selection mode (disable/enable mouse capture)
-                        (KeyCode::F(9), _) => {
-                            if app.mouse_selection_mode {
-                                let _ = crossterm::execute!(
-                                    std::io::stdout(),
-                                    crossterm::event::EnableMouseCapture
-                                );
-                                app.mouse_selection_mode = false;
-                                push_status_line(&mut app, "Mouse capture enabled".to_string());
-                            } else {
-                                let _ = crossterm::execute!(
-                                    std::io::stdout(),
-                                    crossterm::event::DisableMouseCapture
-                                );
-                                app.mouse_selection_mode = true;
-                                let mode_label = if app.mouse_selection_mode {
-                                    "enabled"
-                                } else {
-                                    "disabled"
-                                };
-                                push_status_line(
-                                    &mut app,
-                                    format!("Mouse selection {}", mode_label),
-                                );
-                                push_status_line(
-                                    &mut app,
-                                    "Mouse selection mode: drag to select/copy; F9 to return"
-                                        .to_string(),
-                                );
-                            }
-                        }
-                        (KeyCode::Char(ch), _) => {
-                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                                let mut meta_changed = false;
-                                if let Some(ed) = app.env_editor.as_mut() {
-                                    match ed.field_focus {
-                                        EnvFieldFocus::Name => {
-                                            ed.name.insert(ed.name_cursor, ch);
-                                            ed.name_cursor += 1;
-                                            meta_changed = true;
-                                        }
-                                        EnvFieldFocus::Host => {
-                                            ed.host.insert(ed.host_cursor, ch);
-                                            ed.host_cursor += 1;
-                                            meta_changed = true;
-                                        }
-                                        EnvFieldFocus::PrivateKey => {
-                                            ed.ta_private.input(TAInput {
-                                                key: TAKey::Char(ch),
-                                                ctrl: false,
-                                                alt: false,
-                                                shift: false,
-                                            });
-                                        }
-                                        EnvFieldFocus::PublicKey => {
-                                            ed.ta_public.input(TAInput {
-                                                key: TAKey::Char(ch),
-                                                ctrl: false,
-                                                alt: false,
-                                                shift: false,
-                                            });
-                                        }
-                                        EnvFieldFocus::Ca => {
-                                            ed.ta_ca.input(TAInput {
-                                                key: TAKey::Char(ch),
-                                                ctrl: false,
-                                                alt: false,
-                                                shift: false,
-                                            });
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                if meta_changed {
-                                    sync_env_metadata_from_editor(&mut app);
-                                }
-                                continue;
-                            } else if matches!(app.screen, Screen::AppConfig) {
-                                ensure_app_config_editor(&mut app);
-                                if let Some(ed) = app.app_config_editor.as_mut() {
-                                    if ch == ' ' {
-                                        match ed.field_focus {
-                                            AppConfigFieldFocus::TimestampsUseUtc => {
-                                                ed.timestamps_use_utc = !ed.timestamps_use_utc;
-                                            }
-                                            AppConfigFieldFocus::Buttons => {
-                                                attempt_save_app_config(&mut app);
-                                            }
-                                            _ => {}
-                                        }
-                                        continue;
-                                    }
-                                    match ed.field_focus {
-                                        AppConfigFieldFocus::QueryScanMultiplier => {
-                                            ed.query_scan_multiplier.push(ch);
-                                        }
-                                        AppConfigFieldFocus::DefaultLimit => {
-                                            ed.default_limit.push(ch);
-                                        }
-                                        AppConfigFieldFocus::Buttons => {
-                                            if ch == 'r' || ch == 'R' {
-                                                perform_app_config_reset(&mut app);
-                                            } else if ch == 's' || ch == 'S' {
-                                                attempt_save_app_config(&mut app);
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                continue;
-                            }
-                            match app.focus {
-                                super::app::Focus::Results => {
-                                    // ignore normal chars in results
-                                }
-                                super::app::Focus::Host => {
-                                    if app.show_env_modal {
-                                        // NOP (handled below in modal)
-                                    } else {
-                                        // Previously host edit; now do nothing
-                                    }
-                                }
-                                super::app::Focus::Query => {
-                                    app.input.insert(app.input_cursor, ch);
-                                    app.input_cursor += 1;
-                                    ensure_input_cursor_visible(&mut app);
-                                    app.parse_status_dirty = true;
-                                    if !ch.is_whitespace() {
-                                        app.autocomplete_dirty = true;
-                                        maybe_update_autocomplete(&mut app, &tx_evt, false);
-                                    } else {
-                                        app.autocomplete = None;
-                                    }
-                                }
-                            }
-                        }
-                        (KeyCode::Esc, _) => {
-                            if app.show_env_modal {
-                                app.show_env_modal = false;
-                            } else if matches!(app.screen, Screen::AppConfig) {
-                                app.screen = Screen::Home;
-                            } else if matches!(app.focus, super::app::Focus::Query)
-                                && app.autocomplete.as_ref().map(|a| a.active).unwrap_or(false)
-                            {
-                                freeze_autocomplete_at_cursor(&mut app);
-                                app.autocomplete = None;
-                                app.autocomplete_dirty = false;
-                            } else if matches!(app.focus, super::app::Focus::Query) {
-                                app.input.clear();
-                                app.input_cursor = 0;
-                                ensure_input_cursor_visible(&mut app);
-                                app.parse_status_dirty = true;
-                                app.autocomplete = None;
-                                app.autocomplete_dirty = false;
-                                app.autocomplete_frozen_token = None;
-                            }
-                        }
-                        // Navigation: results or env list / textareas
-                        (KeyCode::Up, _) => {
-                            if matches!(app.screen, Screen::Envs) {
-                                let mut handled = false;
-                                if let Some(ed) = app.env_editor.as_mut() {
-                                    match ed.field_focus {
-                                        EnvFieldFocus::PrivateKey => {
-                                            ed.ta_private.input(ta_input_from_key(key));
-                                            handled = true;
-                                        }
-                                        EnvFieldFocus::PublicKey => {
-                                            ed.ta_public.input(ta_input_from_key(key));
-                                            handled = true;
-                                        }
-                                        EnvFieldFocus::Ca => {
-                                            ed.ta_ca.input(ta_input_from_key(key));
-                                            handled = true;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                if !handled {
-                                    move_env_selection(&mut app, -1);
-                                }
-                            } else if matches!(app.screen, Screen::AppConfig) {
-                                ensure_app_config_editor(&mut app);
-                                if let Some(ed) = app.app_config_editor.as_mut() {
-                                    ed.field_focus = match ed.field_focus {
-                                        AppConfigFieldFocus::QueryScanMultiplier => {
-                                            AppConfigFieldFocus::Buttons
-                                        }
-                                        AppConfigFieldFocus::DefaultLimit => {
-                                            AppConfigFieldFocus::QueryScanMultiplier
-                                        }
-                                        AppConfigFieldFocus::DefaultOrderField => {
-                                            AppConfigFieldFocus::DefaultLimit
-                                        }
-                                        AppConfigFieldFocus::DefaultOrderDir => {
-                                            AppConfigFieldFocus::DefaultOrderField
-                                        }
-                                        AppConfigFieldFocus::TimestampsUseUtc => {
-                                            AppConfigFieldFocus::DefaultOrderDir
-                                        }
-                                        AppConfigFieldFocus::Buttons => {
-                                            AppConfigFieldFocus::TimestampsUseUtc
-                                        }
-                                    };
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Results) {
-                                if app.selected_row > 0 {
-                                    app.selected_row -= 1;
-                                    if matches!(app.results_mode, ResultsMode::Messages) {
-                                        app.json_vscroll = 0;
-                                    }
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Query) {
-                                move_cursor_up(&mut app);
-                            }
-                        }
-                        (KeyCode::Down, _) => {
-                            if matches!(app.screen, Screen::Envs) {
-                                let mut handled = false;
-                                if let Some(ed) = app.env_editor.as_mut() {
-                                    match ed.field_focus {
-                                        EnvFieldFocus::PrivateKey => {
-                                            ed.ta_private.input(ta_input_from_key(key));
-                                            handled = true;
-                                        }
-                                        EnvFieldFocus::PublicKey => {
-                                            ed.ta_public.input(ta_input_from_key(key));
-                                            handled = true;
-                                        }
-                                        EnvFieldFocus::Ca => {
-                                            ed.ta_ca.input(ta_input_from_key(key));
-                                            handled = true;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                if !handled {
-                                    move_env_selection(&mut app, 1);
-                                }
-                            } else if matches!(app.screen, Screen::AppConfig) {
-                                ensure_app_config_editor(&mut app);
-                                if let Some(ed) = app.app_config_editor.as_mut() {
-                                    ed.field_focus = match ed.field_focus {
-                                        AppConfigFieldFocus::QueryScanMultiplier => {
-                                            AppConfigFieldFocus::DefaultLimit
-                                        }
-                                        AppConfigFieldFocus::DefaultLimit => {
-                                            AppConfigFieldFocus::DefaultOrderField
-                                        }
-                                        AppConfigFieldFocus::DefaultOrderField => {
-                                            AppConfigFieldFocus::DefaultOrderDir
-                                        }
-                                        AppConfigFieldFocus::DefaultOrderDir => {
-                                            AppConfigFieldFocus::TimestampsUseUtc
-                                        }
-                                        AppConfigFieldFocus::TimestampsUseUtc => {
-                                            AppConfigFieldFocus::Buttons
-                                        }
-                                        AppConfigFieldFocus::Buttons => {
-                                            AppConfigFieldFocus::QueryScanMultiplier
-                                        }
-                                    };
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Results) {
-                                let total = total_results_rows(&app);
-                                if total > 0 && app.selected_row + 1 < total {
-                                    app.selected_row += 1;
-                                    if matches!(app.results_mode, ResultsMode::Messages) {
-                                        app.json_vscroll = 0;
-                                    }
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Query) {
-                                move_cursor_down(&mut app);
-                            }
-                        }
-                        (KeyCode::Left, KeyModifiers::SHIFT) => {
-                            if matches!(app.focus, super::app::Focus::Results) {
-                                app.table_hscroll = app.table_hscroll.saturating_sub(2);
-                            }
-                        }
-                        (KeyCode::Right, KeyModifiers::SHIFT) => {
-                            if matches!(app.focus, super::app::Focus::Results) {
-                                app.table_hscroll = app.table_hscroll.saturating_add(2);
-                            }
-                        }
-                        (KeyCode::Left, m) => {
-                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                                if let Some(ed) = app.env_editor.as_mut() {
-                                    match ed.field_focus {
-                                        EnvFieldFocus::Name => {
-                                            if ed.name_cursor > 0 {
-                                                ed.name_cursor -= 1;
-                                            }
-                                        }
-                                        EnvFieldFocus::Host => {
-                                            if ed.host_cursor > 0 {
-                                                ed.host_cursor -= 1;
-                                            }
-                                        }
-                                        EnvFieldFocus::PrivateKey => {
-                                            ed.ta_private.input(ta_input_from_key(key));
-                                        }
-                                        EnvFieldFocus::PublicKey => {
-                                            ed.ta_public.input(ta_input_from_key(key));
-                                        }
-                                        EnvFieldFocus::Ca => {
-                                            ed.ta_ca.input(ta_input_from_key(key));
-                                        }
-                                        EnvFieldFocus::Conn => {}
-                                        EnvFieldFocus::Buttons => {}
-                                    }
-                                }
-                            } else if matches!(app.screen, Screen::AppConfig) {
-                                ensure_app_config_editor(&mut app);
-                                if let Some(ed) = app.app_config_editor.as_mut() {
-                                    match ed.field_focus {
-                                        AppConfigFieldFocus::DefaultOrderField => {
-                                            if ed.default_order_field_idx == 0 {
-                                                ed.default_order_field_idx = 2;
-                                            } else {
-                                                ed.default_order_field_idx -= 1;
-                                            }
-                                        }
-                                        AppConfigFieldFocus::DefaultOrderDir => {
-                                            ed.default_order_dir_idx = 0;
-                                        }
-                                        AppConfigFieldFocus::TimestampsUseUtc => {
-                                            ed.timestamps_use_utc = true;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Results) {
-                                if matches!(app.results_mode, ResultsMode::Messages) {
-                                    if app.selected_col > 0 {
-                                        app.selected_col -= 1;
-                                    } else {
-                                        app.selected_col = 0;
-                                    }
-                                    app.json_vscroll = 0;
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Query) {
-                                if has_ctrl_or_alt(m) {
-                                    move_prev_word(&mut app);
-                                } else if app.input_cursor > 0 {
-                                    app.input_cursor -= 1;
-                                    ensure_input_cursor_visible(&mut app);
-                                    app.parse_status_dirty = true;
-                                }
-                            }
-                        }
-                        (KeyCode::Right, m) => {
-                            if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                                if let Some(ed) = app.env_editor.as_mut() {
-                                    match ed.field_focus {
-                                        EnvFieldFocus::Name => {
-                                            if ed.name_cursor < ed.name.len() {
-                                                ed.name_cursor += 1;
-                                            }
-                                        }
-                                        EnvFieldFocus::Host => {
-                                            if ed.host_cursor < ed.host.len() {
-                                                ed.host_cursor += 1;
-                                            }
-                                        }
-                                        EnvFieldFocus::PrivateKey => {
-                                            ed.ta_private.input(ta_input_from_key(key));
-                                        }
-                                        EnvFieldFocus::PublicKey => {
-                                            ed.ta_public.input(ta_input_from_key(key));
-                                        }
-                                        EnvFieldFocus::Ca => {
-                                            ed.ta_ca.input(ta_input_from_key(key));
-                                        }
-                                        EnvFieldFocus::Conn => {}
-                                        EnvFieldFocus::Buttons => {}
-                                    }
-                                }
-                            } else if matches!(app.screen, Screen::AppConfig) {
-                                ensure_app_config_editor(&mut app);
-                                if let Some(ed) = app.app_config_editor.as_mut() {
-                                    match ed.field_focus {
-                                        AppConfigFieldFocus::DefaultOrderField => {
-                                            ed.default_order_field_idx =
-                                                (ed.default_order_field_idx + 1) % 3;
-                                        }
-                                        AppConfigFieldFocus::DefaultOrderDir => {
-                                            ed.default_order_dir_idx = 1;
-                                        }
-                                        AppConfigFieldFocus::TimestampsUseUtc => {
-                                            ed.timestamps_use_utc = false;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Results) {
-                                if matches!(app.results_mode, ResultsMode::Messages) {
-                                    let cols = app.selected_columns.len();
-                                    if cols > 0 && app.selected_col + 1 < cols {
-                                        app.selected_col += 1;
-                                    }
-                                    app.json_vscroll = 0;
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Query) {
-                                if m.is_empty() && try_accept_autocomplete(&mut app) {
-                                    continue;
-                                }
-                                if has_ctrl_or_alt(m) {
-                                    move_next_word(&mut app);
-                                } else if app.input_cursor < app.input.len() {
-                                    app.input_cursor += 1;
-                                    ensure_input_cursor_visible(&mut app);
-                                    app.parse_status_dirty = true;
-                                }
-                            }
-                        }
-                        (KeyCode::PageUp, _) => {
-                            if matches!(app.focus, super::app::Focus::Results) {
-                                let step = 10;
-                                app.selected_row = app.selected_row.saturating_sub(step);
-                                if matches!(app.results_mode, ResultsMode::Messages) {
-                                    app.json_vscroll = 0;
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Query) {
-                                scroll_input(&mut app, true);
-                            }
-                        }
-                        (KeyCode::PageDown, _) => {
-                            if matches!(app.focus, super::app::Focus::Results) {
-                                let step = 10;
-                                let total = total_results_rows(&app);
-                                if total > 0 {
-                                    let max_idx = total - 1;
-                                    let target = app.selected_row.saturating_add(step);
-                                    app.selected_row = target.min(max_idx);
-                                    if matches!(app.results_mode, ResultsMode::Messages) {
-                                        app.json_vscroll = 0;
-                                    }
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Query) {
-                                scroll_input(&mut app, false);
-                            }
-                        }
-                        (KeyCode::Home, m) => {
-                            if matches!(app.focus, super::app::Focus::Results) {
-                                app.selected_row = 0;
-                                if matches!(app.results_mode, ResultsMode::Messages) {
-                                    app.json_vscroll = 0;
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Query) {
-                                if m.contains(KeyModifiers::CONTROL) {
-                                    goto_start_of_doc(&mut app);
-                                } else {
-                                    move_cursor_line_home(&mut app);
-                                }
-                            }
-                        }
-                        (KeyCode::End, m) => {
-                            if matches!(app.focus, super::app::Focus::Results) {
-                                let total = total_results_rows(&app);
-                                if total > 0 {
-                                    app.selected_row = total - 1;
-                                    if matches!(app.results_mode, ResultsMode::Messages) {
-                                        app.json_vscroll = 0;
-                                    }
-                                }
-                            } else if matches!(app.focus, super::app::Focus::Query) {
-                                if m.contains(KeyModifiers::CONTROL) {
-                                    goto_end_of_doc(&mut app);
-                                } else {
-                                    move_cursor_line_end(&mut app);
-                                }
-                            }
-                        }
-                        _ => {}
                     }
                 }
-                Event::Mouse(me) => {
-                    if matches!(app.screen, Screen::About) {
-                        match me.kind {
-                            MouseEventKind::ScrollUp => scroll_help(&mut app, -3),
-                            MouseEventKind::ScrollDown => scroll_help(&mut app, 3),
-                            _ => {}
-                        }
-                    }
-                    // Also route to textareas in Envs screen for scroll/paste-like mouse actions
-                    if matches!(app.screen, Screen::Envs) {
-                        if let Some(ed) = app.env_editor.as_mut() {
-                            let inp = ta_input_from_mouse(me);
-                            ed.ta_private.input(inp.clone());
-                            ed.ta_public.input(inp.clone());
-                            ed.ta_ca.input(inp);
-                        }
-                    }
-                    handle_mouse(&mut app, me, &tx_evt);
-                }
+                Event::Mouse(_) => {}
                 Event::Paste(s) => {
-                    let mut handled = false;
-                    if matches!(app.screen, Screen::Envs) || app.show_env_modal {
-                        handled = handle_env_editor_paste(&mut app, &s);
-                    }
-                    if matches!(app.screen, Screen::AppConfig) && !handled {
-                        ensure_app_config_editor(&mut app);
-                        if let Some(ed) = app.app_config_editor.as_mut() {
-                            let text = normalize_plain_input(&s);
-                            match ed.field_focus {
-                                AppConfigFieldFocus::QueryScanMultiplier => {
-                                    ed.query_scan_multiplier.push_str(&text);
-                                    handled = true;
-                                }
-                                AppConfigFieldFocus::DefaultLimit => {
-                                    ed.default_limit.push_str(&text);
-                                    handled = true;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    if !handled && matches!(app.focus, super::app::Focus::Query) {
-                        let inserted_non_ws = s.chars().any(|ch| !ch.is_whitespace());
-                        for ch in s.chars() {
-                            app.input.insert(app.input_cursor, ch);
-                            app.input_cursor += 1;
-                        }
-                        ensure_input_cursor_visible(&mut app);
-                        if !s.is_empty() {
-                            app.parse_status_dirty = true;
-                        }
-                        if inserted_non_ws {
-                            app.autocomplete_dirty = true;
-                            maybe_update_autocomplete(&mut app, &tx_evt, false);
-                        }
-                    }
+                    handle_paste_event(&mut app, &s);
                 }
                 _ => {}
             }
@@ -1605,14 +312,16 @@ async fn run_query_from_editor(
     tx_evt: &mpsc::UnboundedSender<TuiEvent>,
     run_counter: &mut u64,
 ) {
-    let (qs, qe) = find_query_range(&app.input, app.input_cursor);
-    let raw = &app.input[qs..qe];
+    let text = textarea_text(&app.query_editor);
+    let cursor = textarea_cursor_offset(&app.query_editor);
+    let (qs, qe) = find_query_range(&text, cursor);
+    let raw = text.get(qs..qe).unwrap_or("");
     let query = strip_trailing_semicolon(raw).trim().to_string();
     if query.is_empty() {
         push_status_line(app, "Please enter a query".to_string());
         return;
     }
-    dispatch_query(app, args, tx_evt, run_counter, query, Some((qs, qe)), false).await;
+    dispatch_query(app, args, tx_evt, run_counter, query, false).await;
 }
 
 async fn rerun_last_query(
@@ -1622,7 +331,7 @@ async fn rerun_last_query(
     run_counter: &mut u64,
 ) {
     if let Some(query) = app.last_executed_query.clone() {
-        dispatch_query(app, args, tx_evt, run_counter, query, None, true).await;
+        dispatch_query(app, args, tx_evt, run_counter, query, true).await;
     } else {
         push_status_line(app, "No previous query to re-run".to_string());
     }
@@ -1634,15 +343,12 @@ async fn dispatch_query(
     tx_evt: &mpsc::UnboundedSender<TuiEvent>,
     run_counter: &mut u64,
     query: String,
-    range_hint: Option<(usize, usize)>,
     is_rerun: bool,
 ) {
     match parse_command(&query) {
         Ok(Command::Select(ast)) => {
             let columns = ast.select.clone();
             app.results_mode = ResultsMode::Messages;
-            app.autocomplete = None;
-            app.autocomplete_frozen_token = None;
             app.selected_columns = columns;
             app.table_hscroll = 0;
             app.clear_rows();
@@ -1655,9 +361,6 @@ async fn dispatch_query(
             app.query_rows_seen = 0;
             app.query_started_at = Some(Instant::now());
             app.query_spinner_idx = 0;
-            if let Some(range) = range_hint {
-                app.last_run_query_range = Some(range);
-            }
             let env_host = app
                 .selected_env()
                 .map(|e| e.host.clone())
@@ -1698,8 +401,6 @@ async fn dispatch_query(
         }
         Ok(Command::ListTopics) => {
             app.results_mode = ResultsMode::TopicList;
-            app.autocomplete = None;
-            app.autocomplete_frozen_token = None;
             app.table_hscroll = 0;
             app.clear_rows();
             app.topics_with_partitions.clear();
@@ -1708,9 +409,6 @@ async fn dispatch_query(
             app.query_started_at = None;
             app.query_rows_seen = 0;
             app.query_limit = None;
-            if let Some(range) = range_hint {
-                app.last_run_query_range = Some(range);
-            }
             app.selected_row = 0;
             app.json_vscroll = 0;
             let env_host = app
@@ -1814,6 +512,7 @@ async fn run_pipeline_with_ssl(
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
         .set("enable.partition.eof", "true");
+    cfg.set_log_level(RDKafkaLogLevel::Emerg);
     if let Some(ssl) = &ssl {
         if ssl.ca_pem.is_some() || ssl.cert_pem.is_some() || ssl.key_pem.is_some() {
             cfg.set("security.protocol", "ssl");
@@ -1936,81 +635,6 @@ fn runner_column_text(env: &MessageEnvelope, col: SelectItem, use_utc: bool) -> 
         SelectItem::Key => env.key.clone(),
         SelectItem::Value => env.value.as_deref().unwrap_or("null").to_string(),
     }
-}
-
-fn runner_column_width_hint(col: SelectItem) -> usize {
-    match col {
-        SelectItem::Partition => 10,
-        SelectItem::Offset => 12,
-        SelectItem::Timestamp => 26,
-        SelectItem::Key => 30,
-        SelectItem::Value => usize::MAX,
-    }
-}
-
-#[allow(dead_code)]
-fn ensure_ca_file_for_env(name_hint: &str, pem: &str) -> Result<String> {
-    let dir = config_dir();
-    std::fs::create_dir_all(&dir).context("create env dir for CA")?;
-    let fname = format!("{}-ca.pem", sanitize(name_hint));
-    let path = dir.join(fname);
-    fs::write(&path, pem).context("write CA pem file")?;
-    Ok(path.to_string_lossy().to_string())
-}
-
-#[allow(dead_code)]
-fn sanitize(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn logs_dir() -> std::path::PathBuf {
-    crate::paths::logs_dir()
-}
-
-fn append_test_log_line(line: &str) {
-    let dir = logs_dir();
-    let _ = fs::create_dir_all(&dir);
-    let fpath = dir.join("test-connection.out");
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&fpath) {
-        let ts = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_else(|_| "".into());
-        let _ = writeln!(f, "{} {}", ts, line);
-    }
-}
-
-fn start_test_log(host: &str, ssl: &crate::models::SslConfig) -> Result<()> {
-    let dir = logs_dir();
-    fs::create_dir_all(&dir).ok();
-    let fpath = dir.join("test-connection.out");
-    // Truncate file at start of each test for clarity
-    let mut f = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&fpath)
-        .context("open test log file")?;
-    let ts = time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "".into());
-    let _ = writeln!(
-        f,
-        "{} [start] test connection host={} ca_pem_len={} cert_pem_len={} key_pem_len={}",
-        ts,
-        host,
-        ssl.ca_pem.as_ref().map(|s| s.len()).unwrap_or(0),
-        ssl.cert_pem.as_ref().map(|s| s.len()).unwrap_or(0),
-        ssl.key_pem.as_ref().map(|s| s.len()).unwrap_or(0),
-    );
-    Ok(())
 }
 
 fn copy_to_clipboard(s: &str) -> Result<()> {
@@ -2178,19 +802,22 @@ fn handle_env_editor_paste(app: &mut AppState, raw: &str) -> bool {
                     meta_changed = true;
                 }
             }
-            EnvFieldFocus::PrivateKey => {
-                ed.ta_private.insert_str(normalize_pem_input(raw));
+            EnvFieldFocus::PemEditor => {
+                let text = normalize_pem_input(raw);
                 handled = true;
+                match ed.active_pem {
+                    EnvPemField::PrivateKey => {
+                        ed.ta_private.insert_str(text);
+                    }
+                    EnvPemField::PublicKey => {
+                        ed.ta_public.insert_str(text);
+                    }
+                    EnvPemField::Ca => {
+                        ed.ta_ca.insert_str(text);
+                    }
+                }
             }
-            EnvFieldFocus::PublicKey => {
-                ed.ta_public.insert_str(normalize_pem_input(raw));
-                handled = true;
-            }
-            EnvFieldFocus::Ca => {
-                ed.ta_ca.insert_str(normalize_pem_input(raw));
-                handled = true;
-            }
-            EnvFieldFocus::Conn | EnvFieldFocus::Buttons => {}
+            EnvFieldFocus::Conn | EnvFieldFocus::Buttons | EnvFieldFocus::List => {}
         }
     }
     if meta_changed {
@@ -2267,14 +894,6 @@ fn save_app_config_from_editor(app: &mut AppState) -> Result<()> {
     Ok(())
 }
 
-fn reset_app_config(app: &mut AppState) -> Result<()> {
-    app.app_config = AppConfig::default();
-    app.app_config.save()?;
-    app.app_config_editor = Some(build_app_config_editor(&app.app_config));
-    app.timestamps_use_utc = app.app_config.default_timestamps_use_utc;
-    Ok(())
-}
-
 fn attempt_save_app_config(app: &mut AppState) {
     match save_app_config_from_editor(app) {
         Ok(()) => {
@@ -2283,15 +902,6 @@ fn attempt_save_app_config(app: &mut AppState) {
             push_status_line(app, "✔ App config saved".to_string());
         }
         Err(e) => push_status_line(app, format!("App config error: {}", e)),
-    }
-}
-
-fn perform_app_config_reset(app: &mut AppState) {
-    match reset_app_config(app) {
-        Ok(()) => {
-            push_status_line(app, "App config reset to defaults".to_string());
-        }
-        Err(e) => push_status_line(app, format!("Reset failed: {}", e)),
     }
 }
 
@@ -2355,8 +965,8 @@ fn build_env_editor_from_env(env: &Environment, idx: Option<usize>) -> EnvEditor
         ta_private: text_area_from_string(env.private_key_pem.clone().unwrap_or_default()),
         ta_public: text_area_from_string(env.public_key_pem.clone().unwrap_or_default()),
         ta_ca: text_area_from_string(env.ssl_ca_pem.clone().unwrap_or_default()),
-        ssl_ca_cursor: 0,
-        field_focus: EnvFieldFocus::Name,
+        active_pem: EnvPemField::PrivateKey,
+        field_focus: EnvFieldFocus::List,
     }
 }
 
@@ -2430,1158 +1040,11 @@ fn load_history_entry_into_editor(app: &mut AppState) {
         .history_selected_index
         .min(app.query_history.len().saturating_sub(1));
     let entry = app.query_history[idx].clone();
-    if let Some(pos) = find_history_query_position(&app.input, &entry) {
-        app.input_cursor = pos;
-    } else {
-        let needs_sep = !app.input.trim_end().is_empty();
-        if needs_sep && !app.input.ends_with('\n') {
-            app.input.push('\n');
-        }
-        if needs_sep {
-            app.input.push('\n');
-        }
-        let insert_pos = app.input.len();
-        app.input.push_str(&entry);
-        app.input_cursor = insert_pos;
-        app.autocomplete = None;
-        app.autocomplete_dirty = false;
-        app.autocomplete_frozen_token = None;
-    }
+    app.query_mode = QueryMode::Advanced;
+    app.home_focus = HomeFocus::AdvancedQuery;
+    reset_query_editor(app, &entry);
     app.show_history_popup = false;
     app.parse_status_dirty = true;
-    ensure_input_cursor_visible(app);
-}
-
-fn find_history_query_position(haystack: &str, needle: &str) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    if let Some(pos) = haystack.find(needle) {
-        return Some(pos);
-    }
-    let trimmed = needle.trim();
-    if trimmed != needle {
-        if let Some(pos) = haystack.find(trimmed) {
-            return Some(pos);
-        }
-    }
-    if let Some(core) = trimmed.strip_suffix(';') {
-        if let Some(pos) = haystack.find(core) {
-            return Some(pos);
-        }
-    }
-    let needle_with_semicolon = format!("{};", needle);
-    if let Some(pos) = haystack.find(&needle_with_semicolon) {
-        return Some(pos);
-    }
-    None
-}
-
-fn handle_mouse(app: &mut AppState, me: MouseEvent, tx_evt: &mpsc::UnboundedSender<TuiEvent>) {
-    if app.mouse_selection_mode {
-        return;
-    }
-    let (w, h) = crossterm::terminal::size().unwrap_or((0, 0));
-    let root = Rect {
-        x: 0,
-        y: 0,
-        width: w,
-        height: h,
-    };
-    let mx = me.column;
-    let my = me.row;
-    let rows = match app.screen {
-        Screen::Home => Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(10),
-                Constraint::Fill(1),
-                Constraint::Length(3),
-            ])
-            .split(root),
-        Screen::Envs => Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Fill(1),
-                Constraint::Length(3),
-            ])
-            .split(root),
-        Screen::Info => Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Fill(1),
-                Constraint::Length(3),
-            ])
-            .split(root),
-        Screen::AppConfig | Screen::About => Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Fill(1),
-                Constraint::Length(3),
-            ])
-            .split(root),
-    };
-
-    if let MouseEventKind::Down(MouseButton::Left) = me.kind {
-        if let Some(screen) = super::ui::main_menu_hit_test(rows[0], mx, my) {
-            if screen != app.screen {
-                if matches!(screen, Screen::About) {
-                    app.last_screen_before_about = Some(app.screen);
-                    app.help_vscroll = 0;
-                }
-                app.screen = screen;
-                app.menu_pressed_screen = Some(screen);
-                app.menu_pressed_deadline = Some(Instant::now() + Duration::from_millis(150));
-                app.show_history_popup = false;
-                app.autocomplete = None;
-                if matches!(screen, Screen::Info) {
-                    app.topics_last_fetched_at = Some(Instant::now());
-                    fetch_topics_async(&app, tx_evt.clone());
-                }
-                if matches!(screen, Screen::AppConfig) {
-                    ensure_app_config_editor(app);
-                }
-                if matches!(screen, Screen::Envs) {
-                    ensure_env_editor(app);
-                }
-            }
-            return;
-        }
-    }
-
-    match me.kind {
-        MouseEventKind::Down(MouseButton::Left) => match app.screen {
-            Screen::Home => {
-                let query_area = rows[2];
-                let cols = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                    .split(query_area);
-                let status_rect = cols[1];
-                let status_inner = Rect {
-                    x: status_rect.x.saturating_add(1),
-                    y: status_rect.y.saturating_add(1),
-                    width: status_rect.width.saturating_sub(2),
-                    height: status_rect.height.saturating_sub(2),
-                };
-                let q_inner = Rect {
-                    x: query_area.x.saturating_add(1),
-                    y: query_area.y.saturating_add(1),
-                    width: query_area.width.saturating_sub(2),
-                    height: query_area.height.saturating_sub(2),
-                };
-                let q_cols = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Length(6), Constraint::Min(1)])
-                    .split(q_inner);
-                let q_content = q_cols[1];
-                let results_area = rows[3];
-                let (table_rect, json_rect_opt) =
-                    if matches!(app.results_mode, ResultsMode::Messages) {
-                        let cols = Layout::default()
-                            .direction(Direction::Horizontal)
-                            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                            .split(results_area);
-                        (cols[0], Some(cols[1]))
-                    } else {
-                        (results_area, None)
-                    };
-                let json_inner = json_rect_opt.map(|json_rect| Rect {
-                    x: json_rect.x.saturating_add(1),
-                    y: json_rect.y.saturating_add(1),
-                    width: json_rect.width.saturating_sub(2),
-                    height: json_rect.height.saturating_sub(2),
-                });
-
-                let label = "[ Copy ]";
-                let btn_w = label.chars().count() as u16;
-                if status_inner.width >= btn_w {
-                    let btn_rect = Rect {
-                        x: status_inner.x + status_inner.width - btn_w,
-                        y: status_inner.y,
-                        width: btn_w,
-                        height: 1,
-                    };
-                    if point_in(mx, my, btn_rect) {
-                        let text = if app.status_buffer.is_empty() {
-                            app.status.clone()
-                        } else {
-                            app.status_buffer.clone()
-                        };
-                        if !text.trim().is_empty() {
-                            let _ = copy_to_clipboard(&text);
-                            app.copy_btn_pressed = true;
-                            app.copy_btn_deadline =
-                                Some(Instant::now() + Duration::from_millis(150));
-                        }
-                        return;
-                    }
-                }
-
-                if point_in(mx, my, q_content) {
-                    let y_rel = my.saturating_sub(q_content.y) as usize;
-                    let target_line = app.input_vscroll as usize + y_rel;
-                    let line_starts = compute_line_starts(&app.input);
-                    let line = target_line.min(line_starts.len().saturating_sub(1));
-                    let line_start = line_starts[line];
-                    let line_end = if line + 1 < line_starts.len() {
-                        line_starts[line + 1] - 1
-                    } else {
-                        app.input.len()
-                    };
-                    let x_rel = mx.saturating_sub(q_content.x) as usize;
-                    let col = x_rel.min(line_end.saturating_sub(line_start));
-                    let prev_cursor = app.input_cursor;
-                    app.input_cursor = line_start + col;
-                    ensure_input_cursor_visible(app);
-                    if app.input_cursor != prev_cursor {
-                        app.parse_status_dirty = true;
-                    }
-                    return;
-                }
-                if point_in(mx, my, table_rect) {
-                    match app.results_mode {
-                        ResultsMode::Messages => {
-                            if let Some(rect) = timestamp_toggle_button_rect(table_rect, app) {
-                                if point_in(mx, my, rect) {
-                                    toggle_timestamp_display(app);
-                                    return;
-                                }
-                            }
-                            let data_rect = table_rect;
-                            let data_start_y = data_rect.y.saturating_add(2);
-                            if my >= data_start_y
-                                && my
-                                    < data_rect
-                                        .y
-                                        .saturating_add(data_rect.height.saturating_sub(1))
-                                && !app.rows.is_empty()
-                            {
-                                let y_rel = (my - data_start_y) as usize;
-                                let visible_rows = data_rect.height.saturating_sub(3) as usize;
-                                let approx_first =
-                                    app.selected_row.saturating_sub(visible_rows / 2);
-                                let new_row =
-                                    (approx_first + y_rel).min(app.rows.len().saturating_sub(1));
-                                if new_row != app.selected_row {
-                                    app.selected_row = new_row;
-                                    app.json_vscroll = 0;
-                                }
-                            }
-
-                            let inner_x = data_rect.x.saturating_add(1);
-                            if mx >= inner_x {
-                                let mut x_rel = (mx - inner_x) as usize;
-                                let mut col = 0usize;
-                                let widths: Vec<usize> = app
-                                    .selected_columns
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, c)| {
-                                        let mut w = runner_column_width_hint(*c);
-                                        if i + 1 < app.selected_columns.len() {
-                                            w = w.saturating_add(1);
-                                        }
-                                        w
-                                    })
-                                    .collect();
-                                if !widths.is_empty() {
-                                    for (i, w) in widths.iter().enumerate() {
-                                        if *w == usize::MAX {
-                                            col = i;
-                                            break;
-                                        }
-                                        if x_rel < *w {
-                                            col = i;
-                                            break;
-                                        } else {
-                                            x_rel = x_rel.saturating_sub(*w);
-                                        }
-                                    }
-                                    if col >= widths.len() {
-                                        col = widths.len() - 1;
-                                    }
-                                    if app.selected_col != col {
-                                        app.selected_col = col;
-                                        app.json_vscroll = 0;
-                                    }
-                                }
-                            }
-                        }
-                        ResultsMode::TopicList => {
-                            let data_start_y = table_rect.y.saturating_add(2);
-                            if my >= data_start_y
-                                && my
-                                    < table_rect
-                                        .y
-                                        .saturating_add(table_rect.height.saturating_sub(1))
-                                && !app.topics_with_partitions.is_empty()
-                            {
-                                let y_rel = (my - data_start_y) as usize;
-                                let visible_rows = table_rect.height.saturating_sub(3) as usize;
-                                let approx_first =
-                                    app.selected_row.saturating_sub(visible_rows / 2);
-                                let new_row = (approx_first + y_rel)
-                                    .min(app.topics_with_partitions.len().saturating_sub(1));
-                                app.selected_row = new_row;
-                            }
-                        }
-                    }
-                } else if let Some(json_rect) = json_rect_opt {
-                    if point_in(mx, my, json_rect) {
-                        if let Some(inner) = json_inner {
-                            let label = "[ Copy ]";
-                            let btn_w = label.chars().count() as u16;
-                            if inner.width >= btn_w {
-                                let btn_rect = Rect {
-                                    x: inner.x + inner.width - btn_w,
-                                    y: inner.y,
-                                    width: btn_w,
-                                    height: 1,
-                                };
-                                if point_in(mx, my, btn_rect) {
-                                    if let Some(s) = selected_cell_text(app) {
-                                        if let Err(e) = copy_to_clipboard(&s) {
-                                            push_status_line(
-                                                app,
-                                                format!("Clipboard error: {}", e),
-                                            );
-                                        } else {
-                                            push_status_line(app, "Payload copied".to_string());
-                                        }
-                                        app.copy_btn_pressed = true;
-                                        app.copy_btn_deadline =
-                                            Some(Instant::now() + Duration::from_millis(150));
-                                    } else {
-                                        push_status_line(app, "No payload to copy".to_string());
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Screen::Envs => {
-                if let Some(field_rects) = env_editor_fields(app, rows[1]) {
-                    if handle_env_copy_paste_click(app, &field_rects, mx, my) {
-                        return;
-                    }
-                }
-            }
-            Screen::AppConfig => {
-                ensure_app_config_editor(app);
-                if let Some((fields, actions_rect)) = app_config_field_rects(rows[1]) {
-                    if let Some(ed) = app.app_config_editor.as_mut() {
-                        if detect_title_button(
-                            fields[0],
-                            mx,
-                            my,
-                            &[
-                                (TitleButton::Copy, ENV_COPY_LABEL),
-                                (TitleButton::Paste, ENV_PASTE_LABEL),
-                                (TitleButton::Clear, ENV_CLEAR_LABEL),
-                            ],
-                        )
-                        .map(|b| match b {
-                            TitleButton::Copy => {
-                                let _ = copy_to_clipboard(&ed.query_scan_multiplier);
-                            }
-                            TitleButton::Paste => {
-                                if let Some(text) = read_clipboard_text() {
-                                    ed.query_scan_multiplier
-                                        .push_str(&normalize_plain_input(&text));
-                                }
-                            }
-                            TitleButton::Clear => {
-                                ed.query_scan_multiplier.clear();
-                            }
-                        })
-                        .is_some()
-                        {
-                            ed.field_focus = AppConfigFieldFocus::QueryScanMultiplier;
-                            return;
-                        }
-                        if detect_title_button(
-                            fields[1],
-                            mx,
-                            my,
-                            &[
-                                (TitleButton::Copy, ENV_COPY_LABEL),
-                                (TitleButton::Paste, ENV_PASTE_LABEL),
-                                (TitleButton::Clear, ENV_CLEAR_LABEL),
-                            ],
-                        )
-                        .map(|b| match b {
-                            TitleButton::Copy => {
-                                let _ = copy_to_clipboard(&ed.default_limit);
-                            }
-                            TitleButton::Paste => {
-                                if let Some(text) = read_clipboard_text() {
-                                    ed.default_limit.push_str(&normalize_plain_input(&text));
-                                }
-                            }
-                            TitleButton::Clear => {
-                                ed.default_limit.clear();
-                            }
-                        })
-                        .is_some()
-                        {
-                            ed.field_focus = AppConfigFieldFocus::DefaultLimit;
-                            return;
-                        }
-                        if point_in(mx, my, fields[0]) {
-                            ed.field_focus = AppConfigFieldFocus::QueryScanMultiplier;
-                            return;
-                        }
-                        if point_in(mx, my, fields[1]) {
-                            ed.field_focus = AppConfigFieldFocus::DefaultLimit;
-                            return;
-                        }
-                        if point_in(mx, my, fields[2]) {
-                            let inner = Rect {
-                                x: fields[2].x.saturating_add(1),
-                                y: fields[2].y.saturating_add(1),
-                                width: fields[2].width.saturating_sub(2),
-                                height: fields[2].height.saturating_sub(2),
-                            };
-                            if inner.width > 0 {
-                                let seg = inner.width / 3;
-                                let rel = mx.saturating_sub(inner.x);
-                                let idx = if seg == 0 {
-                                    0
-                                } else {
-                                    (rel / seg).min(2) as usize
-                                };
-                                ed.default_order_field_idx = idx;
-                            }
-                            ed.field_focus = AppConfigFieldFocus::DefaultOrderField;
-                            return;
-                        }
-                        if point_in(mx, my, fields[3]) {
-                            let inner = Rect {
-                                x: fields[3].x.saturating_add(1),
-                                y: fields[3].y.saturating_add(1),
-                                width: fields[3].width.saturating_sub(2),
-                                height: fields[3].height.saturating_sub(2),
-                            };
-                            let rel = mx.saturating_sub(inner.x);
-                            if inner.width > 0 && rel < inner.width {
-                                ed.default_order_dir_idx =
-                                    if rel < inner.width / 2 { 0 } else { 1 };
-                            }
-                            ed.field_focus = AppConfigFieldFocus::DefaultOrderDir;
-                            return;
-                        }
-                        if point_in(mx, my, fields[4]) {
-                            let inner = Rect {
-                                x: fields[4].x.saturating_add(1),
-                                y: fields[4].y.saturating_add(1),
-                                width: fields[4].width.saturating_sub(2),
-                                height: fields[4].height.saturating_sub(2),
-                            };
-                            let rel = mx.saturating_sub(inner.x);
-                            if inner.width > 0 && rel < inner.width {
-                                ed.timestamps_use_utc = rel < inner.width / 2;
-                            }
-                            ed.field_focus = AppConfigFieldFocus::TimestampsUseUtc;
-                            return;
-                        }
-                        if let Some(action) = detect_app_config_action(actions_rect, mx, my) {
-                            match action {
-                                AppConfigAction::Save => attempt_save_app_config(app),
-                                AppConfigAction::Reset => perform_app_config_reset(app),
-                            }
-                            return;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        },
-        MouseEventKind::ScrollUp => match app.screen {
-            Screen::Home => {
-                let query_area = rows[2];
-                let q_inner = Rect {
-                    x: query_area.x.saturating_add(1),
-                    y: query_area.y.saturating_add(1),
-                    width: query_area.width.saturating_sub(2),
-                    height: query_area.height.saturating_sub(2),
-                };
-                let q_cols = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Length(6), Constraint::Min(1)])
-                    .split(q_inner);
-                let q_content = q_cols[1];
-                let results_area = rows[3];
-                let (table_rect, json_rect_opt) =
-                    if matches!(app.results_mode, ResultsMode::Messages) {
-                        let cols = Layout::default()
-                            .direction(Direction::Horizontal)
-                            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                            .split(results_area);
-                        (cols[0], Some(cols[1]))
-                    } else {
-                        (results_area, None)
-                    };
-                if point_in(mx, my, q_content) {
-                    app.input_vscroll = app.input_vscroll.saturating_sub(1);
-                } else if point_in(mx, my, table_rect) {
-                    if app.selected_row > 0 {
-                        app.selected_row -= 1;
-                    }
-                } else if let Some(json_rect) = json_rect_opt {
-                    if point_in(mx, my, json_rect) {
-                        app.json_vscroll = app.json_vscroll.saturating_sub(1);
-                    }
-                }
-            }
-            Screen::Envs => {
-                if let Some(fields) = env_editor_fields(app, rows[1]) {
-                    if point_in(mx, my, fields[6]) {
-                        app.env_conn_vscroll = app.env_conn_vscroll.saturating_sub(1);
-                    }
-                }
-            }
-            _ => {}
-        },
-        MouseEventKind::ScrollDown => match app.screen {
-            Screen::Home => {
-                let query_area = rows[2];
-                let q_inner = Rect {
-                    x: query_area.x.saturating_add(1),
-                    y: query_area.y.saturating_add(1),
-                    width: query_area.width.saturating_sub(2),
-                    height: query_area.height.saturating_sub(2),
-                };
-                let q_cols = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Length(6), Constraint::Min(1)])
-                    .split(q_inner);
-                let q_content = q_cols[1];
-                let results_area = rows[3];
-                let (table_rect, json_rect_opt) =
-                    if matches!(app.results_mode, ResultsMode::Messages) {
-                        let cols = Layout::default()
-                            .direction(Direction::Horizontal)
-                            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                            .split(results_area);
-                        (cols[0], Some(cols[1]))
-                    } else {
-                        (results_area, None)
-                    };
-                if point_in(mx, my, q_content) {
-                    app.input_vscroll = app.input_vscroll.saturating_add(1);
-                } else if point_in(mx, my, table_rect) {
-                    let total = total_results_rows(app);
-                    if total > 0 && app.selected_row + 1 < total {
-                        app.selected_row += 1;
-                    }
-                } else if let Some(json_rect) = json_rect_opt {
-                    if point_in(mx, my, json_rect) {
-                        app.json_vscroll = app.json_vscroll.saturating_add(1);
-                    }
-                }
-            }
-            Screen::Envs => {
-                if let Some(fields) = env_editor_fields(app, rows[1]) {
-                    if point_in(mx, my, fields[6]) {
-                        app.env_conn_vscroll = app.env_conn_vscroll.saturating_add(1);
-                    }
-                }
-            }
-            _ => {}
-        },
-        MouseEventKind::ScrollLeft => {
-            if matches!(app.screen, Screen::Home) {
-                let results_area = rows[3];
-                let (table_rect, _) = if matches!(app.results_mode, ResultsMode::Messages) {
-                    let cols = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                        .split(results_area);
-                    (cols[0], Some(cols[1]))
-                } else {
-                    (results_area, None)
-                };
-                if point_in(mx, my, table_rect) {
-                    app.table_hscroll = app.table_hscroll.saturating_sub(4);
-                }
-            }
-        }
-        MouseEventKind::ScrollRight => {
-            if matches!(app.screen, Screen::Home) {
-                let results_area = rows[3];
-                let (table_rect, _) = if matches!(app.results_mode, ResultsMode::Messages) {
-                    let cols = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                        .split(results_area);
-                    (cols[0], Some(cols[1]))
-                } else {
-                    (results_area, None)
-                };
-                if point_in(mx, my, table_rect) {
-                    app.table_hscroll = app.table_hscroll.saturating_add(4);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn timestamp_toggle_button_rect(area: Rect, app: &AppState) -> Option<Rect> {
-    if !app.should_show_timestamp_switch() || area.width <= 2 || area.height <= 2 {
-        return None;
-    }
-    let label_width = app.timestamp_toggle_label().chars().count() as u16;
-    if label_width == 0 {
-        return None;
-    }
-    let inner = Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
-    if inner.width <= label_width {
-        return None;
-    }
-    Some(Rect {
-        x: inner.x + inner.width - label_width,
-        y: inner.y,
-        width: label_width,
-        height: 1,
-    })
-}
-
-fn toggle_timestamp_display(app: &mut AppState) {
-    app.timestamps_use_utc = !app.timestamps_use_utc;
-    app.timestamp_switch_pressed = true;
-    app.timestamp_switch_deadline = Some(Instant::now() + Duration::from_millis(150));
-    let mode = if app.timestamps_use_utc {
-        "UTC"
-    } else {
-        "system local"
-    };
-    push_status_line(app, format!("Timestamps now show in {mode} time"));
-}
-
-fn scroll_help(app: &mut AppState, delta: i32) {
-    let mut next = app.help_vscroll as i32 + delta;
-    if next < 0 {
-        next = 0;
-    }
-    let max = help_max_scroll() as i32;
-    if next > max {
-        next = max;
-    }
-    app.help_vscroll = next as u32;
-}
-
-fn jump_help_to_end(app: &mut AppState) {
-    app.help_vscroll = help_max_scroll();
-}
-
-fn help_max_scroll() -> u32 {
-    let total_lines = help_content_line_count();
-    total_lines.saturating_sub(1) as u32
-}
-
-fn fetch_topics_async(app: &AppState, tx: mpsc::UnboundedSender<TuiEvent>) {
-    let host = app
-        .selected_env()
-        .map(|e| e.host.clone())
-        .unwrap_or_else(|| app.host.clone());
-    let ssl = app.current_ssl_config();
-    tokio::spawn(async move {
-        let mut cfg = ClientConfig::new();
-        cfg.set("bootstrap.servers", &host)
-            .set("group.id", format!("rkl-list-{}", uuid::Uuid::new_v4()))
-            .set("enable.auto.commit", "false")
-            .set("auto.offset.reset", "earliest")
-            .set("enable.partition.eof", "true");
-        if let Some(ssl) = &ssl {
-            if ssl.ca_pem.is_some() || ssl.cert_pem.is_some() || ssl.key_pem.is_some() {
-                cfg.set("security.protocol", "ssl");
-                if let Some(ref s) = ssl.ca_pem {
-                    cfg.set("ssl.ca.pem", s);
-                }
-                if let Some(ref s) = ssl.cert_pem {
-                    cfg.set("ssl.certificate.pem", s);
-                }
-                if let Some(ref s) = ssl.key_pem {
-                    cfg.set("ssl.key.pem", s);
-                }
-            }
-        }
-        let list = async {
-            struct QuietContext;
-            impl ClientContext for QuietContext {
-                fn log(&self, _level: RDKafkaLogLevel, _fac: &str, _log_message: &str) {}
-            }
-            impl ConsumerContext for QuietContext {}
-            let c: StreamConsumer<QuietContext> = cfg
-                .create_with_context(QuietContext)
-                .context("create consumer")?;
-            let md = c
-                .fetch_metadata(None, Duration::from_secs(10))
-                .context("fetch metadata")?;
-            let mut names: Vec<String> = md.topics().iter().map(|t| t.name().to_string()).collect();
-            names.sort();
-            Ok::<_, anyhow::Error>(names)
-        }
-        .await;
-        match list {
-            Ok(v) => {
-                let _ = tx.send(TuiEvent::Topics(v));
-            }
-            Err(e) => {
-                let _ = tx.send(TuiEvent::Topics(vec![format!("Error: {}", e)]));
-            }
-        }
-    });
-}
-
-fn fetch_topics_with_partitions_async(app: &AppState, tx: mpsc::UnboundedSender<TuiEvent>) {
-    let host = app
-        .selected_env()
-        .map(|e| e.host.clone())
-        .unwrap_or_else(|| app.host.clone());
-    let ssl = app.current_ssl_config();
-    tokio::spawn(async move {
-        let mut cfg = ClientConfig::new();
-        cfg.set("bootstrap.servers", &host)
-            .set("group.id", format!("rkl-list-{}", uuid::Uuid::new_v4()))
-            .set("enable.auto.commit", "false")
-            .set("auto.offset.reset", "earliest")
-            .set("enable.partition.eof", "true");
-        if let Some(ssl) = &ssl {
-            if ssl.ca_pem.is_some() || ssl.cert_pem.is_some() || ssl.key_pem.is_some() {
-                cfg.set("security.protocol", "ssl");
-                if let Some(ref s) = ssl.ca_pem {
-                    cfg.set("ssl.ca.pem", s);
-                }
-                if let Some(ref s) = ssl.cert_pem {
-                    cfg.set("ssl.certificate.pem", s);
-                }
-                if let Some(ref s) = ssl.key_pem {
-                    cfg.set("ssl.key.pem", s);
-                }
-            }
-        }
-        let list = async {
-            struct QuietContext;
-            impl ClientContext for QuietContext {
-                fn log(&self, _level: RDKafkaLogLevel, _fac: &str, _log_message: &str) {}
-            }
-            impl ConsumerContext for QuietContext {}
-            let c: StreamConsumer<QuietContext> = cfg
-                .create_with_context(QuietContext)
-                .context("create consumer")?;
-            let md = c
-                .fetch_metadata(None, std::time::Duration::from_secs(10))
-                .context("fetch metadata")?;
-            let mut entries: Vec<(String, usize)> = md
-                .topics()
-                .iter()
-                .map(|t| (t.name().to_string(), t.partitions().len()))
-                .collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            Ok::<_, anyhow::Error>(entries)
-        }
-        .await;
-        match list {
-            Ok(v) => {
-                let _ = tx.send(TuiEvent::TopicsWithPartitions(v));
-            }
-            Err(e) => {
-                let _ = tx.send(TuiEvent::TopicsWithPartitions(vec![(
-                    format!("Error: {}", e),
-                    0,
-                )]));
-            }
-        }
-    });
-}
-
-fn env_editor_fields(app: &AppState, body: Rect) -> Option<Vec<Rect>> {
-    let area = if app.show_env_modal {
-        let popup_rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(10),
-                Constraint::Percentage(80),
-                Constraint::Percentage(10),
-            ])
-            .split(body);
-        let center_v = popup_rows.get(1)?.to_owned();
-        let popup_cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(10),
-                Constraint::Percentage(80),
-                Constraint::Percentage(10),
-            ])
-            .split(center_v);
-        popup_cols.get(1).copied()?
-    } else if matches!(app.screen, Screen::Envs) {
-        body
-    } else {
-        return None;
-    };
-    let inner = Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .margin(1)
-        .split(inner);
-    let editor = cols.get(1).copied()?;
-    let fields = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Min(5),
-            Constraint::Min(5),
-            Constraint::Length(3),
-            Constraint::Min(5),
-        ])
-        .split(editor);
-    Some(fields.to_vec())
-}
-
-fn app_config_field_rects(body: Rect) -> Option<(Vec<Rect>, Rect)> {
-    if body.width <= 2 || body.height <= 2 {
-        return None;
-    }
-    let inner = Rect {
-        x: body.x.saturating_add(1),
-        y: body.y.saturating_add(1),
-        width: body.width.saturating_sub(2),
-        height: body.height.saturating_sub(2),
-    };
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Min(8),
-            Constraint::Length(3),
-        ])
-        .split(inner);
-    let fields = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(2),
-        ])
-        .split(sections[1]);
-    Some((fields.to_vec(), sections[2]))
-}
-
-#[derive(Copy, Clone)]
-enum AppConfigAction {
-    Save,
-    Reset,
-}
-
-fn detect_app_config_action(area: Rect, mx: u16, my: u16) -> Option<AppConfigAction> {
-    let inner = Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
-    if my != inner.y {
-        return None;
-    }
-    let labels = [
-        ("[Save]", AppConfigAction::Save),
-        ("[Reset to defaults]", AppConfigAction::Reset),
-    ];
-    let mut cursor = inner.x.saturating_add(1);
-    for (label, action) in labels {
-        let w = label.chars().count() as u16;
-        if mx >= cursor && mx < cursor + w {
-            return Some(action);
-        }
-        cursor = cursor.saturating_add(w + 3);
-    }
-    None
-}
-
-fn handle_env_copy_paste_click(app: &mut AppState, fields: &[Rect], mx: u16, my: u16) -> bool {
-    if fields.len() < 7 || app.env_editor.is_none() {
-        return false;
-    }
-    if let Some(button) = detect_title_button(
-        fields[0],
-        mx,
-        my,
-        &[
-            (TitleButton::Copy, ENV_COPY_LABEL),
-            (TitleButton::Paste, ENV_PASTE_LABEL),
-        ],
-    ) {
-        let mut meta_changed = false;
-        match button {
-            TitleButton::Copy => {
-                if let Some(name) = app.env_editor.as_ref().map(|ed| ed.name.clone()) {
-                    let _ = copy_to_clipboard(&name);
-                }
-            }
-            TitleButton::Paste => {
-                if let Some(text) = read_clipboard_text() {
-                    let normalized = normalize_plain_input(&text);
-                    if let Some(ed) = app.env_editor.as_mut() {
-                        if !normalized.is_empty() {
-                            insert_text_at_cursor(&mut ed.name, &mut ed.name_cursor, &normalized);
-                            meta_changed = true;
-                        }
-                    }
-                }
-            }
-            TitleButton::Clear => {}
-        }
-        if meta_changed {
-            sync_env_metadata_from_editor(app);
-        }
-        return true;
-    }
-    if let Some(button) = detect_title_button(
-        fields[1],
-        mx,
-        my,
-        &[
-            (TitleButton::Copy, ENV_COPY_LABEL),
-            (TitleButton::Paste, ENV_PASTE_LABEL),
-        ],
-    ) {
-        let mut meta_changed = false;
-        match button {
-            TitleButton::Copy => {
-                if let Some(host) = app.env_editor.as_ref().map(|ed| ed.host.clone()) {
-                    let _ = copy_to_clipboard(&host);
-                }
-            }
-            TitleButton::Paste => {
-                if let Some(text) = read_clipboard_text() {
-                    let normalized = normalize_plain_input(&text);
-                    if let Some(ed) = app.env_editor.as_mut() {
-                        if !normalized.is_empty() {
-                            insert_text_at_cursor(&mut ed.host, &mut ed.host_cursor, &normalized);
-                            meta_changed = true;
-                        }
-                    }
-                }
-            }
-            TitleButton::Clear => {}
-        }
-        if meta_changed {
-            sync_env_metadata_from_editor(app);
-        }
-        return true;
-    }
-    if let Some(button) = detect_title_button(
-        fields[2],
-        mx,
-        my,
-        &[
-            (TitleButton::Copy, ENV_COPY_LABEL),
-            (TitleButton::Paste, ENV_PASTE_LABEL),
-            (TitleButton::Clear, ENV_CLEAR_LABEL),
-        ],
-    ) {
-        match button {
-            TitleButton::Copy => {
-                if let Some(text) = app
-                    .env_editor
-                    .as_ref()
-                    .map(|ed| ed.ta_private.lines().join("\n"))
-                {
-                    let _ = copy_to_clipboard(&text);
-                }
-            }
-            TitleButton::Paste => {
-                if let Some(text) = read_clipboard_text() {
-                    if let Some(ed) = app.env_editor.as_mut() {
-                        ed.ta_private.insert_str(normalize_pem_input(&text));
-                    }
-                }
-            }
-            TitleButton::Clear => {
-                if let Some(ed) = app.env_editor.as_mut() {
-                    ed.ta_private = text_area_from_string(String::new());
-                }
-            }
-        }
-        return true;
-    }
-    if let Some(button) = detect_title_button(
-        fields[3],
-        mx,
-        my,
-        &[
-            (TitleButton::Copy, ENV_COPY_LABEL),
-            (TitleButton::Paste, ENV_PASTE_LABEL),
-            (TitleButton::Clear, ENV_CLEAR_LABEL),
-        ],
-    ) {
-        match button {
-            TitleButton::Copy => {
-                if let Some(text) = app
-                    .env_editor
-                    .as_ref()
-                    .map(|ed| ed.ta_public.lines().join("\n"))
-                {
-                    let _ = copy_to_clipboard(&text);
-                }
-            }
-            TitleButton::Paste => {
-                if let Some(text) = read_clipboard_text() {
-                    if let Some(ed) = app.env_editor.as_mut() {
-                        ed.ta_public.insert_str(normalize_pem_input(&text));
-                    }
-                }
-            }
-            TitleButton::Clear => {
-                if let Some(ed) = app.env_editor.as_mut() {
-                    ed.ta_public = text_area_from_string(String::new());
-                }
-            }
-        }
-        return true;
-    }
-    if let Some(button) = detect_title_button(
-        fields[4],
-        mx,
-        my,
-        &[
-            (TitleButton::Copy, ENV_COPY_LABEL),
-            (TitleButton::Paste, ENV_PASTE_LABEL),
-            (TitleButton::Clear, ENV_CLEAR_LABEL),
-        ],
-    ) {
-        match button {
-            TitleButton::Copy => {
-                if let Some(text) = app
-                    .env_editor
-                    .as_ref()
-                    .map(|ed| ed.ta_ca.lines().join("\n"))
-                {
-                    let _ = copy_to_clipboard(&text);
-                }
-            }
-            TitleButton::Paste => {
-                if let Some(text) = read_clipboard_text() {
-                    if let Some(ed) = app.env_editor.as_mut() {
-                        ed.ta_ca.insert_str(normalize_pem_input(&text));
-                    }
-                }
-            }
-            TitleButton::Clear => {
-                if let Some(ed) = app.env_editor.as_mut() {
-                    ed.ta_ca = text_area_from_string(String::new());
-                }
-            }
-        }
-        return true;
-    }
-    if let Some(button) = detect_title_button(
-        fields[6],
-        mx,
-        my,
-        &[
-            (TitleButton::Copy, ENV_COPY_LABEL),
-            (TitleButton::Paste, ENV_CONN_PASTE_LABEL),
-        ],
-    ) {
-        match button {
-            TitleButton::Copy => {
-                let text = app
-                    .env_test_message
-                    .clone()
-                    .unwrap_or_else(|| "Ready".to_string());
-                let _ = copy_to_clipboard(&text);
-            }
-            TitleButton::Paste => {
-                if let Some(text) = read_clipboard_text() {
-                    app.env_test_message = Some(normalize_plain_input(&text));
-                }
-            }
-            TitleButton::Clear => {}
-        }
-        return true;
-    }
-    false
-}
-
-#[derive(Copy, Clone)]
-enum TitleButton {
-    Copy,
-    Paste,
-    Clear,
-}
-
-fn detect_title_button(
-    rect: Rect,
-    mx: u16,
-    my: u16,
-    labels: &[(TitleButton, &str)],
-) -> Option<TitleButton> {
-    if my != rect.y || rect.width <= 2 || labels.is_empty() {
-        return None;
-    }
-    let inner = Rect {
-        x: rect.x.saturating_add(1),
-        y: rect.y.saturating_add(1),
-        width: rect.width.saturating_sub(2),
-        height: rect.height.saturating_sub(2),
-    };
-    if inner.width == 0 {
-        return None;
-    }
-    let mut cursor = inner.x + inner.width;
-    for (button, label) in labels.iter().rev() {
-        let label_width = label.chars().count() as u16;
-        if label_width == 0 {
-            continue;
-        }
-        if cursor <= inner.x {
-            break;
-        }
-        let start = cursor.saturating_sub(label_width);
-        if mx >= start && mx < cursor {
-            return Some(*button);
-        }
-        if start > inner.x {
-            cursor = start - 1;
-        } else {
-            cursor = inner.x;
-        }
-    }
-    None
-}
-
-fn read_clipboard_text() -> Option<String> {
-    let mut cb = arboard::Clipboard::new().ok()?;
-    cb.get_text().ok()
 }
 
 fn normalize_plain_input(raw: &str) -> String {
@@ -3625,613 +1088,1214 @@ fn ta_input_from_key(key: KeyEvent) -> TAInput {
     }
 }
 
-fn ta_input_from_mouse(me: MouseEvent) -> TAInput {
-    let ctrl = me.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = me.modifiers.contains(KeyModifiers::ALT);
-    let shift = me.modifiers.contains(KeyModifiers::SHIFT);
-    let tkey = match me.kind {
-        MouseEventKind::ScrollUp => TAKey::MouseScrollUp,
-        MouseEventKind::ScrollDown => TAKey::MouseScrollDown,
-        _ => TAKey::Null,
-    };
-    TAInput {
-        key: tkey,
-        ctrl,
-        alt,
-        shift,
-    }
+fn textarea_text(ta: &TextArea) -> String {
+    ta.lines().join("\n")
 }
 
-#[cfg(unix)]
-struct StdioRedirectGuard {
-    orig_out: i32,
-    orig_err: i32,
-}
-#[cfg(unix)]
-impl Drop for StdioRedirectGuard {
-    fn drop(&mut self) {
-        unsafe {
-            libc::fflush(std::ptr::null_mut());
-            libc::dup2(self.orig_out, libc::STDOUT_FILENO);
-            libc::dup2(self.orig_err, libc::STDERR_FILENO);
-            libc::close(self.orig_out);
-            libc::close(self.orig_err);
+fn textarea_cursor_offset(ta: &TextArea) -> usize {
+    let (row, col) = ta.cursor();
+    let mut offset = 0usize;
+    for (idx, line) in ta.lines().iter().enumerate() {
+        if idx == row {
+            offset += line
+                .chars()
+                .take(col)
+                .map(|c| c.len_utf8())
+                .sum::<usize>();
+            return offset;
         }
+        offset += line.len() + 1;
     }
+    offset
 }
 
-#[cfg(unix)]
-fn redirect_stdio_to_file(path: &std::path::Path) -> std::io::Result<StdioRedirectGuard> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    unsafe {
-        libc::fflush(std::ptr::null_mut());
-        let orig_out = libc::dup(libc::STDOUT_FILENO);
-        let orig_err = libc::dup(libc::STDERR_FILENO);
-        libc::dup2(file.as_raw_fd(), libc::STDOUT_FILENO);
-        libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
-        Ok(StdioRedirectGuard { orig_out, orig_err })
-    }
-}
-
-#[cfg(not(unix))]
-fn redirect_stdio_to_file(_path: &std::path::Path) -> std::io::Result<()> {
-    Ok(())
-}
-
-fn point_in(x: u16, y: u16, r: Rect) -> bool {
-    x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
-}
-
-fn compute_line_starts(text: &str) -> Vec<usize> {
-    let mut v = Vec::new();
-    let mut acc = 0usize;
-    for (i, l) in text.split('\n').enumerate() {
-        v.push(acc);
-        acc += l.len();
-        if i + 1 < text.split('\n').count() {
-            acc += 1;
-        }
-    }
-    if v.is_empty() {
-        v.push(0);
-    }
-    v
-}
-
-fn move_cursor_up(app: &mut AppState) {
-    let prev_cursor = app.input_cursor;
-    let (line, col) = line_col(&app.input, app.input_cursor);
-    if line == 0 {
-        return;
-    }
-    let prev_start = nth_line_start(&app.input, line - 1);
-    let prev_len = line_len(&app.input, line - 1);
-    app.input_cursor = prev_start + col.min(prev_len);
-    ensure_input_cursor_visible(app);
-    if app.input_cursor != prev_cursor {
-        app.parse_status_dirty = true;
-    }
-}
-
-fn move_cursor_down(app: &mut AppState) {
-    let prev_cursor = app.input_cursor;
-    let (line, col) = line_col(&app.input, app.input_cursor);
-    let total = app.input.split('\n').count();
-    if line + 1 >= total {
-        return;
-    }
-    let next_start = nth_line_start(&app.input, line + 1);
-    let next_len = line_len(&app.input, line + 1);
-    app.input_cursor = next_start + col.min(next_len);
-    ensure_input_cursor_visible(app);
-    if app.input_cursor != prev_cursor {
-        app.parse_status_dirty = true;
-    }
-}
-
-fn move_cursor_line_home(app: &mut AppState) {
-    let prev_cursor = app.input_cursor;
-    let (line, _) = line_col(&app.input, app.input_cursor);
-    app.input_cursor = nth_line_start(&app.input, line);
-    ensure_input_cursor_visible(app);
-    if app.input_cursor != prev_cursor {
-        app.parse_status_dirty = true;
-    }
-}
-
-fn move_cursor_line_end(app: &mut AppState) {
-    let prev_cursor = app.input_cursor;
-    let (line, _) = line_col(&app.input, app.input_cursor);
-    let start = nth_line_start(&app.input, line);
-    let len = line_len(&app.input, line);
-    app.input_cursor = start + len;
-    ensure_input_cursor_visible(app);
-    if app.input_cursor != prev_cursor {
-        app.parse_status_dirty = true;
-    }
-}
-
-fn goto_start_of_doc(app: &mut AppState) {
-    if app.input_cursor == 0 {
-        return;
-    }
-    app.input_cursor = 0;
-    ensure_input_cursor_visible(app);
-    app.parse_status_dirty = true;
-}
-
-fn goto_end_of_doc(app: &mut AppState) {
-    if app.input_cursor == app.input.len() {
-        return;
-    }
-    app.input_cursor = app.input.len();
-    ensure_input_cursor_visible(app);
-    app.parse_status_dirty = true;
-}
-
-fn move_prev_word(app: &mut AppState) {
-    let prev_cursor = app.input_cursor;
-    let target = find_prev_word_boundary(&app.input, app.input_cursor);
-    app.input_cursor = target;
-    ensure_input_cursor_visible(app);
-    if app.input_cursor != prev_cursor {
-        app.parse_status_dirty = true;
-    }
-}
-
-fn move_next_word(app: &mut AppState) {
-    let prev_cursor = app.input_cursor;
-    let target = find_next_word_boundary(&app.input, app.input_cursor);
-    app.input_cursor = target;
-    ensure_input_cursor_visible(app);
-    if app.input_cursor != prev_cursor {
-        app.parse_status_dirty = true;
-    }
-}
-
-fn delete_prev_word(app: &mut AppState) -> bool {
-    let start = find_prev_word_boundary(&app.input, app.input_cursor);
-    if start < app.input_cursor {
-        app.input.replace_range(start..app.input_cursor, "");
-        app.input_cursor = start;
-        ensure_input_cursor_visible(app);
-        app.parse_status_dirty = true;
-        return true;
-    }
-    false
-}
-
-fn delete_next_word(app: &mut AppState) -> bool {
-    let end = find_next_word_boundary(&app.input, app.input_cursor);
-    if end > app.input_cursor {
-        app.input.replace_range(app.input_cursor..end, "");
-        ensure_input_cursor_visible(app);
-        app.parse_status_dirty = true;
-        return true;
-    }
-    false
-}
-
-fn find_prev_word_boundary(text: &str, cursor: usize) -> usize {
-    let bytes = text.as_bytes();
-    if bytes.is_empty() {
-        return 0;
-    }
-    let mut idx = cursor.min(bytes.len());
-    idx = skip_left_while_bytes(bytes, idx, |b| b.is_ascii_whitespace());
-    let word_idx = skip_left_while_bytes(bytes, idx, is_word_char_byte);
-    if word_idx != idx {
-        return word_idx;
-    }
-    idx = skip_left_while_bytes(bytes, idx, |b| {
-        !is_word_char_byte(b) && !b.is_ascii_whitespace()
-    });
-    idx = skip_left_while_bytes(bytes, idx, |b| b.is_ascii_whitespace());
-    skip_left_while_bytes(bytes, idx, is_word_char_byte)
-}
-
-fn find_next_word_boundary(text: &str, cursor: usize) -> usize {
-    let bytes = text.as_bytes();
-    let mut idx = cursor.min(bytes.len());
-    if idx >= bytes.len() {
-        return bytes.len();
-    }
-    if is_word_char_byte(bytes[idx]) {
-        idx = skip_right_while_bytes(bytes, idx, is_word_char_byte);
-    }
-    skip_right_while_bytes(bytes, idx, |b| !is_word_char_byte(b))
-}
-
-fn skip_left_while_bytes<F>(bytes: &[u8], mut idx: usize, mut predicate: F) -> usize
-where
-    F: FnMut(u8) -> bool,
-{
-    while idx > 0 {
-        let b = bytes[idx - 1];
-        if !predicate(b) {
-            break;
-        }
-        idx -= 1;
-    }
-    idx
-}
-
-fn skip_right_while_bytes<F>(bytes: &[u8], mut idx: usize, mut predicate: F) -> usize
-where
-    F: FnMut(u8) -> bool,
-{
-    while idx < bytes.len() {
-        let b = bytes[idx];
-        if !predicate(b) {
-            break;
-        }
-        idx += 1;
-    }
-    idx
-}
-
-fn is_word_char_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-fn has_ctrl_or_alt(m: KeyModifiers) -> bool {
-    m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::ALT)
-}
-
-fn line_col(text: &str, cursor: usize) -> (usize, usize) {
-    let idx = cursor.min(text.len());
-    let mut count = 0usize;
-    for (i, l) in text.split('\n').enumerate() {
-        let llen = l.len();
-        if count + llen >= idx {
-            return (i, idx - count);
-        } else {
-            count += llen + 1;
-        }
-    }
-    (0, 0)
-}
-
-fn nth_line_start(text: &str, n: usize) -> usize {
-    if n == 0 {
-        return 0;
-    }
-    let mut count = 0usize;
-    for (i, l) in text.split('\n').enumerate() {
-        if i == n {
-            return count;
-        }
-        count += l.len() + 1;
-    }
-    text.len()
-}
-
-fn line_len(text: &str, n: usize) -> usize {
-    text.split('\n').nth(n).map(|l| l.len()).unwrap_or(0)
-}
-
-fn ensure_input_cursor_visible(app: &mut AppState) {
-    // Keep cursor within the visible editor viewport using actual layout metrics
-    let (w, h) = crossterm::terminal::size().unwrap_or((0, 0));
-    if w == 0 || h == 0 {
-        return;
-    }
-    // Mirror ui.rs layout
-    let root = Rect {
-        x: 0,
-        y: 0,
-        width: w,
-        height: h,
-    };
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),  // menu
-            Constraint::Length(3),  // env bar
-            Constraint::Length(10), // editor + status
-            Constraint::Fill(1),    // results
-            Constraint::Length(3),  // footer
-        ])
-        .split(root);
-    let query_area = rows[2];
-    let inner = Rect {
-        x: query_area.x.saturating_add(1),
-        y: query_area.y.saturating_add(1),
-        width: query_area.width.saturating_sub(2),
-        height: query_area.height.saturating_sub(2),
-    };
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(6), Constraint::Min(1)])
-        .split(inner);
-    let content = cols[1];
-    let visible_lines = content.height.max(1) as usize;
-
-    let (line, col) = line_col(&app.input, app.input_cursor);
-    let wrap_w = content.width.max(1) as usize;
-    let vis_line = line + (col / wrap_w);
-    let top = app.input_vscroll as usize;
-    let bottom_excl = top + visible_lines;
-    if vis_line < top {
-        app.input_vscroll = vis_line as u16;
-    } else if vis_line >= bottom_excl {
-        app.input_vscroll = (vis_line + 1 - visible_lines) as u16;
-    }
-}
-
-fn scroll_input(app: &mut AppState, up: bool) {
-    if up {
-        app.input_vscroll = app.input_vscroll.saturating_sub(5);
+fn reset_query_editor(app: &mut AppState, text: &str) {
+    let mut ta = if text.trim().is_empty() {
+        TextArea::default()
     } else {
-        app.input_vscroll = app.input_vscroll.saturating_add(5);
+        TextArea::from(text.lines())
+    };
+    ta.set_tab_length(2);
+    ta.set_placeholder_text("Write a SELECT query...");
+    app.query_editor = ta;
+}
+
+fn open_command_palette(app: &mut AppState) {
+    app.command_palette.open = true;
+    let mut ta = TextArea::default();
+    ta.set_tab_length(2);
+    ta.set_placeholder_text("Type a command");
+    app.command_palette.input = ta;
+    app.command_palette.selected = 0;
+    update_command_palette_matches(app);
+}
+
+fn update_command_palette_matches(app: &mut AppState) {
+    let filter = textarea_text(&app.command_palette.input);
+    let filter = filter.trim();
+    let mut matches: Vec<usize> = Vec::new();
+    if filter.is_empty() {
+        matches.extend(0..COMMAND_SPECS.len());
+    } else {
+        let matcher = SkimMatcherV2::default();
+        let mut scored: Vec<(i64, usize)> = Vec::new();
+        for (idx, cmd) in COMMAND_SPECS.iter().enumerate() {
+            if let Some(score) = matcher.fuzzy_match(cmd.label, filter) {
+                scored.push((score, idx));
+            }
+        }
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| COMMAND_SPECS[a.1].label.cmp(COMMAND_SPECS[b.1].label))
+        });
+        matches.extend(scored.into_iter().map(|(_, idx)| idx));
+    }
+    app.command_palette.matches = matches;
+    if app.command_palette.matches.is_empty() {
+        app.command_palette.selected = 0;
+    } else {
+        app.command_palette.selected = app
+            .command_palette
+            .selected
+            .min(app.command_palette.matches.len().saturating_sub(1));
     }
 }
 
-const AUTOCOMPLETE_FETCH_COOLDOWN: Duration = Duration::from_secs(5);
-
-fn detect_from_token(text: &str, cursor: usize) -> Option<(usize, usize, usize)> {
-    let (qs, qe) = find_query_range(text, cursor);
-    if qs >= qe {
-        return None;
-    }
-    let rel_cursor = cursor.min(qe) - qs;
-    let query = &text[qs..qe];
-    let bytes = query.as_bytes();
-
-    let from_idx = find_keyword_before(bytes, b"from", rel_cursor)?;
-    find_keyword_before(bytes, b"select", from_idx)?;
-    let mut token_start = from_idx + 4;
-    while token_start < query.len() && bytes[token_start].is_ascii_whitespace() {
-        token_start += 1;
-    }
-    if rel_cursor < token_start {
-        return None;
-    }
-    let mut token_end = token_start;
-    while token_end < query.len() {
-        let b = bytes[token_end];
-        if b.is_ascii_whitespace() || b == b';' {
-            break;
-        }
-        token_end += 1;
-    }
-    if rel_cursor > token_end {
-        return None;
-    }
-    let typed_end = rel_cursor.min(token_end);
-    Some((qs + token_start, qs + token_end, qs + typed_end))
-}
-
-fn find_keyword_before(bytes: &[u8], keyword: &[u8], cursor: usize) -> Option<usize> {
-    if keyword.is_empty() || bytes.len() < keyword.len() {
-        return None;
-    }
-    let mut idx = cursor.min(bytes.len());
-    while idx >= keyword.len() {
-        let start = idx - keyword.len();
-        if slice_eq_ignore_ascii_case(&bytes[start..start + keyword.len()], keyword)
-            && is_word_boundary(bytes, start, start + keyword.len())
-        {
-            return Some(start);
-        }
-        if idx == keyword.len() {
-            break;
-        }
-        idx -= 1;
-    }
-    None
-}
-
-fn slice_eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter()
-        .zip(b.iter())
-        .all(|(x, y)| x.eq_ignore_ascii_case(y))
-}
-
-fn is_word_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
-    let prev = start > 0 && is_word_char_byte(bytes[start - 1]);
-    let next = end < bytes.len() && is_word_char_byte(bytes[end]);
-    !prev && !next
-}
-
-fn maybe_update_autocomplete(
-    app: &mut AppState,
-    tx: &mpsc::UnboundedSender<TuiEvent>,
-    force: bool,
-) {
-    if !force && !app.autocomplete_dirty {
-        return;
-    }
-    if !(matches!(app.screen, Screen::Home)
-        && matches!(app.focus, super::app::Focus::Query)
-        && !app.show_env_modal)
-    {
-        app.autocomplete = None;
-        if !force {
-            app.autocomplete_dirty = false;
-        }
-        return;
-    }
-    let Some((token_start, token_end, typed_end)) = detect_from_token(&app.input, app.input_cursor)
-    else {
-        app.autocomplete = None;
-        if !force {
-            app.autocomplete_dirty = false;
-        }
+fn execute_command(app: &mut AppState, cmd_idx: usize, tx_evt: &mpsc::UnboundedSender<TuiEvent>) {
+    let Some(cmd) = COMMAND_SPECS.get(cmd_idx) else {
         return;
     };
+    match cmd.id {
+        CommandId::SwitchToBasic => {
+            app.query_mode = QueryMode::Basic;
+            app.home_focus = HomeFocus::TopicFilter;
+            app.screen = Screen::Home;
+            app.parse_status_dirty = true;
+        }
+        CommandId::SwitchToAdvanced => {
+            app.query_mode = QueryMode::Advanced;
+            app.home_focus = HomeFocus::AdvancedQuery;
+            app.screen = Screen::Home;
+            app.parse_status_dirty = true;
+        }
+        CommandId::OpenEnvs => {
+            app.screen = Screen::Envs;
+            ensure_env_editor(app);
+        }
+        CommandId::OpenAppConfig => {
+            app.screen = Screen::AppConfig;
+            ensure_app_config_editor(app);
+        }
+        CommandId::OpenInfo => {
+            app.screen = Screen::Info;
+            app.topics_last_fetched_at = Some(Instant::now());
+            fetch_topics_async(app, tx_evt.clone());
+        }
+        CommandId::OpenHelp => {
+            app.last_screen_before_help = Some(app.screen);
+            app.screen = Screen::Help;
+            app.help_vscroll = 0;
+        }
+        CommandId::OpenHistory => {
+            if app.query_history.is_empty() {
+                push_status_line(app, "No query history yet".to_string());
+            } else {
+                app.show_history_popup = true;
+                app.history_selected_index = app.query_history.len().saturating_sub(1);
+            }
+        }
+        CommandId::RefreshTopics => {
+            app.topics_last_fetched_at = Some(Instant::now());
+            fetch_topics_async(app, tx_evt.clone());
+        }
+        CommandId::ToggleTimestampMode => {
+            toggle_timestamp_display(app);
+        }
+        CommandId::ClearResults => {
+            app.clear_rows();
+            app.topics_with_partitions.clear();
+            app.selected_row = 0;
+            app.selected_col = 0;
+            app.json_vscroll = 0;
+            app.table_hscroll = 0;
+        }
+    }
+}
 
-    if app.input_cursor > token_end {
-        app.autocomplete = None;
-        if !force {
-            app.autocomplete_dirty = false;
+fn handle_command_palette_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    tx_evt: &mpsc::UnboundedSender<TuiEvent>,
+) {
+    match key.code {
+        KeyCode::Esc => {
+            app.command_palette.open = false;
+        }
+        KeyCode::Enter => {
+            if let Some(idx) = app
+                .command_palette
+                .matches
+                .get(app.command_palette.selected)
+                .copied()
+            {
+                execute_command(app, idx, tx_evt);
+            }
+            app.command_palette.open = false;
+        }
+        KeyCode::Up => {
+            if app.command_palette.selected > 0 {
+                app.command_palette.selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.command_palette.selected + 1 < app.command_palette.matches.len() {
+                app.command_palette.selected += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            let step = 5.min(app.command_palette.matches.len());
+            app.command_palette.selected = app.command_palette.selected.saturating_sub(step);
+        }
+        KeyCode::PageDown => {
+            let len = app.command_palette.matches.len();
+            if len > 0 {
+                let step = 5.min(len);
+                let next = app.command_palette.selected.saturating_add(step);
+                app.command_palette.selected = next.min(len.saturating_sub(1));
+            }
+        }
+        KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete | KeyCode::Left | KeyCode::Right
+        | KeyCode::Home | KeyCode::End => {
+            let modified = app.command_palette.input.input(ta_input_from_key(key));
+            if modified {
+                update_command_palette_matches(app);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_global_shortcuts(
+    app: &mut AppState,
+    key: KeyEvent,
+    tx_evt: &mpsc::UnboundedSender<TuiEvent>,
+) -> bool {
+    let code = key.code;
+    let modifiers = key.modifiers;
+    if modifiers.is_empty() && matches!(code, KeyCode::Char(':')) {
+        open_command_palette(app);
+        return true;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('p')) {
+        open_command_palette(app);
+        return true;
+    }
+    if modifiers.is_empty() && matches!(code, KeyCode::Char('?')) {
+        app.last_screen_before_help = Some(app.screen);
+        app.screen = Screen::Help;
+        app.help_vscroll = 0;
+        return true;
+    }
+    if matches!(code, KeyCode::F(2)) {
+        app.screen = Screen::Envs;
+        app.show_history_popup = false;
+        ensure_env_editor(app);
+        return true;
+    }
+    if matches!(code, KeyCode::F(3)) {
+        app.screen = Screen::AppConfig;
+        app.show_history_popup = false;
+        ensure_app_config_editor(app);
+        return true;
+    }
+    if matches!(code, KeyCode::F(12)) {
+        app.screen = Screen::Info;
+        app.show_history_popup = false;
+        app.topics_last_fetched_at = Some(Instant::now());
+        fetch_topics_async(app, tx_evt.clone());
+        return true;
+    }
+    if matches!(code, KeyCode::F(8)) {
+        app.screen = Screen::Home;
+        return true;
+    }
+    false
+}
+
+async fn handle_home_key(
+    app: &mut AppState,
+    args: &RunArgs,
+    tx_evt: &mpsc::UnboundedSender<TuiEvent>,
+    run_counter: &mut u64,
+    key: KeyEvent,
+) {
+    let code = key.code;
+    let modifiers = key.modifiers;
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let shift = modifiers.contains(KeyModifiers::SHIFT);
+
+    if ctrl && matches!(code, KeyCode::Char('r')) {
+        if shift {
+            rerun_last_query(app, args, tx_evt, run_counter).await;
+        } else if app.query_history.is_empty() {
+            push_status_line(app, "No query history yet".to_string());
+        } else {
+            app.show_history_popup = true;
+            app.history_selected_index = app.query_history.len().saturating_sub(1);
         }
         return;
     }
 
-    let typed_end = typed_end.min(app.input.len()).min(token_end);
-    if typed_end < token_start {
-        app.autocomplete = None;
-        if !force {
-            app.autocomplete_dirty = false;
-        }
-        return;
-    }
-    let filter = app.input[token_start..typed_end].to_string();
-    if filter.trim().is_empty() {
-        app.autocomplete = None;
-        if !force {
-            app.autocomplete_dirty = false;
+    if ctrl
+        && (matches!(code, KeyCode::Enter)
+            || matches!(code, KeyCode::Char('j') | KeyCode::Char('m')))
+    {
+        if shift {
+            rerun_last_query(app, args, tx_evt, run_counter).await;
+        } else if matches!(app.query_mode, QueryMode::Basic) {
+            run_basic_query(app, args, tx_evt, run_counter).await;
+        } else {
+            run_query_from_editor(app, args, tx_evt, run_counter).await;
         }
         return;
     }
 
-    if let Some((s, e, text)) = app.autocomplete_frozen_token.clone() {
-        if s == token_start && e == token_end {
-            if app.input[token_start..token_end] == text {
-                app.autocomplete = None;
-                if !force {
-                    app.autocomplete_dirty = false;
+    if ctrl && matches!(code, KeyCode::Char('y')) {
+        if matches!(app.query_mode, QueryMode::Advanced) {
+            insert_selected_topic_into_query(app);
+            app.parse_status_dirty = true;
+        }
+        return;
+    }
+
+    if matches!(code, KeyCode::Tab | KeyCode::Char('\t')) {
+        cycle_home_focus(app, true);
+        return;
+    }
+    if matches!(code, KeyCode::BackTab) {
+        cycle_home_focus(app, false);
+        return;
+    }
+
+    if matches!(code, KeyCode::F(5)) {
+        if let Some(s) = selected_cell_text(app) {
+            if let Err(e) = copy_to_clipboard(&s) {
+                push_status_line(app, format!("Clipboard error: {}", e));
+            } else {
+                push_status_line(app, "Copied to clipboard".to_string());
+            }
+        }
+        return;
+    }
+
+    if matches!(code, KeyCode::Esc) {
+        app.home_focus = HomeFocus::TopicFilter;
+        return;
+    }
+
+    match app.home_focus {
+        HomeFocus::TopicFilter => {
+            if matches!(code, KeyCode::Enter | KeyCode::Down) {
+                app.home_focus = HomeFocus::TopicList;
+                return;
+            }
+            let (open_palette, modified) = {
+                let Some(ta) = home_focus_textarea_mut(app, HomeFocus::TopicFilter) else {
+                    return;
+                };
+                if should_open_palette_on_double_slash(ta, key) {
+                    (true, false)
+                } else {
+                    (false, ta.input(ta_input_from_key(key)))
+                }
+            };
+            if open_palette {
+                open_command_palette(app);
+                return;
+            }
+            if modified {
+                refresh_topic_matches(app);
+            }
+        }
+        HomeFocus::TopicList => {
+            let total = app.topic_picker.matches.len();
+            match code {
+                KeyCode::Up => {
+                    if app.topic_picker.selected > 0 {
+                        app.topic_picker.selected -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if app.topic_picker.selected + 1 < total {
+                        app.topic_picker.selected += 1;
+                    }
+                }
+                KeyCode::PageUp => {
+                    let step = 5.min(total);
+                    app.topic_picker.selected = app.topic_picker.selected.saturating_sub(step);
+                }
+                KeyCode::PageDown => {
+                    if total > 0 {
+                        let step = 5.min(total);
+                        let next = app.topic_picker.selected.saturating_add(step);
+                        app.topic_picker.selected = next.min(total.saturating_sub(1));
+                    }
+                }
+                KeyCode::Left => {
+                    app.home_focus = HomeFocus::TopicFilter;
+                }
+                KeyCode::Right | KeyCode::Enter => {
+                    app.home_focus = if matches!(app.query_mode, QueryMode::Basic) {
+                        HomeFocus::BasicSearch
+                    } else {
+                        HomeFocus::AdvancedQuery
+                    };
+                }
+                _ => {}
+            }
+        }
+        HomeFocus::BasicSearch
+        | HomeFocus::BasicWhere
+        | HomeFocus::BasicSince
+        | HomeFocus::BasicUntil
+        | HomeFocus::BasicLimit => {
+            if matches!(code, KeyCode::Enter) {
+                cycle_home_focus(app, true);
+                return;
+            }
+            let open_palette = {
+                let Some(ta) = home_focus_textarea_mut(app, app.home_focus) else {
+                    return;
+                };
+                if should_open_palette_on_double_slash(ta, key) {
+                    true
+                } else {
+                    let _ = ta.input(ta_input_from_key(key));
+                    false
+                }
+            };
+            if open_palette {
+                open_command_palette(app);
+                return;
+            }
+        }
+        HomeFocus::BasicOrderField => {
+            match code {
+                KeyCode::Left => {
+                    if app.basic_query.order_field_idx > 0 {
+                        app.basic_query.order_field_idx -= 1;
+                    }
+                }
+                KeyCode::Right => {
+                    if app.basic_query.order_field_idx < 2 {
+                        app.basic_query.order_field_idx += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    cycle_home_focus(app, true);
+                }
+                _ => {}
+            }
+        }
+        HomeFocus::BasicOrderDir => {
+            match code {
+                KeyCode::Left | KeyCode::Right => {
+                    app.basic_query.order_dir_idx = if app.basic_query.order_dir_idx == 0 {
+                        1
+                    } else {
+                        0
+                    };
+                }
+                KeyCode::Enter => {
+                    cycle_home_focus(app, true);
+                }
+                _ => {}
+            }
+        }
+        HomeFocus::AdvancedQuery => {
+            let open_palette = should_open_palette_on_double_slash(&mut app.query_editor, key);
+            if open_palette {
+                open_command_palette(app);
+                return;
+            }
+            let modified = app.query_editor.input(ta_input_from_key(key));
+            if modified {
+                app.parse_status_dirty = true;
+            }
+        }
+        HomeFocus::Results => {
+            let total = total_results_rows(app);
+            if modifiers.contains(KeyModifiers::SHIFT)
+                && matches!(code, KeyCode::Left | KeyCode::Right)
+            {
+                if matches!(code, KeyCode::Left) {
+                    app.table_hscroll = app.table_hscroll.saturating_sub(1);
+                } else {
+                    app.table_hscroll = app.table_hscroll.saturating_add(1);
                 }
                 return;
-            } else {
-                app.autocomplete_frozen_token = None;
             }
-        } else if s != token_start || e != token_end {
-            app.autocomplete_frozen_token = None;
+            match code {
+                KeyCode::Up => {
+                    if app.selected_row > 0 {
+                        app.selected_row -= 1;
+                        if matches!(app.results_mode, ResultsMode::Messages) {
+                            app.json_vscroll = 0;
+                        }
+                    }
+                }
+                KeyCode::Down => {
+                    if total > 0 {
+                        let max_idx = total.saturating_sub(1);
+                        let next = app.selected_row.saturating_add(1);
+                        app.selected_row = next.min(max_idx);
+                        if matches!(app.results_mode, ResultsMode::Messages) {
+                            app.json_vscroll = 0;
+                        }
+                    }
+                }
+                KeyCode::Left => {
+                    if app.selected_col > 0 {
+                        app.selected_col -= 1;
+                        app.json_vscroll = 0;
+                    }
+                }
+                KeyCode::Right => {
+                    let cols = app.selected_columns.len();
+                    if app.selected_col + 1 < cols {
+                        app.selected_col += 1;
+                        app.json_vscroll = 0;
+                    }
+                }
+                KeyCode::PageUp => {
+                    if app.selected_row > 10 {
+                        app.selected_row -= 10;
+                    } else {
+                        app.selected_row = 0;
+                    }
+                    if matches!(app.results_mode, ResultsMode::Messages) {
+                        app.json_vscroll = 0;
+                    }
+                }
+                KeyCode::PageDown => {
+                    if total > 0 {
+                        let max_idx = total.saturating_sub(1);
+                        let next = app.selected_row.saturating_add(10);
+                        app.selected_row = next.min(max_idx);
+                        if matches!(app.results_mode, ResultsMode::Messages) {
+                            app.json_vscroll = 0;
+                        }
+                    }
+                }
+                KeyCode::Home => {
+                    app.selected_row = 0;
+                    if matches!(app.results_mode, ResultsMode::Messages) {
+                        app.json_vscroll = 0;
+                    }
+                }
+                KeyCode::End => {
+                    if total > 0 {
+                        app.selected_row = total.saturating_sub(1);
+                        if matches!(app.results_mode, ResultsMode::Messages) {
+                            app.json_vscroll = 0;
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    if !app.rows.is_empty() {
+                        app.screen = Screen::RecordDetail;
+                        app.record_detail_scroll = 0;
+                    }
+                }
+                _ => {}
+            }
         }
+        HomeFocus::Details => match code {
+            KeyCode::Up => {
+                app.json_vscroll = app.json_vscroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                app.json_vscroll = app.json_vscroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                app.json_vscroll = app.json_vscroll.saturating_sub(5);
+            }
+            KeyCode::PageDown => {
+                app.json_vscroll = app.json_vscroll.saturating_add(5);
+            }
+            KeyCode::Home => {
+                app.json_vscroll = 0;
+            }
+            KeyCode::End => {
+                app.json_vscroll = u16::MAX;
+            }
+            _ => {}
+        },
     }
-
-    if app.topics.is_empty() {
-        let should_fetch = app
-            .topics_last_fetched_at
-            .map(|inst| inst.elapsed() > AUTOCOMPLETE_FETCH_COOLDOWN)
-            .unwrap_or(true);
-        if should_fetch {
-            app.topics_last_fetched_at = Some(Instant::now());
-            fetch_topics_async(app, tx.clone());
-        }
-    }
-
-    if !force {
-        app.autocomplete_dirty = false;
-    }
-
-    let suggestions = build_topic_suggestions(&app.topics, &filter);
-    let mut selected = app.autocomplete.as_ref().map(|a| a.selected).unwrap_or(0);
-    if suggestions.is_empty() {
-        selected = 0;
-    } else {
-        selected = selected.min(suggestions.len().saturating_sub(1));
-    }
-    app.autocomplete = Some(AutoCompleteState {
-        active: true,
-        filter,
-        suggestions,
-        selected,
-        token_abs_start: token_start,
-        token_abs_end: token_end,
-    });
 }
 
-fn build_topic_suggestions(topics: &[String], filter: &str) -> Vec<String> {
-    const MAX_SUGGESTIONS: usize = 16;
-    if topics.is_empty() {
-        return Vec::new();
+fn handle_env_key(app: &mut AppState, key: KeyEvent, tx_evt: &mpsc::UnboundedSender<TuiEvent>) {
+    let code = key.code;
+    let modifiers = key.modifiers;
+    if matches!(code, KeyCode::Esc) {
+        app.screen = Screen::Home;
+        return;
     }
-    if filter.is_empty() {
-        let mut list: Vec<String> = topics.to_vec();
-        list.sort();
-        list.truncate(MAX_SUGGESTIONS);
-        return list;
-    }
-    let matcher = SkimMatcherV2::default();
-    let filter_chars: Vec<char> = filter.chars().map(|c| c.to_ascii_lowercase()).collect();
-    let mut scored = Vec::new();
-    for name in topics {
-        if let Some(score) = matcher.fuzzy_match(name, filter) {
-            let distance = levenshtein_casefold(&filter_chars, name);
-            scored.push((distance, score, name));
+    if matches!(code, KeyCode::Tab | KeyCode::Char('\t')) {
+        if let Some(ed) = app.env_editor.as_mut() {
+            let order = [
+                EnvFieldFocus::List,
+                EnvFieldFocus::Name,
+                EnvFieldFocus::Host,
+                EnvFieldFocus::PemEditor,
+                EnvFieldFocus::Conn,
+                EnvFieldFocus::Buttons,
+            ];
+            let idx = order
+                .iter()
+                .position(|f| *f == ed.field_focus)
+                .unwrap_or(0);
+            ed.field_focus = order[(idx + 1) % order.len()];
         }
+        return;
     }
-    scored.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then_with(|| a.2.cmp(b.2)));
-    scored
-        .into_iter()
-        .map(|(_, _, name)| name.clone())
-        .take(MAX_SUGGESTIONS)
-        .collect()
-}
-
-fn levenshtein_casefold(filter_chars: &[char], candidate: &str) -> usize {
-    let rhs: Vec<char> = candidate.chars().map(|c| c.to_ascii_lowercase()).collect();
-    levenshtein_chars(filter_chars, &rhs)
-}
-
-fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
-    if a.is_empty() {
-        return b.len();
-    }
-    if b.is_empty() {
-        return a.len();
-    }
-    let mut prev: Vec<usize> = (0..=a.len()).collect();
-    let mut curr = vec![0usize; a.len() + 1];
-    for (i, bc) in b.iter().enumerate() {
-        curr[0] = i + 1;
-        for (j, ac) in a.iter().enumerate() {
-            let cost = if ac == bc { 0 } else { 1 };
-            curr[j + 1] = (curr[j] + 1).min(prev[j + 1] + 1).min(prev[j] + cost);
+    if matches!(code, KeyCode::BackTab) {
+        if let Some(ed) = app.env_editor.as_mut() {
+            let order = [
+                EnvFieldFocus::List,
+                EnvFieldFocus::Name,
+                EnvFieldFocus::Host,
+                EnvFieldFocus::PemEditor,
+                EnvFieldFocus::Conn,
+                EnvFieldFocus::Buttons,
+            ];
+            let idx = order
+                .iter()
+                .position(|f| *f == ed.field_focus)
+                .unwrap_or(0);
+            let next = if idx == 0 { order.len() - 1 } else { idx - 1 };
+            ed.field_focus = order[next];
         }
-        prev.copy_from_slice(&curr);
+        return;
     }
-    prev[a.len()]
-}
 
-fn try_accept_autocomplete(app: &mut AppState) -> bool {
-    let (choice, start, end) = match app.autocomplete.as_ref() {
-        Some(state) if state.active && !state.suggestions.is_empty() => {
-            let idx = state.selected.min(state.suggestions.len() - 1);
-            (
-                state.suggestions[idx].clone(),
-                state.token_abs_start,
-                state.token_abs_end,
-            )
+    match code {
+        KeyCode::F(1) => {
+            let name = next_unique_env_name(&app.env_store.envs);
+            app.env_store.envs.push(Environment {
+                name: name.clone(),
+                host: String::new(),
+                private_key_pem: None,
+                public_key_pem: None,
+                ssl_ca_pem: None,
+            });
+            let idx = app.env_store.envs.len().saturating_sub(1);
+            app.env_store.selected = Some(idx);
+            if let Some(env) = app.env_store.envs.get(idx) {
+                let mut editor = build_env_editor_from_env(env, Some(idx));
+                editor.name_cursor = editor.name.len();
+                editor.host_cursor = editor.host.len();
+                app.env_editor = Some(editor);
+            }
+            return;
         }
-        _ => return false,
+        KeyCode::F(3) => {
+            if let Some(i) = app.env_store.selected {
+                if i < app.env_store.envs.len() {
+                    app.env_store.envs.remove(i);
+                    app.env_store.selected = if app.env_store.envs.is_empty() {
+                        None
+                    } else {
+                        Some(i.min(app.env_store.envs.len() - 1))
+                    };
+                    let _ = app.env_store.save();
+                    sync_env_editor_to_selection(app);
+                }
+            }
+            return;
+        }
+        KeyCode::F(4) => {
+            save_env_from_editor(app);
+            return;
+        }
+        KeyCode::F(5) => {
+            start_env_connection_test(app, tx_evt.clone());
+            return;
+        }
+        KeyCode::F(6) => {
+            move_env_selection(app, 1);
+            return;
+        }
+        KeyCode::F(7) => {
+            move_env_selection(app, -1);
+            return;
+        }
+        _ => {}
+    }
+
+    let focus = app.env_editor.as_ref().map(|ed| ed.field_focus);
+    if matches!(focus, Some(EnvFieldFocus::List)) {
+        match code {
+            KeyCode::Up => move_env_selection(app, -1),
+            KeyCode::Down => move_env_selection(app, 1),
+            KeyCode::Enter => {
+                if let Some(ed) = app.env_editor.as_mut() {
+                    ed.field_focus = EnvFieldFocus::Name;
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+    if matches!(focus, Some(EnvFieldFocus::Conn)) {
+        match code {
+            KeyCode::Up => app.env_conn_vscroll = app.env_conn_vscroll.saturating_sub(1),
+            KeyCode::Down => app.env_conn_vscroll = app.env_conn_vscroll.saturating_add(1),
+            KeyCode::PageUp => app.env_conn_vscroll = app.env_conn_vscroll.saturating_sub(5),
+            KeyCode::PageDown => app.env_conn_vscroll = app.env_conn_vscroll.saturating_add(5),
+            KeyCode::Home => app.env_conn_vscroll = 0,
+            KeyCode::End => app.env_conn_vscroll = u16::MAX,
+            _ => {}
+        }
+        return;
+    }
+    if matches!(focus, Some(EnvFieldFocus::Buttons)) {
+        if matches!(code, KeyCode::Enter) {
+            save_env_from_editor(app);
+        }
+        return;
+    }
+
+    let Some(ed) = app.env_editor.as_mut() else {
+        return;
     };
-    if start > end || end > app.input.len() {
-        app.autocomplete = None;
+    let mut meta_changed = false;
+
+    match ed.field_focus {
+        EnvFieldFocus::Name => {
+            meta_changed = handle_single_line_edit(&mut ed.name, &mut ed.name_cursor, key);
+        }
+        EnvFieldFocus::Host => {
+            meta_changed = handle_single_line_edit(&mut ed.host, &mut ed.host_cursor, key);
+        }
+        EnvFieldFocus::PemEditor => {
+            if modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(code, KeyCode::Left | KeyCode::Right)
+            {
+                ed.active_pem = match (ed.active_pem, code) {
+                    (EnvPemField::PrivateKey, KeyCode::Left) => EnvPemField::Ca,
+                    (EnvPemField::PrivateKey, KeyCode::Right) => EnvPemField::PublicKey,
+                    (EnvPemField::PublicKey, KeyCode::Left) => EnvPemField::PrivateKey,
+                    (EnvPemField::PublicKey, KeyCode::Right) => EnvPemField::Ca,
+                    (EnvPemField::Ca, KeyCode::Left) => EnvPemField::PublicKey,
+                    (EnvPemField::Ca, KeyCode::Right) => EnvPemField::PrivateKey,
+                    (cur, _) => cur,
+                };
+                return;
+            }
+            let input = ta_input_from_key(key);
+            match ed.active_pem {
+                EnvPemField::PrivateKey => {
+                    ed.ta_private.input(input);
+                }
+                EnvPemField::PublicKey => {
+                    ed.ta_public.input(input);
+                }
+                EnvPemField::Ca => {
+                    ed.ta_ca.input(input);
+                }
+            }
+        }
+        EnvFieldFocus::Conn | EnvFieldFocus::Buttons | EnvFieldFocus::List => {}
+    }
+    if meta_changed {
+        sync_env_metadata_from_editor(app);
+    }
+}
+
+fn handle_info_key(app: &mut AppState, key: KeyEvent, tx_evt: &mpsc::UnboundedSender<TuiEvent>) {
+    let code = key.code;
+    if matches!(code, KeyCode::Esc) {
+        app.screen = Screen::Home;
+        return;
+    }
+    if matches!(code, KeyCode::F(6) | KeyCode::Char('r')) {
+        app.topics_last_fetched_at = Some(Instant::now());
+        fetch_topics_async(app, tx_evt.clone());
+        return;
+    }
+    let total = app.topics.len();
+    match code {
+        KeyCode::Up => {
+            if app.selected_row > 0 {
+                app.selected_row -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.selected_row + 1 < total {
+                app.selected_row += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            let step = 5.min(total);
+            app.selected_row = app.selected_row.saturating_sub(step);
+        }
+        KeyCode::PageDown => {
+            if total > 0 {
+                let step = 5.min(total);
+                let next = app.selected_row.saturating_add(step);
+                app.selected_row = next.min(total.saturating_sub(1));
+            }
+        }
+        KeyCode::Home => app.selected_row = 0,
+        KeyCode::End => {
+            if total > 0 {
+                app.selected_row = total.saturating_sub(1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_app_config_key(app: &mut AppState, key: KeyEvent) {
+    let code = key.code;
+    if matches!(code, KeyCode::Esc) {
+        app.screen = Screen::Home;
+        return;
+    }
+    ensure_app_config_editor(app);
+    let Some(ed) = app.app_config_editor.as_mut() else {
+        return;
+    };
+    match code {
+        KeyCode::Tab | KeyCode::Char('\t') => {
+            ed.field_focus = match ed.field_focus {
+                AppConfigFieldFocus::QueryScanMultiplier => AppConfigFieldFocus::DefaultLimit,
+                AppConfigFieldFocus::DefaultLimit => AppConfigFieldFocus::DefaultOrderField,
+                AppConfigFieldFocus::DefaultOrderField => AppConfigFieldFocus::DefaultOrderDir,
+                AppConfigFieldFocus::DefaultOrderDir => AppConfigFieldFocus::TimestampsUseUtc,
+                AppConfigFieldFocus::TimestampsUseUtc => AppConfigFieldFocus::Buttons,
+                AppConfigFieldFocus::Buttons => AppConfigFieldFocus::QueryScanMultiplier,
+            };
+            return;
+        }
+        KeyCode::BackTab => {
+            ed.field_focus = match ed.field_focus {
+                AppConfigFieldFocus::QueryScanMultiplier => AppConfigFieldFocus::Buttons,
+                AppConfigFieldFocus::DefaultLimit => AppConfigFieldFocus::QueryScanMultiplier,
+                AppConfigFieldFocus::DefaultOrderField => AppConfigFieldFocus::DefaultLimit,
+                AppConfigFieldFocus::DefaultOrderDir => AppConfigFieldFocus::DefaultOrderField,
+                AppConfigFieldFocus::TimestampsUseUtc => AppConfigFieldFocus::DefaultOrderDir,
+                AppConfigFieldFocus::Buttons => AppConfigFieldFocus::TimestampsUseUtc,
+            };
+            return;
+        }
+        _ => {}
+    }
+
+    match ed.field_focus {
+        AppConfigFieldFocus::QueryScanMultiplier => match code {
+            KeyCode::Char(ch) => ed.query_scan_multiplier.push(ch),
+            KeyCode::Backspace | KeyCode::Delete => {
+                ed.query_scan_multiplier.pop();
+            }
+            _ => {}
+        },
+        AppConfigFieldFocus::DefaultLimit => match code {
+            KeyCode::Char(ch) => ed.default_limit.push(ch),
+            KeyCode::Backspace | KeyCode::Delete => {
+                ed.default_limit.pop();
+            }
+            _ => {}
+        },
+        AppConfigFieldFocus::DefaultOrderField => match code {
+            KeyCode::Left => {
+                if ed.default_order_field_idx > 0 {
+                    ed.default_order_field_idx -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if ed.default_order_field_idx < 2 {
+                    ed.default_order_field_idx += 1;
+                }
+            }
+            _ => {}
+        },
+        AppConfigFieldFocus::DefaultOrderDir => match code {
+            KeyCode::Left => {
+                if ed.default_order_dir_idx > 0 {
+                    ed.default_order_dir_idx -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if ed.default_order_dir_idx < 1 {
+                    ed.default_order_dir_idx += 1;
+                }
+            }
+            _ => {}
+        },
+        AppConfigFieldFocus::TimestampsUseUtc => match code {
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                ed.timestamps_use_utc = !ed.timestamps_use_utc;
+            }
+            _ => {}
+        },
+        AppConfigFieldFocus::Buttons => match code {
+            KeyCode::Enter => attempt_save_app_config(app),
+            _ => {}
+        },
+    }
+}
+
+fn handle_help_key(app: &mut AppState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.screen = app.last_screen_before_help.unwrap_or(Screen::Home);
+        }
+        KeyCode::Up => scroll_help(app, -1),
+        KeyCode::Down => scroll_help(app, 1),
+        KeyCode::PageUp => scroll_help(app, -10),
+        KeyCode::PageDown => scroll_help(app, 10),
+        KeyCode::Home => app.help_vscroll = 0,
+        KeyCode::End => jump_help_to_end(app),
+        _ => {}
+    }
+}
+
+fn handle_record_detail_key(app: &mut AppState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.screen = Screen::Home;
+        }
+        KeyCode::Up => {
+            app.record_detail_scroll = app.record_detail_scroll.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            app.record_detail_scroll = app.record_detail_scroll.saturating_add(1);
+        }
+        KeyCode::PageUp => {
+            app.record_detail_scroll = app.record_detail_scroll.saturating_sub(5);
+        }
+        KeyCode::PageDown => {
+            app.record_detail_scroll = app.record_detail_scroll.saturating_add(5);
+        }
+        KeyCode::Home => {
+            app.record_detail_scroll = 0;
+        }
+        KeyCode::End => {
+            app.record_detail_scroll = u16::MAX;
+        }
+        _ => {}
+    }
+}
+
+fn handle_paste_event(app: &mut AppState, raw: &str) {
+    if app.command_palette.open {
+        let text = normalize_plain_input(raw);
+        if !text.is_empty() {
+            app.command_palette.input.insert_str(text);
+            update_command_palette_matches(app);
+        }
+        return;
+    }
+
+    match app.screen {
+        Screen::Home => {
+            let focus = app.home_focus;
+            let text = normalize_plain_input(raw);
+            if !text.is_empty() {
+                let mut applied = false;
+                if let Some(ta) = home_focus_textarea_mut(app, focus) {
+                    ta.insert_str(text);
+                    applied = true;
+                }
+                if applied {
+                    if matches!(focus, HomeFocus::AdvancedQuery) {
+                        app.parse_status_dirty = true;
+                    }
+                    if matches!(focus, HomeFocus::TopicFilter) {
+                        refresh_topic_matches(app);
+                    }
+                }
+            }
+        }
+        Screen::Envs => {
+            let _ = handle_env_editor_paste(app, raw);
+        }
+        Screen::AppConfig => {
+            ensure_app_config_editor(app);
+            if let Some(ed) = app.app_config_editor.as_mut() {
+                let text = normalize_plain_input(raw);
+                match ed.field_focus {
+                    AppConfigFieldFocus::QueryScanMultiplier => {
+                        ed.query_scan_multiplier.push_str(&text);
+                    }
+                    AppConfigFieldFocus::DefaultLimit => {
+                        ed.default_limit.push_str(&text);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn should_open_palette_on_double_slash(ta: &mut TextArea, key: KeyEvent) -> bool {
+    if !matches!(key.code, KeyCode::Char('/')) || !key.modifiers.is_empty() {
         return false;
     }
-    app.input.replace_range(start..end, &choice);
-    let new_end = start + choice.len();
-    app.input_cursor = new_end;
-    ensure_input_cursor_visible(app);
-    app.autocomplete_frozen_token = Some((start, new_end, choice));
-    app.autocomplete = None;
-    app.parse_status_dirty = true;
+    let (row, col) = ta.cursor();
+    let Some(line) = ta.lines().get(row) else {
+        return false;
+    };
+    if col == 0 {
+        return false;
+    }
+    let prev = line.chars().nth(col.saturating_sub(1)).unwrap_or(' ');
+    if prev != '/' {
+        return false;
+    }
+    let prefix: String = line.chars().take(col.saturating_sub(1)).collect();
+    if !prefix.trim().is_empty() {
+        return false;
+    }
+    ta.input(TAInput {
+        key: TAKey::Backspace,
+        ctrl: false,
+        alt: false,
+        shift: false,
+    });
     true
 }
 
-fn move_autocomplete_selection(app: &mut AppState, down: bool) {
-    if let Some(state) = app.autocomplete.as_mut() {
-        if state.suggestions.is_empty() {
-            return;
-        }
-        if down {
-            if state.selected + 1 < state.suggestions.len() {
-                state.selected += 1;
+const BASIC_FOCUS_ORDER: &[HomeFocus] = &[
+    HomeFocus::TopicFilter,
+    HomeFocus::TopicList,
+    HomeFocus::BasicSearch,
+    HomeFocus::BasicWhere,
+    HomeFocus::BasicSince,
+    HomeFocus::BasicUntil,
+    HomeFocus::BasicLimit,
+    HomeFocus::BasicOrderField,
+    HomeFocus::BasicOrderDir,
+    HomeFocus::Results,
+    HomeFocus::Details,
+];
+
+const ADVANCED_FOCUS_ORDER: &[HomeFocus] = &[
+    HomeFocus::TopicFilter,
+    HomeFocus::TopicList,
+    HomeFocus::AdvancedQuery,
+    HomeFocus::Results,
+    HomeFocus::Details,
+];
+
+fn home_focus_order(mode: QueryMode) -> &'static [HomeFocus] {
+    match mode {
+        QueryMode::Basic => BASIC_FOCUS_ORDER,
+        QueryMode::Advanced => ADVANCED_FOCUS_ORDER,
+    }
+}
+
+fn cycle_home_focus(app: &mut AppState, forward: bool) {
+    let order = home_focus_order(app.query_mode);
+    let idx = order.iter().position(|f| *f == app.home_focus).unwrap_or(0);
+    let next = if forward {
+        (idx + 1) % order.len()
+    } else if idx == 0 {
+        order.len() - 1
+    } else {
+        idx - 1
+    };
+    app.home_focus = order[next];
+}
+
+fn home_focus_textarea_mut(
+    app: &mut AppState,
+    focus: HomeFocus,
+) -> Option<&mut TextArea<'static>> {
+    match focus {
+        HomeFocus::TopicFilter => Some(&mut app.topic_picker.filter),
+        HomeFocus::BasicSearch => Some(&mut app.basic_query.search),
+        HomeFocus::BasicWhere => Some(&mut app.basic_query.where_clause),
+        HomeFocus::BasicSince => Some(&mut app.basic_query.since),
+        HomeFocus::BasicUntil => Some(&mut app.basic_query.until),
+        HomeFocus::BasicLimit => Some(&mut app.basic_query.limit),
+        HomeFocus::AdvancedQuery => Some(&mut app.query_editor),
+        _ => None,
+    }
+}
+
+fn refresh_topic_matches(app: &mut AppState) {
+    const MAX_TOPIC_MATCHES: usize = 200;
+    let filter = textarea_text(&app.topic_picker.filter);
+    let filter = filter.trim();
+    let mut matches: Vec<usize> = Vec::new();
+    if app.topics.is_empty() {
+        app.topic_picker.matches.clear();
+        app.topic_picker.selected = 0;
+        return;
+    }
+    if filter.is_empty() {
+        matches.extend(0..app.topics.len());
+        matches.sort_by(|a, b| app.topics[*a].cmp(&app.topics[*b]));
+    } else {
+        let matcher = SkimMatcherV2::default();
+        let mut scored: Vec<(i64, usize)> = Vec::new();
+        for (idx, name) in app.topics.iter().enumerate() {
+            if let Some(score) = matcher.fuzzy_match(name, filter) {
+                scored.push((score, idx));
             }
-        } else if state.selected > 0 {
-            state.selected -= 1;
+        }
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| app.topics[a.1].cmp(&app.topics[b.1]))
+        });
+        matches.extend(scored.into_iter().map(|(_, idx)| idx));
+    }
+    if matches.len() > MAX_TOPIC_MATCHES {
+        matches.truncate(MAX_TOPIC_MATCHES);
+    }
+    app.topic_picker.matches = matches;
+    if app.topic_picker.matches.is_empty() {
+        app.topic_picker.selected = 0;
+    } else {
+        app.topic_picker.selected = app
+            .topic_picker
+            .selected
+            .min(app.topic_picker.matches.len().saturating_sub(1));
+    }
+}
+
+fn selected_topic_name(app: &AppState) -> Option<&str> {
+    let idx = app.topic_picker.matches.get(app.topic_picker.selected)?;
+    app.topics.get(*idx).map(|s| s.as_str())
+}
+
+fn insert_selected_topic_into_query(app: &mut AppState) {
+    let Some(topic) = selected_topic_name(app).map(|s| s.to_string()) else {
+        return;
+    };
+    app.query_editor.insert_str(topic);
+}
+
+fn normalize_where_clause(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("where ") {
+        let offset = trimmed.len().saturating_sub(rest.len());
+        return trimmed[offset..].trim().to_string();
+    }
+    trimmed.to_string()
+}
+
+fn escape_sql_literal(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+fn normalize_timestamp_literal(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        trimmed.to_string()
+    } else {
+        format!("'{}'", escape_sql_literal(trimmed))
+    }
+}
+
+fn build_basic_query_text(app: &AppState) -> Result<String, String> {
+    let Some(topic) = selected_topic_name(app) else {
+        return Err("Select a topic first".to_string());
+    };
+    let search = textarea_text(&app.basic_query.search).trim().to_string();
+    let where_raw = textarea_text(&app.basic_query.where_clause).trim().to_string();
+    let since = textarea_text(&app.basic_query.since).trim().to_string();
+    let until = textarea_text(&app.basic_query.until).trim().to_string();
+    let limit_raw = textarea_text(&app.basic_query.limit).trim().to_string();
+
+    let mut clauses: Vec<String> = Vec::new();
+    if !search.is_empty() {
+        clauses.push(format!(
+            "value CONTAINS '{}'",
+            escape_sql_literal(search.trim())
+        ));
+    }
+    let where_clause = normalize_where_clause(&where_raw);
+    if !where_clause.is_empty() {
+        clauses.push(format!("({})", where_clause));
+    }
+    if !since.is_empty() {
+        clauses.push(format!(
+            "timestamp >= {}",
+            normalize_timestamp_literal(&since)
+        ));
+    }
+    if !until.is_empty() {
+        clauses.push(format!(
+            "timestamp <= {}",
+            normalize_timestamp_literal(&until)
+        ));
+    }
+
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+
+    let order_field = match app.basic_query.order_field_idx {
+        0 => "timestamp",
+        1 => "poffset",
+        _ => "poffset_ts",
+    };
+    let order_dir = if app.basic_query.order_dir_idx == 0 {
+        "ASC"
+    } else {
+        "DESC"
+    };
+
+    let mut query = format!(
+        "SELECT partition, offset, timestamp, key, value FROM {}{} ORDER BY {} {}",
+        topic, where_sql, order_field, order_dir
+    );
+
+    if !limit_raw.is_empty() {
+        let limit = limit_raw
+            .parse::<usize>()
+            .map_err(|_| "LIMIT must be a number".to_string())?;
+        if limit == 0 {
+            return Err("LIMIT must be > 0".to_string());
+        }
+        query.push_str(&format!(" LIMIT {}", limit));
+    }
+
+    query.push(';');
+    Ok(query)
+}
+
+async fn run_basic_query(
+    app: &mut AppState,
+    args: &RunArgs,
+    tx_evt: &mpsc::UnboundedSender<TuiEvent>,
+    run_counter: &mut u64,
+) {
+    match build_basic_query_text(app) {
+        Ok(query) => {
+            dispatch_query(app, args, tx_evt, run_counter, query, false).await;
+        }
+        Err(msg) => {
+            push_status_line(app, msg);
         }
     }
+}
+
+fn toggle_timestamp_display(app: &mut AppState) {
+    app.timestamps_use_utc = !app.timestamps_use_utc;
+    app.timestamp_switch_pressed = true;
+    app.timestamp_switch_deadline = Some(Instant::now() + Duration::from_millis(150));
 }
 
 fn total_results_rows(app: &AppState) -> usize {
@@ -4241,18 +2305,33 @@ fn total_results_rows(app: &AppState) -> usize {
     }
 }
 
-fn freeze_autocomplete_at_cursor(app: &mut AppState) {
-    if let Some((start, end, _)) = detect_from_token(&app.input, app.input_cursor) {
-        if end <= app.input.len() && start <= end {
-            let text = app.input[start..end].to_string();
-            app.autocomplete_frozen_token = Some((start, end, text));
-        }
+fn scroll_help(app: &mut AppState, delta: i32) {
+    let max = help_content_line_count().saturating_sub(1) as i32;
+    let mut next = app.help_vscroll as i32 + delta;
+    if next < 0 {
+        next = 0;
     }
+    if next > max {
+        next = max;
+    }
+    app.help_vscroll = next as u32;
+}
+
+fn jump_help_to_end(app: &mut AppState) {
+    let max = help_content_line_count().saturating_sub(1);
+    app.help_vscroll = max as u32;
 }
 
 fn update_parse_status(app: &mut AppState) {
-    let (qs, qe) = find_query_range(&app.input, app.input_cursor);
-    let raw = &app.input[qs..qe];
+    if matches!(app.query_mode, QueryMode::Basic) {
+        app.parse_ok = true;
+        app.parse_error_msg = None;
+        return;
+    }
+    let text = textarea_text(&app.query_editor);
+    let cursor = textarea_cursor_offset(&app.query_editor);
+    let (qs, qe) = find_query_range(&text, cursor);
+    let raw = text.get(qs..qe).unwrap_or("");
     let trimmed = strip_trailing_semicolon(raw).trim();
     if trimmed.is_empty() {
         app.parse_ok = true;
@@ -4269,4 +2348,274 @@ fn update_parse_status(app: &mut AppState) {
             app.parse_error_msg = Some(format!("{}", e));
         }
     }
+}
+
+fn handle_single_line_edit(target: &mut String, cursor: &mut usize, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char(ch) => {
+            target.insert(*cursor, ch);
+            *cursor += 1;
+            true
+        }
+        KeyCode::Backspace => {
+            if *cursor > 0 {
+                target.remove(*cursor - 1);
+                *cursor -= 1;
+                return true;
+            }
+            false
+        }
+        KeyCode::Delete => {
+            if *cursor < target.len() {
+                target.remove(*cursor);
+                return true;
+            }
+            false
+        }
+        KeyCode::Left => {
+            if *cursor > 0 {
+                *cursor -= 1;
+            }
+            false
+        }
+        KeyCode::Right => {
+            if *cursor < target.len() {
+                *cursor += 1;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn textarea_to_string(ta: &TextArea<'_>) -> Option<String> {
+    let joined = ta.lines().join("\n");
+    if joined.trim().is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+fn save_env_from_editor(app: &mut AppState) {
+    let (idx, name, host, private_key_pem, public_key_pem, ssl_ca_pem) = {
+        let Some(ed) = app.env_editor.as_ref() else {
+            return;
+        };
+        (
+            ed.idx,
+            ed.name.trim().to_string(),
+            ed.host.trim().to_string(),
+            textarea_to_string(&ed.ta_private),
+            textarea_to_string(&ed.ta_public),
+            textarea_to_string(&ed.ta_ca),
+        )
+    };
+
+    if name.is_empty() {
+        push_status_line(app, "Environment name cannot be empty".to_string());
+        return;
+    }
+    if host.is_empty() {
+        push_status_line(app, "Environment host cannot be empty".to_string());
+        return;
+    }
+    if app.env_store.envs.iter().enumerate().any(|(i, e)| {
+        Some(i) != idx && e.name.eq_ignore_ascii_case(&name)
+    }) {
+        push_status_line(
+            app,
+            "Environment name already exists. Choose a unique name.".to_string(),
+        );
+        return;
+    }
+
+    let new_env = Environment {
+        name,
+        host,
+        private_key_pem,
+        public_key_pem,
+        ssl_ca_pem,
+    };
+
+    if let Some(i) = idx {
+        if i < app.env_store.envs.len() {
+            app.env_store.envs[i] = new_env.clone();
+            app.env_store.selected = Some(i);
+        } else {
+            app.env_store.envs.push(new_env.clone());
+            app.env_store.selected = Some(app.env_store.envs.len() - 1);
+        }
+    } else {
+        app.env_store.envs.push(new_env.clone());
+        app.env_store.selected = Some(app.env_store.envs.len() - 1);
+    }
+    match app.env_store.save() {
+        Ok(()) => {
+            app.env_save_pressed = true;
+            app.env_save_deadline = Some(Instant::now() + Duration::from_millis(800));
+            push_status_line(app, "Environments saved".to_string());
+        }
+        Err(e) => {
+            push_status_line(app, format!("Save failed: {}", e));
+        }
+    }
+    if let Some(sel) = app.env_store.selected {
+        if let Some(env) = app.env_store.envs.get(sel) {
+            app.env_editor = Some(build_env_editor_from_env(env, Some(sel)));
+        }
+    }
+}
+
+fn start_env_connection_test(app: &mut AppState, tx_evt: mpsc::UnboundedSender<TuiEvent>) {
+    let env = {
+        let Some(ed) = app.env_editor.as_ref() else {
+            return;
+        };
+        Environment {
+            name: ed.name.clone(),
+            host: ed.host.clone(),
+            private_key_pem: textarea_to_string(&ed.ta_private),
+            public_key_pem: textarea_to_string(&ed.ta_public),
+            ssl_ca_pem: textarea_to_string(&ed.ta_ca),
+        }
+    };
+    app.env_test_log.clear();
+    app.env_conn_vscroll = 0;
+    app.env_test_in_progress = true;
+    tokio::spawn(async move {
+        let _ = tx_evt.send(TuiEvent::EnvTestProgress {
+            message: "Testing connection...".to_string(),
+        });
+        let result = tokio::task::spawn_blocking(move || test_env_connection(env)).await;
+        match result {
+            Ok(Ok(())) => {
+                let _ = tx_evt.send(TuiEvent::EnvTestDone {
+                    message: "Connection OK".to_string(),
+                });
+            }
+            Ok(Err(e)) => {
+                let _ = tx_evt.send(TuiEvent::EnvTestDone {
+                    message: format!("Connection error: {}", e),
+                });
+            }
+            Err(e) => {
+                let _ = tx_evt.send(TuiEvent::EnvTestDone {
+                    message: format!("Connection error: {}", e),
+                });
+            }
+        }
+    });
+}
+
+fn test_env_connection(env: Environment) -> Result<()> {
+    let ssl = if env.private_key_pem.is_some()
+        || env.public_key_pem.is_some()
+        || env.ssl_ca_pem.is_some()
+    {
+        Some(crate::models::SslConfig {
+            ca_pem: env.ssl_ca_pem.clone(),
+            cert_pem: env.public_key_pem.clone(),
+            key_pem: env.private_key_pem.clone(),
+        })
+    } else {
+        None
+    };
+    let cfg = build_client_config(&env.host, ssl);
+    let consumer: StreamConsumer = cfg.create().context("create consumer")?;
+    let _ = consumer
+        .fetch_metadata(None, Duration::from_secs(10))
+        .context("fetch metadata")?;
+    Ok(())
+}
+
+fn build_client_config(broker: &str, ssl: Option<crate::models::SslConfig>) -> ClientConfig {
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", broker)
+        .set("group.id", format!("rkl-meta-{}", uuid::Uuid::new_v4()))
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "latest")
+        .set("enable.partition.eof", "true");
+    cfg.set_log_level(RDKafkaLogLevel::Emerg);
+    if let Some(ssl) = ssl {
+        if ssl.ca_pem.is_some() || ssl.cert_pem.is_some() || ssl.key_pem.is_some() {
+            cfg.set("security.protocol", "ssl");
+            if let Some(ref s) = ssl.ca_pem {
+                cfg.set("ssl.ca.pem", s);
+            }
+            if let Some(ref s) = ssl.cert_pem {
+                cfg.set("ssl.certificate.pem", s);
+            }
+            if let Some(ref s) = ssl.key_pem {
+                cfg.set("ssl.key.pem", s);
+            }
+        }
+    }
+    cfg
+}
+
+fn fetch_topics_async(app: &AppState, tx: mpsc::UnboundedSender<TuiEvent>) {
+    let broker = app
+        .selected_env()
+        .map(|e| e.host.clone())
+        .unwrap_or_else(|| app.host.clone());
+    let ssl = app.current_ssl_config();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let cfg = build_client_config(&broker, ssl);
+            let consumer: StreamConsumer = cfg.create().context("create consumer")?;
+            let md = consumer
+                .fetch_metadata(None, Duration::from_secs(10))
+                .context("fetch metadata")?;
+            let mut topics: Vec<String> = md.topics().iter().map(|t| t.name().to_string()).collect();
+            topics.sort();
+            Ok::<_, anyhow::Error>(topics)
+        })
+        .await;
+        if let Ok(Ok(list)) = result {
+            let _ = tx.send(TuiEvent::Topics(list));
+        }
+    });
+}
+
+fn fetch_topics_with_partitions_async(app: &AppState, tx: mpsc::UnboundedSender<TuiEvent>) {
+    let broker = app
+        .selected_env()
+        .map(|e| e.host.clone())
+        .unwrap_or_else(|| app.host.clone());
+    let ssl = app.current_ssl_config();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let cfg = build_client_config(&broker, ssl);
+            let consumer: StreamConsumer = cfg.create().context("create consumer")?;
+            let md = consumer
+                .fetch_metadata(None, Duration::from_secs(10))
+                .context("fetch metadata")?;
+            let mut entries: Vec<(String, usize)> = md
+                .topics()
+                .iter()
+                .map(|t| (t.name().to_string(), t.partitions().len()))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok::<_, anyhow::Error>(entries)
+        })
+        .await;
+        match result {
+            Ok(Ok(list)) => {
+                let _ = tx.send(TuiEvent::TopicsWithPartitions(list));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(TuiEvent::TopicsWithPartitions(vec![(
+                    format!("Error: {}", e),
+                    0,
+                )]));
+            }
+            Err(e) => {
+                let _ = tx.send(TuiEvent::TopicsWithPartitions(vec![(
+                    format!("Error: {}", e),
+                    0,
+                )]));
+            }
+        }
+    });
 }

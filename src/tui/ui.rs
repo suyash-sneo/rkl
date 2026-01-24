@@ -8,1590 +8,1146 @@ use ratatui::widgets::{
     Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
+use tui_textarea::TextArea;
 
 use super::app::{
-    AppConfigFieldFocus, AppState, EnvFieldFocus, Focus, ResultsMode, SPINNER_FRAMES, Screen,
+    AppConfigFieldFocus, AppState, EnvEditor, EnvFieldFocus, EnvPemField, HomeFocus, QueryMode,
+    ResultsMode, Screen, COMMAND_SPECS, SPINNER_FRAMES,
 };
-use super::query_bounds::{find_query_range, strip_trailing_semicolon};
 use super::timefmt::fmt_ts;
 
-pub(super) const COPY_BTN_LABEL: &str = "[ Copy ]";
-const MAIN_MENU_ITEMS: &[(Screen, &str)] = &[
-    (Screen::Home, "Query"),
-    (Screen::Envs, "Envs"),
-    (Screen::AppConfig, "App Config"),
-    (Screen::About, "About"),
+const PANEL: Color = Color::Rgb(24, 27, 35);
+const RAISED: Color = Color::Rgb(32, 36, 46);
+const ACCENT: Color = Color::Rgb(120, 190, 255);
+const ACCENT_FADED: Color = Color::Rgb(90, 130, 180);
+const POSITIVE: Color = Color::Rgb(140, 220, 140);
+const NEGATIVE: Color = Color::Rgb(250, 130, 140);
+
+static HELP_LINES: &[&str] = &[
+    "Home",
+    "  • Ctrl-Enter run query (Shift+Ctrl-Enter rerun last)",
+    "  • Tab / Shift-Tab move focus between filter, query, results, detail",
+    "  • Ctrl-R opens history, Ctrl-Shift-R reruns last query",
+    "  • Ctrl-P or ':' opens command palette, '?' opens help",
+    "  • Ctrl-Y drops selected topic into advanced editor",
+    "  • F2 Envs, F3 App config, F12 Topics, Esc resets focus to filter",
+    "",
+    "Basic mode",
+    "  • Type to fuzzy-search topics; Enter jumps to fields",
+    "  • Filters: search value contains, WHERE, time bounds, LIMIT, ORDER",
+    "",
+    "Advanced mode",
+    "  • Full SQL editor with multi-line editing; query under cursor runs",
+    "  • Double slash '//' at line start opens command palette",
+    "",
+    "Results",
+    "  • Arrows move selection, Enter opens record detail view",
+    "  • Shift-Left/Right scroll columns; timestamp toggle top-right",
+    "",
+    "Environments",
+    "  • F4 save, F5 test, F6/F7 cycle envs, Ctrl-Left/Right switches PEM tab",
+    "",
+    "General",
+    "  • Copy/paste works in text areas; status log scrolls with mouse/keys",
 ];
 
-pub fn draw_main_menu(frame: &mut Frame, area: Rect, app: &AppState) {
-    let block = Block::default().borders(Borders::ALL).title("RKL");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+pub fn draw(frame: &mut Frame, app: &AppState) {
+    match app.screen {
+        Screen::Home => draw_home(frame, frame.area(), app),
+        Screen::Envs => draw_envs(frame, frame.area(), app),
+        Screen::Info => draw_info(frame, frame.area(), app),
+        Screen::AppConfig => draw_app_config(frame, frame.area(), app),
+        Screen::Help => draw_help(frame, frame.area(), app),
+        Screen::RecordDetail => draw_record_detail(frame, frame.area(), app),
+    }
 
-    let mut x = inner.x.saturating_add(1);
-    let y = inner.y;
-    for (screen, label) in MAIN_MENU_ITEMS.iter() {
-        let text = format!(" {} ", label);
-        let width = text.chars().count() as u16;
-        if x + width > inner.x + inner.width {
-            break;
+    if app.command_palette.open {
+        draw_command_palette(frame, frame.area(), app);
+    }
+    if app.show_history_popup {
+        draw_history_popup(frame, frame.area(), app);
+    }
+}
+
+fn draw_home(frame: &mut Frame, area: Rect, app: &AppState) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(14),
+            Constraint::Length(6),
+        ])
+        .split(area);
+
+    draw_header(frame, layout[0], app);
+
+    let workspace = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .split(layout[1]);
+
+    draw_controls(frame, workspace[0], app);
+    draw_results(frame, workspace[1], app);
+    draw_status_log(frame, layout[2], app);
+}
+
+fn draw_header(frame: &mut Frame, area: Rect, app: &AppState) {
+    let env_name = app
+        .selected_env()
+        .map(|e| e.name.as_str())
+        .unwrap_or("Default");
+    let host = app
+        .selected_env()
+        .map(|e| e.host.as_str())
+        .unwrap_or(app.host.as_str());
+    let mode = match app.query_mode {
+        QueryMode::Basic => "Basic lookup",
+        QueryMode::Advanced => "Advanced SQL",
+    };
+    let focus = match app.home_focus {
+        HomeFocus::TopicFilter => "Topic filter",
+        HomeFocus::TopicList => "Topic list",
+        HomeFocus::BasicSearch => "Search contains",
+        HomeFocus::BasicWhere => "WHERE",
+        HomeFocus::BasicSince => "Since",
+        HomeFocus::BasicUntil => "Until",
+        HomeFocus::BasicLimit => "Limit",
+        HomeFocus::BasicOrderField => "Order field",
+        HomeFocus::BasicOrderDir => "Order dir",
+        HomeFocus::AdvancedQuery => "Editor",
+        HomeFocus::Results => "Results",
+        HomeFocus::Details => "Detail",
+    };
+    let spinner = if app.query_in_progress {
+        format!(
+            "{} running… {}",
+            SPINNER_FRAMES[app.query_spinner_idx % SPINNER_FRAMES.len()],
+            app.query_rows_seen
+        )
+    } else if let Some(last) = app.last_executed_query.as_ref() {
+        format!("Last: {}", truncate_with_ellipsis(last, 40))
+    } else {
+        "Idle".to_string()
+    };
+
+    let content = Line::from(vec![
+        Span::styled("Env ", Style::default().fg(ACCENT_FADED)),
+        Span::styled(env_name, Style::default().fg(ACCENT)),
+        Span::raw("  "),
+        Span::styled("Host ", Style::default().fg(ACCENT_FADED)),
+        Span::styled(host, Style::default().fg(Color::White)),
+        Span::raw("  "),
+        Span::styled("Mode ", Style::default().fg(ACCENT_FADED)),
+        Span::styled(mode, Style::default().fg(Color::White)),
+        Span::raw("  "),
+        Span::styled("Focus ", Style::default().fg(ACCENT_FADED)),
+        Span::styled(focus, Style::default().fg(Color::White)),
+        Span::raw("    "),
+        Span::styled(spinner, Style::default().fg(Color::Gray)),
+        Span::raw("    "),
+        Span::styled("Ctrl-P palette • ? help • Ctrl-Enter run", Style::default().fg(Color::Gray)),
+    ]);
+
+    let block = Block::default()
+        .borders(Borders::NONE)
+        .style(Style::default().bg(RAISED));
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(content)
+            .alignment(Alignment::Left)
+            .style(Style::default().bg(RAISED)),
+        area,
+    );
+}
+
+fn draw_controls(frame: &mut Frame, area: Rect, app: &AppState) {
+    let inner = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .split(inset(area, 1));
+
+    draw_topic_panel(frame, inner[0], app);
+    match app.query_mode {
+        QueryMode::Basic => draw_basic_query(frame, inner[1], app),
+        QueryMode::Advanced => draw_advanced_query(frame, inner[1], app),
+    }
+}
+
+fn draw_topic_panel(frame: &mut Frame, area: Rect, app: &AppState) {
+    let block = Block::default()
+        .borders(Borders::NONE)
+        .title("Topics")
+        .title_alignment(Alignment::Left)
+        .style(Style::default().bg(PANEL));
+    frame.render_widget(block, area);
+    let inner = inset(area, 1);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(4)])
+        .split(inner);
+
+    render_textarea(
+        frame,
+        layout[0],
+        &app.topic_picker.filter,
+        "Filter topics (fuzzy)",
+        matches!(app.home_focus, HomeFocus::TopicFilter),
+    );
+
+    let mut items: Vec<ListItem> = Vec::new();
+    for idx in app.topic_picker.matches.iter().copied() {
+        if let Some(name) = app.topics.get(idx) {
+            items.push(ListItem::new(name.clone()));
         }
-        let rect = Rect {
-            x,
-            y,
-            width,
-            height: 1,
+    }
+    if items.is_empty() {
+        items.push(ListItem::new("No topics. Press F12 to refresh."));
+    }
+    let mut state = ListState::default();
+    state.select(Some(
+        app.topic_picker
+            .selected
+            .min(app.topic_picker.matches.len().saturating_sub(1)),
+    ));
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .bg(ACCENT)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(PANEL))
+        .block(
+            Block::default()
+                .borders(Borders::NONE)
+                .title("Matches")
+                .title_style(Style::default().fg(ACCENT_FADED))
+                .style(Style::default().bg(PANEL)),
+        );
+    frame.render_stateful_widget(list, layout[1], &mut state);
+}
+
+fn draw_basic_query(frame: &mut Frame, area: Rect, app: &AppState) {
+    let block = Block::default()
+        .borders(Borders::NONE)
+        .title("Lookup builder")
+        .title_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(PANEL));
+    frame.render_widget(block, area);
+    let inner = inset(area, 1);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    let topic = selected_topic_label(app);
+    frame.render_widget(
+        Paragraph::new(topic)
+            .style(Style::default().fg(Color::Gray))
+            .alignment(Alignment::Left),
+        layout[0],
+    );
+
+    render_textarea(
+        frame,
+        layout[1],
+        &app.basic_query.search,
+        "Value contains",
+        matches!(app.home_focus, HomeFocus::BasicSearch),
+    );
+    render_textarea(
+        frame,
+        layout[2],
+        &app.basic_query.where_clause,
+        "WHERE (optional)",
+        matches!(app.home_focus, HomeFocus::BasicWhere),
+    );
+
+    let time_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(layout[3]);
+    render_textarea(
+        frame,
+        time_row[0],
+        &app.basic_query.since,
+        "Since (ts or date)",
+        matches!(app.home_focus, HomeFocus::BasicSince),
+    );
+    render_textarea(
+        frame,
+        time_row[1],
+        &app.basic_query.until,
+        "Until (ts or date)",
+        matches!(app.home_focus, HomeFocus::BasicUntil),
+    );
+
+    let limit_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(layout[4]);
+    render_textarea(
+        frame,
+        limit_row[0],
+        &app.basic_query.limit,
+        "Limit (empty = auto)",
+        matches!(app.home_focus, HomeFocus::BasicLimit),
+    );
+    draw_order_pills(
+        frame,
+        limit_row[1],
+        app.basic_query.order_field_idx,
+        app.basic_query.order_dir_idx,
+        app,
+    );
+
+    let tips = "Ctrl-Enter to run • Tab to move • Ctrl-/ to open palette";
+    frame.render_widget(
+        Paragraph::new(tips)
+            .style(Style::default().fg(Color::Gray))
+            .alignment(Alignment::Left),
+        layout[6],
+    );
+}
+
+fn draw_order_pills(
+    frame: &mut Frame,
+    area: Rect,
+    field_idx: usize,
+    dir_idx: usize,
+    app: &AppState,
+) {
+    let focused_field = matches!(app.home_focus, HomeFocus::BasicOrderField);
+    let focused_dir = matches!(app.home_focus, HomeFocus::BasicOrderDir);
+    let row = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(2)])
+        .split(area);
+
+    let mut spans = Vec::new();
+    spans.push(Span::styled("Order by ", Style::default().fg(Color::Gray)));
+    for (i, label) in ["timestamp", "poffset", "poffset_ts"].iter().enumerate() {
+        let active = i == field_idx;
+        spans.push(Span::raw(" "));
+        spans.push(pill(label, active, focused_field));
+    }
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled("Dir ", Style::default().fg(Color::Gray)));
+    for (i, label) in ["ASC", "DESC"].iter().enumerate() {
+        let active = i == dir_idx;
+        spans.push(Span::raw(" "));
+        spans.push(pill(label, active, focused_dir));
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
+        row[1],
+    );
+}
+
+fn draw_advanced_query(frame: &mut Frame, area: Rect, app: &AppState) {
+    let block = Block::default()
+        .borders(Borders::NONE)
+        .title("Advanced SQL")
+        .title_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(PANEL));
+    frame.render_widget(block, area);
+    let inner = inset(area, 1);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(2)])
+        .split(inner);
+
+    render_textarea(
+        frame,
+        layout[0],
+        &app.query_editor,
+        "SELECT ... FROM ... WHERE ...",
+        matches!(app.home_focus, HomeFocus::AdvancedQuery),
+    );
+
+    let parse_status = if app.parse_ok {
+        Span::styled("Parse: OK", Style::default().fg(POSITIVE))
+    } else if let Some(msg) = app.parse_error_msg.as_ref() {
+        Span::styled(
+            format!("Parse error: {}", truncate_with_ellipsis(msg, 80)),
+            Style::default().fg(NEGATIVE),
+        )
+    } else {
+        Span::raw("")
+    };
+    let hint = Line::from(vec![
+        parse_status,
+        Span::raw("    "),
+        Span::styled("Ctrl-Enter runs query under cursor", Style::default().fg(Color::Gray)),
+    ]);
+    frame.render_widget(Paragraph::new(hint), layout[1]);
+}
+
+fn render_textarea(frame: &mut Frame, area: Rect, ta: &TextArea<'_>, label: &str, focused: bool) {
+    let block = Block::default()
+        .borders(Borders::NONE)
+        .title(label)
+        .title_style(Style::default().fg(ACCENT_FADED))
+        .style(Style::default().bg(if focused { RAISED } else { PANEL }));
+    let mut widget = ta.clone();
+    widget.set_block(block.clone());
+    frame.render_widget(&widget, area);
+
+    if focused {
+        let inner = block.inner(area);
+        let (row, col) = ta.cursor();
+        let x = inner.x + col as u16;
+        let y = inner.y + row as u16;
+        frame.set_cursor_position(Position::new(x, y));
+    }
+}
+
+fn draw_results(frame: &mut Frame, area: Rect, app: &AppState) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .split(area);
+    draw_results_header(frame, layout[0], app);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(layout[1]);
+    draw_results_table(frame, body[0], app);
+    draw_detail_preview(frame, body[1], app);
+}
+
+fn draw_results_header(frame: &mut Frame, area: Rect, app: &AppState) {
+    let mut spans = Vec::new();
+    spans.push(Span::styled(
+        match app.results_mode {
+            ResultsMode::Messages => "Results",
+            ResultsMode::TopicList => "Topics",
+        },
+        Style::default().fg(ACCENT),
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!("{} rows", app.rows.len()),
+        Style::default().fg(Color::Gray),
+    ));
+    if app.query_in_progress {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!(
+                "{} streaming",
+                SPINNER_FRAMES[app.query_spinner_idx % SPINNER_FRAMES.len()]
+            ),
+            Style::default().fg(ACCENT),
+        ));
+    }
+    if app.should_show_timestamp_switch() {
+        spans.push(Span::raw("    "));
+        spans.push(Span::styled(
+            app.timestamp_toggle_label(),
+            Style::default()
+                .fg(if app.timestamps_use_utc { Color::White } else { Color::LightCyan })
+                .bg(RAISED),
+        ));
+    }
+    let line = Line::from(spans);
+    frame.render_widget(
+        Paragraph::new(line)
+            .style(Style::default().bg(PANEL))
+            .alignment(Alignment::Left),
+        area,
+    );
+}
+
+fn draw_results_table(frame: &mut Frame, area: Rect, app: &AppState) {
+    match app.results_mode {
+        ResultsMode::Messages => draw_message_table(frame, area, app),
+        ResultsMode::TopicList => draw_topic_table(frame, area, app),
+    }
+}
+
+fn draw_topic_table(frame: &mut Frame, area: Rect, app: &AppState) {
+    let rows: Vec<Row> = app
+        .topics_with_partitions
+        .iter()
+        .map(|(name, partitions)| {
+            Row::new(vec![
+                Cell::from(name.clone()),
+                Cell::from(format!("{} partitions", partitions)),
+            ])
+        })
+        .collect();
+    let mut state = TableState::default();
+    state.select(Some(
+        app.selected_row
+            .min(app.topics_with_partitions.len().saturating_sub(1)),
+    ));
+
+    let table = Table::new(rows, [Constraint::Percentage(70), Constraint::Percentage(30)])
+        .column_spacing(2)
+        .row_highlight_style(
+            Style::default()
+                .bg(ACCENT)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(PANEL));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn draw_message_table(frame: &mut Frame, area: Rect, app: &AppState) {
+    if app.selected_columns.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No columns selected").style(Style::default().bg(PANEL)),
+            area,
+        );
+        return;
+    }
+    let headers: Vec<Cell> = app
+        .selected_columns
+        .iter()
+        .map(|col| Cell::from(column_label(col)))
+        .collect();
+    let rows: Vec<Row> = app
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, env)| build_row(i, env, app))
+        .collect();
+    let constraints: Vec<Constraint> = app
+        .selected_columns
+        .iter()
+        .map(|c| column_constraint(c))
+        .collect();
+    let mut state = TableState::default();
+    state.select(Some(app.selected_row.min(app.rows.len().saturating_sub(1))));
+
+    let table = Table::new(rows, constraints)
+        .header(
+            Row::new(headers)
+                .style(Style::default().fg(Color::Gray))
+                .height(1),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(ACCENT)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .column_spacing(1)
+        .style(Style::default().bg(PANEL));
+
+    frame.render_stateful_widget(table, area, &mut state);
+
+    if app.rows.len() > area.height as usize {
+        let mut vs = ScrollbarState::new(app.rows.len())
+            .position(app.selected_row.min(app.rows.len().saturating_sub(1)));
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(bar, area, &mut vs);
+    }
+}
+
+fn build_row(idx: usize, env: &MessageEnvelope, app: &AppState) -> Row<'static> {
+    let mut cells = Vec::new();
+    for (col_idx, col) in app.selected_columns.iter().enumerate() {
+        let text = match col {
+            SelectItem::Value => {
+                let raw = env.value.as_deref().unwrap_or("null");
+                let preview = json_preview(raw);
+                apply_hscroll(&preview, app.table_hscroll)
+            }
+            _ => column_text(env, *col, app),
         };
-        let is_current = app.screen == *screen;
-        let is_pressed = app.menu_pressed_screen == Some(*screen);
-        let style = if is_pressed {
+        let style = if app.selected_row == idx && app.selected_col == col_idx {
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Yellow)
+                .bg(ACCENT)
                 .add_modifier(Modifier::BOLD)
-        } else if is_current {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
             Style::default().fg(Color::White)
         };
-        let para = Paragraph::new(text).style(style);
-        frame.render_widget(para, rect);
-        x = x.saturating_add(width + 1);
+        cells.push(Cell::from(Span::styled(text, style)));
     }
+    Row::new(cells).height(1)
 }
 
-pub fn main_menu_hit_test(area: Rect, mx: u16, my: u16) -> Option<Screen> {
-    let inner = Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
-    if my != inner.y {
-        return None;
-    }
-    let mut x = inner.x.saturating_add(1);
-    for (screen, label) in MAIN_MENU_ITEMS.iter() {
-        let text = format!(" {} ", label);
-        let width = text.chars().count() as u16;
-        if x + width > inner.x + inner.width {
-            break;
-        }
-        let rect = Rect {
-            x,
-            y: inner.y,
-            width,
-            height: 1,
-        };
-        if mx >= rect.x && mx < rect.x + rect.width {
-            return Some(*screen);
-        }
-        x = x.saturating_add(width + 1);
-    }
-    None
-}
-
-pub fn draw(frame: &mut Frame, app: &AppState) {
-    let size = frame.area();
-    match app.screen {
-        Screen::Home => {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),  // menu
-                    Constraint::Length(3),  // env bar
-                    Constraint::Length(10), // editor + status
-                    Constraint::Fill(1),    // results
-                    Constraint::Length(3),  // footer
-                ])
-                .split(size);
-
-            draw_main_menu(frame, chunks[0], app);
-            draw_env_bar(frame, chunks[1], app);
-            let cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                .split(chunks[2]);
-            draw_input(frame, cols[0], app);
-            draw_status_panel(frame, cols[1], app);
-            draw_results(frame, chunks[3], app);
-            draw_footer(frame, chunks[4], app);
-        }
-        Screen::Envs => {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3), // menu
-                    Constraint::Fill(1),   // body
-                    Constraint::Length(3), // footer
-                ])
-                .split(size);
-            draw_main_menu(frame, chunks[0], app);
-            draw_env_modal(frame, chunks[1], app);
-            draw_footer(frame, chunks[2], app);
-        }
-        Screen::Info => {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3), // menu
-                    Constraint::Length(3), // env bar
-                    Constraint::Fill(1),   // body
-                    Constraint::Length(3), // footer
-                ])
-                .split(size);
-            draw_main_menu(frame, chunks[0], app);
-            draw_env_bar(frame, chunks[1], app);
-            draw_topics(frame, chunks[2], app);
-            draw_footer(frame, chunks[3], app);
-        }
-        Screen::AppConfig => {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3), // menu
-                    Constraint::Fill(1),   // body
-                    Constraint::Length(3), // footer
-                ])
-                .split(size);
-            draw_main_menu(frame, chunks[0], app);
-            draw_app_config_screen(frame, chunks[1], app);
-            draw_footer(frame, chunks[2], app);
-        }
-        Screen::About => {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3), // menu
-                    Constraint::Fill(1),   // body
-                    Constraint::Length(3), // footer
-                ])
-                .split(size);
-            draw_main_menu(frame, chunks[0], app);
-            draw_about_screen(frame, chunks[1], app);
-            draw_footer(frame, chunks[2], app);
-        }
-    }
-
-    if app.show_history_popup {
-        draw_history_popup(frame, size, app);
-    }
-}
-
-fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
-    let focused = app.focus == Focus::Query;
-    let title = "Query (Ctrl-Enter runs current SELECT; ';' ends)";
-    let border_style = if focused {
-        Style::default().fg(Color::LightCyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+fn draw_detail_preview(frame: &mut Frame, area: Rect, app: &AppState) {
+    let focused = matches!(app.home_focus, HomeFocus::Details);
+    let (title, body) = selected_detail(app);
     let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(border_style);
-    let inner = block.inner(area);
+        .borders(Borders::NONE)
+        .title(format!("Detail — {}", title))
+        .title_style(Style::default().fg(ACCENT_FADED))
+        .style(Style::default().bg(if focused { RAISED } else { PANEL }));
     frame.render_widget(block, area);
+    let inner = inset(area, 1);
 
-    // Split inner into gutter and content. Gutter width is dynamic to always
-    // preserve a visible gap between line numbers and content, even when
-    // markers like the last-run pointer are shown.
-    let text = &app.input;
-    let lines: Vec<&str> = text.split('\n').collect();
-    let max_lineno_digits = lines.len().max(1).to_string().len() as u16;
-    let marker_max = 2u16; // e.g., "➤▶" can take two cells
-    let gap = 1u16; // fixed one-space gap to content
-    let gutter_width: u16 = (marker_max + 1 + max_lineno_digits + gap).max(6);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(gutter_width), Constraint::Min(1)])
-        .split(inner);
-    let gutter = cols[0];
-    let content = cols[1];
-
-    // Compute line starts to style per-line highlights, and find query ranges
-    let line_starts: Vec<usize> = {
-        let mut v = Vec::with_capacity(lines.len());
-        let mut acc = 0usize;
-        for (i, l) in lines.iter().enumerate() {
-            v.push(acc);
-            acc += l.len();
-            if i + 1 < lines.len() {
-                acc += 1;
-            } // newline
-        }
-        v
-    };
-    let (cur_q_start, cur_q_end) = find_query_range(text, app.input_cursor);
-    let last_range = app.last_run_query_range;
-
-    // Build content lines with SQL-ish highlighting and per-line background for current/last-run query regions
-    let mut out_lines: Vec<Line> = Vec::with_capacity(lines.len());
-    for (i, &lstart) in line_starts.iter().enumerate() {
-        let lend = lstart + lines[i].len();
-        let mut line = Line::from(highlight_sql_line(lines[i]));
-        if intersects(lstart, lend, cur_q_start, cur_q_end) {
-            // Current query highlight
-            line = line.style(Style::default().bg(Color::Rgb(35, 60, 100)));
-        } else if let Some((ls, le)) = last_range {
-            if intersects(lstart, lend, ls, le) {
-                // Last run query highlight
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-        }
-        out_lines.push(line);
-    }
-
-    // Render content paragraph with wrapping + vertical scroll
-    let para = Paragraph::new(Text::from(out_lines))
+    let text = body
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| Text::from("No selection"));
+    let para = Paragraph::new(text)
         .wrap(Wrap { trim: false })
-        .scroll((app.input_vscroll, 0));
-    frame.render_widget(para, content);
-
-    // Render gutter: line numbers and markers for current and last-run query
-    let mut gut: Vec<Line> = Vec::with_capacity(lines.len());
-    let _cur_first_line = byte_index_to_line(&line_starts, cur_q_start);
-    let last_first_line = last_range.map(|(s, _)| byte_index_to_line(&line_starts, s));
-    for (i, &lstart) in line_starts.iter().enumerate() {
-        let lend = lstart + lines[i].len();
-        let is_cur = intersects(lstart, lend, cur_q_start, cur_q_end);
-        let is_last = last_range
-            .map(|(ls, le)| intersects(lstart, lend, ls, le))
-            .unwrap_or(false);
-        let marker = if is_cur && Some(i) == last_first_line {
-            "➤▶"
-        } else if is_cur {
-            "➤"
-        } else if Some(i) == last_first_line || is_last {
-            "▶"
-        } else {
-            " "
-        };
-        // Align line numbers based on max digits to keep layout stable
-        let no = format!("{:>width$}", i + 1, width = max_lineno_digits as usize);
-        // Add an extra trailing space after the line number to separate gutter from content
-        let mut line = Line::from(vec![
-            Span::styled(marker, Style::default().fg(Color::Yellow)),
-            Span::raw(" "),
-            Span::styled(no, Style::default().fg(Color::Gray)),
-            Span::raw(" "),
-        ]);
-        if is_cur {
-            line = line.style(Style::default().bg(Color::Rgb(35, 60, 100)));
-        } else if is_last {
-            line = line.style(Style::default().bg(Color::DarkGray));
-        }
-        gut.push(line);
-    }
-    let gp = Paragraph::new(Text::from(gut)).scroll((app.input_vscroll, 0));
-    frame.render_widget(gp, gutter);
-
-    // Position caret
-    if focused {
-        if let Some((cx, cy)) =
-            caret_pos_multiline(content, text, app.input_cursor, app.input_vscroll)
-        {
-            frame.set_cursor_position(Position::new(cx, cy));
-        }
-    }
-
-    if let Some(ac) = app.autocomplete.as_ref() {
-        if ac.active && content.width > 0 && content.height > 2 {
-            let max_visible = 6usize;
-            let base_width = content.width.min(80);
-            let available_height = content.height.saturating_sub(2);
-            if base_width > 0 && available_height > 0 {
-                let slots = max_visible.min(available_height as usize).max(1);
-                let popup_width = base_width.max(10).min(content.width);
-                let total = ac.suggestions.len();
-                let window_len = slots.min(total.max(1));
-                let (mut items, selection): (Vec<ListItem>, Option<usize>) = if total == 0 {
-                    (
-                        vec![ListItem::new(if app.topics.is_empty() {
-                            "Loading topics..."
-                        } else {
-                            "No matches"
-                        })],
-                        None,
-                    )
-                } else {
-                    let start = if total <= window_len {
-                        0
-                    } else {
-                        ac.selected
-                            .saturating_sub(window_len.saturating_sub(1))
-                            .min(total - window_len)
-                    };
-                    let end = (start + window_len).min(total);
-                    let sel = Some(ac.selected.saturating_sub(start));
-                    (
-                        ac.suggestions[start..end]
-                            .iter()
-                            .map(|s| ListItem::new(s.clone()))
-                            .collect(),
-                        sel,
-                    )
-                };
-                while items.len() < slots {
-                    items.push(ListItem::new(""));
-                }
-                let popup_height = slots as u16 + 2;
-                let mut popup = Rect {
-                    x: content.x.saturating_add(1),
-                    y: content.y.saturating_add(1),
-                    width: popup_width,
-                    height: popup_height.min(content.height),
-                };
-                let content_bottom = content.y.saturating_add(content.height);
-                if popup.y + popup.height > content_bottom {
-                    let overflow = popup.y + popup.height - content_bottom;
-                    popup.y = popup.y.saturating_sub(overflow);
-                }
-                frame.render_widget(Clear, popup);
-                let title = if ac.filter.is_empty() {
-                    "Topic Suggestions".to_string()
-                } else {
-                    format!("Topic Suggestions [{}]", ac.filter)
-                };
-                let list = List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title(title))
-                    .highlight_style(
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-                    );
-                let mut state = ListState::default();
-                state.select(selection);
-                frame.render_stateful_widget(list, popup, &mut state);
-
-                if total > slots && popup.height > 2 {
-                    let mut vs = ScrollbarState::new(total)
-                        .position(ac.selected.min(total.saturating_sub(1)));
-                    let bar_height = popup.height.saturating_sub(2);
-                    if bar_height > 0 {
-                        let bar_area = Rect {
-                            x: popup.x + popup.width - 1,
-                            y: popup.y + 1,
-                            width: 1,
-                            height: bar_height,
-                        };
-                        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-                        frame.render_stateful_widget(bar, bar_area, &mut vs);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn draw_env_bar(frame: &mut Frame, area: Rect, app: &AppState) {
-    let title = "Environment (F2 to manage)";
-    let border_style = if app.focus == Focus::Host {
-        Style::default().fg(Color::LightCyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(border_style);
-    let name = app
-        .selected_env()
-        .map(|e| e.name.clone())
-        .unwrap_or_else(|| "(none)".to_string());
-    let host = app
-        .selected_env()
-        .map(|e| e.host.clone())
-        .unwrap_or_default();
-    let content = format!("{name}  —  host: {host}");
-    let para = Paragraph::new(content).block(block);
-    frame.render_widget(para, area);
-}
-
-fn draw_status_panel(frame: &mut Frame, area: Rect, app: &AppState) {
-    let block = Block::default().borders(Borders::ALL).title("Status");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let mut log_lines: Vec<Line> = Vec::new();
-    if !app.status.is_empty() {
-        log_lines.push(Line::from(app.status.clone()));
-    }
-    if !app.status_buffer.is_empty() {
-        if !log_lines.is_empty() {
-            log_lines.push(Line::from(""));
-        }
-        log_lines.extend(app.status_buffer.lines().map(|l| Line::from(l.to_string())));
-    }
-    if log_lines.is_empty() {
-        log_lines.push(Line::from(""));
-    }
-
-    let mut lines: Vec<Line> = Vec::new();
-    if app.query_in_progress {
-        let limit = app
-            .query_limit
-            .unwrap_or_else(|| app.query_rows_seen.max(1))
-            .max(1);
-        let current = app.query_rows_seen.min(limit);
-        let fraction = current as f64 / limit as f64;
-        let available = inner.width.saturating_sub(20) as usize;
-        let bar_width = available.clamp(10, 30);
-        let filled = ((fraction * bar_width as f64).round() as usize).min(bar_width);
-        let empty = bar_width.saturating_sub(filled);
-        let filled_txt = "█".repeat(filled);
-        let empty_txt = "░".repeat(empty);
-        let spinner = SPINNER_FRAMES[app.query_spinner_idx % SPINNER_FRAMES.len()];
-        let elapsed = app
-            .query_started_at
-            .map(|start| start.elapsed().as_secs_f32())
-            .unwrap_or(0.0);
-        let mut spans = Vec::new();
-        spans.push(Span::styled(
-            spinner,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" Query "));
-        spans.push(Span::styled(
-            format!("{}/{}", current, limit),
-            Style::default().fg(Color::Green),
-        ));
-        spans.push(Span::raw(" "));
-        spans.push(Span::raw("["));
-        if !filled_txt.is_empty() {
-            spans.push(Span::styled(
-                filled_txt,
-                Style::default().fg(Color::LightGreen),
-            ));
-        }
-        if !empty_txt.is_empty() {
-            spans.push(Span::styled(
-                empty_txt,
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        spans.push(Span::raw("] "));
-        spans.push(Span::styled(
-            format!("{:.1}s", elapsed),
-            Style::default().fg(Color::Gray),
-        ));
-        lines.push(Line::from(spans));
-        if !log_lines.is_empty() {
-            lines.push(Line::from(""));
-        }
-    }
-    lines.extend(log_lines);
-
-    let total_lines = lines.len().max(1);
-    let para = Paragraph::new(Text::from(lines))
-        .wrap(Wrap { trim: false })
-        .scroll((app.status_vscroll, 0));
+        .scroll((app.json_vscroll, 0))
+        .style(Style::default().bg(if focused { RAISED } else { PANEL }));
     frame.render_widget(para, inner);
 
-    // Draw Copy button at top-right of inner area
-    let btn_w = COPY_BTN_LABEL.chars().count() as u16;
-    if inner.width >= btn_w {
-        let btn_x = inner.x + inner.width - btn_w;
-        let btn_rect = Rect {
-            x: btn_x,
-            y: inner.y,
-            width: btn_w,
-            height: 1,
-        };
-        let style = if app.copy_btn_pressed {
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Yellow)
-        };
-        let btn = Paragraph::new(COPY_BTN_LABEL).style(style);
-        frame.render_widget(btn, btn_rect);
-    }
-
-    // Scrollbar
-    let vis = inner.height as usize;
-    if total_lines > vis {
-        let mut vs = ScrollbarState::new(total_lines).position(app.status_vscroll as usize);
-        let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        frame.render_stateful_widget(vbar, inner, &mut vs);
+    let content_len = paragraph_len(body.as_ref());
+    if content_len > inner.height as usize {
+        let mut vs = ScrollbarState::new(content_len)
+            .position(app.json_vscroll.min(content_len.saturating_sub(1) as u16) as usize);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(bar, inner, &mut vs);
     }
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
-    let mut spans = Vec::new();
-    spans.push(Span::raw(footer_legend(app)));
-    if matches!(app.screen, Screen::Home) && matches!(app.focus, Focus::Query) {
-        let (line_no, col_no) = cursor_line_col(&app.input, app.input_cursor);
-        spans.push(Span::raw(" | "));
-        spans.push(Span::styled(
-            format!("Ln {}, Col {}", line_no, col_no),
-            Style::default().fg(Color::Gray),
-        ));
-        let (qs, qe) = find_query_range(&app.input, app.input_cursor);
-        let raw = &app.input[qs..qe];
-        let trimmed = strip_trailing_semicolon(raw).trim();
-        if !trimmed.is_empty() {
-            spans.push(Span::raw(" | "));
-            if app.parse_ok {
-                spans.push(Span::styled("Parse: OK", Style::default().fg(Color::Green)));
-            } else if let Some(msg) = &app.parse_error_msg {
-                let available = area.width.saturating_sub(30) as usize;
-                let shortened = truncate_with_ellipsis(msg, available.max(20));
-                spans.push(Span::styled(
-                    format!("Parse error: {}", shortened),
-                    Style::default().fg(Color::Red),
-                ));
-            }
-        }
+fn draw_status_log(frame: &mut Frame, area: Rect, app: &AppState) {
+    let mut lines: Vec<Line> = Vec::new();
+    if !app.status.is_empty() {
+        lines.push(Line::from(app.status.clone()));
     }
-    let block = Block::default().borders(Borders::ALL).title("Help");
-    let para = Paragraph::new(Line::from(spans)).block(block);
-    frame.render_widget(para, area);
-}
+    if !app.status_buffer.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::from("──"));
+        }
+        lines.extend(app.status_buffer.lines().map(|l| Line::from(l.to_string())));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("Ready"));
+    }
+    let block = Block::default()
+        .borders(Borders::NONE)
+        .title("Status")
+        .title_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(PANEL));
+    let inner = inset(area, 1);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines.clone()))
+            .wrap(Wrap { trim: false })
+            .scroll((app.status_vscroll, 0))
+            .style(Style::default().bg(PANEL)),
+        inner,
+    );
 
-fn footer_legend(app: &AppState) -> String {
-    match app.screen {
-        Screen::Home => match app.focus {
-            Focus::Query => "Tab focus | Query: Enter newline, Ctrl-Enter run, Right accept autocomplete, Ctrl-N/P navigate autocomplete, Ctrl-R history | F3 App Config | F10 About | Ctrl-Q/C quit".to_string(),
-            Focus::Results => "Tab focus | Results: arrows select, Shift-←/→ h-scroll, F5 copy value, F7 copy status | F3 App Config | F10 About | Ctrl-Q/C quit".to_string(),
-            Focus::Host => "Tab focus | Host: Enter open envs, F2 Envs | F3 App Config | F10 About | Ctrl-Q/C quit".to_string(),
-        },
-        Screen::Envs => "F4 Save, F5 Test, Tab move, Up/Down select, Esc Close | F10 About | Ctrl-Q/C quit".to_string(),
-        Screen::Info => "F6 Refresh, F8 Home, F3 App Config | F10 About | Ctrl-Q/C quit".to_string(),
-        Screen::AppConfig => {
-            "Tab focus | Left/Right change ORDER fields | Enter toggles timestamps or saves on Buttons | F4 Save | Esc Home | Ctrl-Q/C quit"
-                .to_string()
-        }
-        Screen::About => {
-            "Scroll Up/Down/PageUp/PageDown/Home/End | F10 back | Ctrl-Q/C quit".to_string()
-        }
+    let total = lines.len();
+    if total > inner.height as usize {
+        let mut vs = ScrollbarState::new(total).position(app.status_vscroll as usize);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(bar, inner, &mut vs);
     }
 }
 
-fn draw_env_modal(frame: &mut Frame, area: Rect, app: &AppState) {
-    let outer = Block::default()
-        .title("Environments")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner_area = outer.inner(area);
-    frame.render_widget(outer, area);
+fn draw_envs(frame: &mut Frame, area: Rect, app: &AppState) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(8), Constraint::Length(6)])
+        .split(area);
+    draw_env_header(frame, layout[0]);
 
-    // Split modal into left list and right editor
-    let cols = Layout::default()
+    let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .margin(1)
-        .split(inner_area);
+        .split(inset(layout[1], 1));
+    draw_env_list(frame, body[0], app);
+    draw_env_editor(frame, body[1], app);
+    draw_status_log(frame, layout[2], app);
+}
 
-    // Left: environments list
+fn draw_env_header(frame: &mut Frame, area: Rect) {
+    frame.render_widget(
+        Paragraph::new("Environments — F4 save • F5 test • Ctrl-Left/Right switch PEM")
+            .style(Style::default().bg(RAISED).fg(Color::White)),
+        area,
+    );
+}
+
+fn draw_env_list(frame: &mut Frame, area: Rect, app: &AppState) {
     let items: Vec<ListItem> = app
         .env_store
         .envs
         .iter()
         .map(|e| ListItem::new(e.name.clone()))
         .collect();
+    let mut state = ListState::default();
+    state.select(app.env_store.selected);
+    let focused = matches!(
+        app.env_editor.as_ref().map(|e| e.field_focus),
+        Some(EnvFieldFocus::List)
+    );
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Environments"))
         .highlight_style(
             Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                .bg(ACCENT)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::NONE)
+                .title("Profiles")
+                .style(Style::default().bg(if focused { RAISED } else { PANEL })),
         );
-    let mut state = ratatui::widgets::ListState::default();
-    if let Some(i) = app.env_store.selected {
-        state.select(Some(i));
-    }
-    frame.render_stateful_widget(list, cols[0], &mut state);
-
-    // Right: fields editor stacked vertically
-    let ed = app.env_editor.as_ref();
-    let fields = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Min(5),
-            Constraint::Min(5),
-            Constraint::Length(3),
-            Constraint::Min(5),
-        ])
-        .split(cols[1]);
-
-    let name_val = ed.map(|e| e.name.clone()).unwrap_or_default();
-    let host_val = ed.map(|e| e.host.clone()).unwrap_or_default();
-    // Values are drawn via TextAreas; no pre-rendered strings needed here.
-
-    let title_name_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Name)) {
-        "Name [FOCUSED]"
-    } else {
-        "Name"
-    };
-    let title_name = format!("{title_name_base}  [Copy] [Paste]");
-    let title_host_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Host)) {
-        "Host [FOCUSED]"
-    } else {
-        "Host"
-    };
-    let title_host = format!("{title_host_base}  [Copy] [Paste]");
-    let title_pk_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::PrivateKey)) {
-        "Private Key (PEM) [FOCUSED]"
-    } else {
-        "Private Key (PEM)"
-    };
-    let title_pk = format!("{}  [Copy] [Paste] [Clear]", title_pk_base);
-    let title_cert_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::PublicKey)) {
-        "Public/Certificate (PEM) [FOCUSED]"
-    } else {
-        "Public/Certificate (PEM)"
-    };
-    let title_cert = format!("{}  [Copy] [Paste] [Clear]", title_cert_base);
-    let title_ca_base = if matches!(ed.map(|e| e.field_focus), Some(EnvFieldFocus::Ca)) {
-        "SSL CA (PEM) [FOCUSED]"
-    } else {
-        "SSL CA (PEM)"
-    };
-    let title_ca = format!("{}  [Copy] [Paste] [Clear]", title_ca_base);
-
-    frame.render_widget(
-        Paragraph::new(name_val.clone())
-            .block(Block::default().borders(Borders::ALL).title(title_name)),
-        fields[0],
-    );
-    frame.render_widget(
-        Paragraph::new(host_val.clone())
-            .block(Block::default().borders(Borders::ALL).title(title_host)),
-        fields[1],
-    );
-    // Render multi-line fields using tui-textarea
-    let block_pk = Block::default()
-        .borders(Borders::ALL)
-        .title(title_pk.clone());
-    let block_pub = Block::default()
-        .borders(Borders::ALL)
-        .title(title_cert.clone());
-    let block_ca = Block::default()
-        .borders(Borders::ALL)
-        .title(title_ca.clone());
-    let inner_pk = block_pk.inner(fields[2]);
-    let inner_pub = block_pub.inner(fields[3]);
-    let inner_ca = block_ca.inner(fields[4]);
-    frame.render_widget(block_pk, fields[2]);
-    frame.render_widget(block_pub, fields[3]);
-    frame.render_widget(block_ca, fields[4]);
-    if let Some(edm) = app.env_editor.as_ref() {
-        frame.render_widget(&edm.ta_private, inner_pk);
-        frame.render_widget(&edm.ta_public, inner_pub);
-        frame.render_widget(&edm.ta_ca, inner_ca);
-    }
-    if let Some(ed) = app.env_editor.as_ref() {
-        let (x, y) = match ed.field_focus {
-            super::app::EnvFieldFocus::Name => caret_pos_in(fields[0], &name_val, ed.name_cursor),
-            super::app::EnvFieldFocus::Host => caret_pos_in(fields[1], &host_val, ed.host_cursor),
-            // TextArea draws its own cursor; we skip frame.set_cursor for these
-            super::app::EnvFieldFocus::PrivateKey => (0, 0),
-            super::app::EnvFieldFocus::PublicKey => (0, 0),
-            super::app::EnvFieldFocus::Ca => (0, 0),
-            super::app::EnvFieldFocus::Conn => (0, 0),
-            super::app::EnvFieldFocus::Buttons => (0, 0),
-        };
-        if x > 0 || y > 0 {
-            frame.set_cursor_position(Position::new(x, y));
-        }
-    }
-    let mut action_spans = Vec::new();
-    action_spans.push(Span::raw("F1 New | F2 Edit | F3 Delete | "));
-    let save_style = if app.env_save_pressed {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Green)
-    };
-    action_spans.push(Span::styled("F4 Save", save_style));
-    action_spans.push(Span::raw(
-        " | F5 Test | F6 Next | F7 Prev | F9 Mouse select on/off | Tab/Shift-Tab Move | Up/Down Select | Shift-←/→ H-scroll | Esc Close",
-    ));
-    frame.render_widget(
-        Paragraph::new(Line::from(action_spans))
-            .block(Block::default().borders(Borders::ALL).title("Actions")),
-        fields[5],
-    );
-
-    // Connection status/progress area (scrollable)
-    let mut log_lines: Vec<String> = if app.env_test_log.trim().is_empty() {
-        vec![
-            app.env_test_message
-                .clone()
-                .unwrap_or_else(|| "No env test run yet".to_string()),
-        ]
-    } else {
-        app.env_test_log.lines().map(|l| l.to_string()).collect()
-    };
-    if log_lines.is_empty() {
-        log_lines.push("No env test run yet".to_string());
-    }
-    if app.env_test_in_progress {
-        let spinner = match (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-            / 200)
-            % 4
-        {
-            0 => "⠋",
-            1 => "⠙",
-            2 => "⠸",
-            _ => "⠴",
-        };
-        if let Some(last) = log_lines.last_mut() {
-            *last = format!("{} {}", spinner, last);
-        }
-    }
-    let total_lines = log_lines.len().max(1);
-    let conn_lines: Vec<Line> = log_lines.into_iter().map(Line::from).collect();
-    let conn_title = if matches!(
-        app.env_editor.as_ref().map(|e| e.field_focus),
-        Some(EnvFieldFocus::Conn)
-    ) {
-        "Connection [FOCUSED]  [Copy] [Paste/F9 Select]"
-    } else {
-        "Connection  [Copy] [Paste/F9 Select]"
-    };
-    let conn_block = Block::default().borders(Borders::ALL).title(conn_title);
-    let conn_inner = conn_block.inner(fields[6]);
-    let conn_para = Paragraph::new(Text::from(conn_lines))
-        .block(conn_block)
-        .scroll((app.env_conn_vscroll, 0));
-    frame.render_widget(conn_para, fields[6]);
-    if total_lines > conn_inner.height as usize {
-        let mut vs = ScrollbarState::new(total_lines).position(app.env_conn_vscroll as usize);
-        let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        frame.render_stateful_widget(vbar, conn_inner, &mut vs);
-    }
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_app_config_screen(frame: &mut Frame, area: Rect, app: &AppState) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("App Config")
-        .border_style(Style::default().fg(Color::LightCyan));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let sections = Layout::default()
+fn draw_env_editor(frame: &mut Frame, area: Rect, app: &AppState) {
+    let focused = |f: EnvFieldFocus| {
+        app.env_editor
+            .as_ref()
+            .map(|e| e.field_focus == f)
+            .unwrap_or(false)
+    };
+    let inner = inset(area, 1);
+    let ed = match app.env_editor.as_ref() {
+        Some(v) => v,
+        None => {
+            frame.render_widget(
+                Paragraph::new("No environment").style(Style::default().bg(PANEL)),
+                inner,
+            );
+            return;
+        }
+    };
+    let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
-            Constraint::Min(8),
             Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(5),
         ])
         .split(inner);
 
-    let (order_field, order_dir) = app.app_config.default_order();
-    let order_label = match order_field {
-        crate::query::ast::OrderField::Timestamp => "timestamp",
-        crate::query::ast::OrderField::Poffset => "poffset",
-        crate::query::ast::OrderField::PoffsetTs => "poffset_ts",
-    };
-    let order_dir_label = match order_dir {
-        crate::query::ast::OrderDir::Asc => "ASC",
-        crate::query::ast::OrderDir::Desc => "DESC",
-    };
-    let summary = format!(
-        "Configure defaults when queries omit ORDER/LIMIT. Query scan multiplier (currently {}) controls how deep each partition is scanned when no explicit LIMIT is provided. Effective default order: {} {}.",
-        app.app_config.query_scan_multiplier, order_label, order_dir_label
+    render_single_line(
+        frame,
+        layout[0],
+        &ed.name,
+        ed.name_cursor,
+        "Name",
+        focused(EnvFieldFocus::Name),
     );
+    render_single_line(
+        frame,
+        layout[1],
+        &ed.host,
+        ed.host_cursor,
+        "Host",
+        focused(EnvFieldFocus::Host),
+    );
+
+    draw_pem_tabs(frame, layout[2], ed, focused(EnvFieldFocus::PemEditor));
+
+    let active_ta = match ed.active_pem {
+        EnvPemField::PrivateKey => (&ed.ta_private, "Private key (PEM)"),
+        EnvPemField::PublicKey => (&ed.ta_public, "Certificate (PEM)"),
+        EnvPemField::Ca => (&ed.ta_ca, "SSL CA (PEM)"),
+    };
+    render_textarea(
+        frame,
+        layout[3],
+        active_ta.0,
+        active_ta.1,
+        focused(EnvFieldFocus::PemEditor),
+    );
+
+    draw_env_connection(frame, layout[4], app, focused(EnvFieldFocus::Conn));
+}
+
+fn draw_pem_tabs(frame: &mut Frame, area: Rect, ed: &EnvEditor, focused: bool) {
+    let mut spans = Vec::new();
+    spans.push(Span::styled(
+        "PEM ",
+        Style::default().fg(if focused { ACCENT } else { Color::Gray }),
+    ));
+    for (field, label) in [
+        (EnvPemField::PrivateKey, "Private"),
+        (EnvPemField::PublicKey, "Public/Cert"),
+        (EnvPemField::Ca, "CA"),
+    ] {
+        let active = ed.active_pem == field;
+        spans.push(Span::raw(" "));
+        spans.push(pill(label, active, focused));
+    }
+    spans.push(Span::raw("    Ctrl-Left/Right switches"));
     frame.render_widget(
-        Paragraph::new(summary).wrap(Wrap { trim: false }),
-        sections[0],
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
+        area,
     );
+}
+
+fn render_single_line(
+    frame: &mut Frame,
+    area: Rect,
+    text: &str,
+    cursor: usize,
+    label: &str,
+    focused: bool,
+) {
+    let block = Block::default()
+        .borders(Borders::NONE)
+        .title(label)
+        .title_style(Style::default().fg(ACCENT_FADED))
+        .style(Style::default().bg(if focused { RAISED } else { PANEL }));
+    frame.render_widget(block, area);
+    let inner = inset(area, 1);
+    frame.render_widget(
+        Paragraph::new(text.to_string())
+            .style(Style::default().bg(if focused { RAISED } else { PANEL })),
+        inner,
+    );
+    if focused {
+        let pos = cursor.min(text.len()) as u16;
+        frame.set_cursor_position(Position::new(inner.x + pos, inner.y));
+    }
+}
+
+fn draw_env_connection(frame: &mut Frame, area: Rect, app: &AppState, focused: bool) {
+    let mut lines: Vec<Line> = if app.env_test_log.trim().is_empty() {
+        vec![Line::from(
+            app.env_test_message
+                .clone()
+                .unwrap_or_else(|| "No test run yet".to_string()),
+        )]
+    } else {
+        app.env_test_log
+            .lines()
+            .map(|l| Line::from(l.to_string()))
+            .collect()
+    };
+    if lines.is_empty() {
+        lines.push(Line::from("No test output"));
+    }
+    let block = Block::default()
+        .borders(Borders::NONE)
+        .title("Connection log")
+        .title_style(Style::default().fg(ACCENT_FADED))
+        .style(Style::default().bg(if focused { RAISED } else { PANEL }));
+    frame.render_widget(block, area);
+    let inner = inset(area, 1);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines.clone()))
+            .scroll((app.env_conn_vscroll, 0))
+            .style(Style::default().bg(if focused { RAISED } else { PANEL })),
+        inner,
+    );
+    if lines.len() > inner.height as usize {
+        let mut vs =
+            ScrollbarState::new(lines.len()).position(app.env_conn_vscroll as usize);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(bar, inner, &mut vs);
+    }
+
+    let actions = Line::from(vec![
+        Span::styled("F4 Save", Style::default().fg(POSITIVE)),
+        Span::raw("  "),
+        Span::styled("F5 Test", Style::default().fg(ACCENT)),
+        Span::raw("  "),
+        Span::styled("F6/F7 Cycle  Esc Home", Style::default().fg(Color::Gray)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(actions).style(Style::default().bg(PANEL)),
+        Rect {
+            x: inner.x,
+            y: inner.y.saturating_add(inner.height.saturating_sub(1)),
+            width: inner.width,
+            height: 1,
+        },
+    );
+}
+
+fn draw_info(frame: &mut Frame, area: Rect, app: &AppState) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new("Broker topics — F6 refresh • Esc back")
+            .style(Style::default().bg(RAISED)),
+        layout[0],
+    );
+    draw_topic_table(frame, layout[1], app);
+}
+
+fn draw_app_config(frame: &mut Frame, area: Rect, app: &AppState) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(2),
+        ])
+        .split(area);
+
+    let header = Paragraph::new("App config — Tab/Shift-Tab moves • Enter toggles/save • Esc back")
+        .style(Style::default().bg(RAISED));
+    frame.render_widget(header, layout[0]);
 
     let Some(ed) = app.app_config_editor.as_ref() else {
         return;
     };
-    let fields = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(2),
-        ])
-        .split(sections[1]);
-
-    let title_mul = if matches!(ed.field_focus, AppConfigFieldFocus::QueryScanMultiplier) {
-        "Query scan multiplier [FOCUSED]  [Copy] [Paste] [Clear]"
-    } else {
-        "Query scan multiplier  [Copy] [Paste] [Clear]"
-    };
-    frame.render_widget(
-        Paragraph::new(ed.query_scan_multiplier.clone())
-            .block(Block::default().borders(Borders::ALL).title(title_mul)),
-        fields[0],
+    render_single_line(
+        frame,
+        layout[1],
+        &ed.query_scan_multiplier,
+        ed.query_scan_multiplier.len(),
+        "Query scan multiplier",
+        matches!(ed.field_focus, AppConfigFieldFocus::QueryScanMultiplier),
+    );
+    render_single_line(
+        frame,
+        layout[2],
+        &ed.default_limit,
+        ed.default_limit.len(),
+        "Default LIMIT (empty = auto)",
+        matches!(ed.field_focus, AppConfigFieldFocus::DefaultLimit),
     );
 
-    let title_limit = if matches!(ed.field_focus, AppConfigFieldFocus::DefaultLimit) {
-        "Default LIMIT (empty = auto) [FOCUSED]  [Copy] [Paste] [Clear]"
-    } else {
-        "Default LIMIT (empty = auto)  [Copy] [Paste] [Clear]"
-    };
-    frame.render_widget(
-        Paragraph::new(ed.default_limit.clone())
-            .block(Block::default().borders(Borders::ALL).title(title_limit)),
-        fields[1],
-    );
-
-    let title_order_field = if matches!(ed.field_focus, AppConfigFieldFocus::DefaultOrderField) {
-        "Default ORDER BY [FOCUSED]"
-    } else {
-        "Default ORDER BY"
-    };
-    let mut spans_field = Vec::new();
+    let order_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(layout[3]);
+    let mut spans = Vec::new();
+    spans.push(Span::styled("Order field ", Style::default().fg(Color::Gray)));
     for (i, label) in ["timestamp", "poffset", "poffset_ts"].iter().enumerate() {
-        let style = if ed.default_order_field_idx == i {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        spans_field.push(Span::styled(*label, style));
-        if i + 1 < 3 {
-            spans_field.push(Span::raw("  |  "));
-        }
+        spans.push(Span::raw(" "));
+        spans.push(pill(
+            label,
+            ed.default_order_field_idx == i,
+            matches!(ed.field_focus, AppConfigFieldFocus::DefaultOrderField),
+        ));
     }
     frame.render_widget(
-        Paragraph::new(Line::from(spans_field)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title_order_field),
-        ),
-        fields[2],
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
+        order_row[0],
     );
 
-    let title_order_dir = if matches!(ed.field_focus, AppConfigFieldFocus::DefaultOrderDir) {
-        "Default ORDER direction [FOCUSED]"
-    } else {
-        "Default ORDER direction"
-    };
-    let mut spans_dir = Vec::new();
+    let mut dir_spans = Vec::new();
+    dir_spans.push(Span::styled("Direction ", Style::default().fg(Color::Gray)));
     for (i, label) in ["ASC", "DESC"].iter().enumerate() {
-        let style = if ed.default_order_dir_idx == i {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        spans_dir.push(Span::styled(*label, style));
-        if i + 1 < 2 {
-            spans_dir.push(Span::raw("  |  "));
-        }
+        dir_spans.push(Span::raw(" "));
+        dir_spans.push(pill(
+            label,
+            ed.default_order_dir_idx == i,
+            matches!(ed.field_focus, AppConfigFieldFocus::DefaultOrderDir),
+        ));
     }
     frame.render_widget(
-        Paragraph::new(Line::from(spans_dir)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title_order_dir),
-        ),
-        fields[3],
+        Paragraph::new(Line::from(dir_spans)).style(Style::default().bg(PANEL)),
+        order_row[1],
     );
 
-    let title_ts = if matches!(ed.field_focus, AppConfigFieldFocus::TimestampsUseUtc) {
-        "Default timestamp display [FOCUSED]"
-    } else {
-        "Default timestamp display"
-    };
     let mut ts_spans = Vec::new();
-    let options = [
-        ("UTC", ed.timestamps_use_utc),
-        ("Local", !ed.timestamps_use_utc),
-    ];
-    for (idx, (label, active)) in options.iter().enumerate() {
-        let style = if *active {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        ts_spans.push(Span::styled(*label, style));
-        if idx + 1 < options.len() {
-            ts_spans.push(Span::raw("  |  "));
-        }
+    ts_spans.push(Span::styled("Timestamp display ", Style::default().fg(Color::Gray)));
+    for (label, active) in [("UTC", ed.timestamps_use_utc), ("Local", !ed.timestamps_use_utc)] {
+        ts_spans.push(Span::raw(" "));
+        ts_spans.push(pill(
+            label,
+            active,
+            matches!(ed.field_focus, AppConfigFieldFocus::TimestampsUseUtc),
+        ));
     }
     frame.render_widget(
-        Paragraph::new(Line::from(ts_spans))
-            .block(Block::default().borders(Borders::ALL).title(title_ts)),
-        fields[4],
+        Paragraph::new(Line::from(ts_spans)).style(Style::default().bg(PANEL)),
+        layout[4],
     );
 
-    let limit_note = if ed.default_limit.trim().is_empty() {
-        "auto (multiplier applies)"
-    } else {
-        ed.default_limit.as_str()
-    };
-    let order_label_edit = match ed.default_order_field_idx {
-        0 => "timestamp",
-        1 => "poffset",
-        _ => "poffset_ts",
-    };
-    let order_dir_label_edit = if ed.default_order_dir_idx == 0 {
-        "ASC"
-    } else {
-        "DESC"
-    };
-    let note = format!(
-        "Edited values: ORDER {} {}, LIMIT {}, timestamps {}, scan multiplier {}",
-        order_label_edit,
-        order_dir_label_edit,
-        limit_note,
-        if ed.timestamps_use_utc {
-            "UTC"
-        } else {
-            "Local"
-        },
-        ed.query_scan_multiplier
-    );
-    frame.render_widget(
-        Paragraph::new(note)
-            .style(Style::default().fg(Color::Gray))
-            .wrap(Wrap { trim: false }),
-        fields[5],
-    );
-
-    let mut action_spans = Vec::new();
-    let save_style = if app.app_config_save_pressed {
+    let actions_style = if matches!(ed.field_focus, AppConfigFieldFocus::Buttons) {
         Style::default()
+            .bg(RAISED)
             .fg(Color::Black)
-            .bg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Green)
+        Style::default().fg(Color::Gray)
     };
-    action_spans.push(Span::styled("[Save]", save_style));
-    action_spans.push(Span::raw("    "));
-    action_spans.push(Span::styled(
-        "[Reset to defaults]",
-        Style::default().fg(Color::Gray),
-    ));
-    action_spans.push(Span::raw("    (Enter/click to apply)"));
+    let actions = Paragraph::new("[Enter] save  •  [Backspace] reset field  •  Esc back")
+        .style(actions_style);
+    frame.render_widget(actions, layout[5]);
+
+    let summary = format!(
+        "Defaults: order {} {}, limit {}, timestamps {}",
+        match ed.default_order_field_idx {
+            0 => "timestamp",
+            1 => "poffset",
+            _ => "poffset_ts",
+        },
+        if ed.default_order_dir_idx == 0 { "ASC" } else { "DESC" },
+        if ed.default_limit.trim().is_empty() {
+            "auto".to_string()
+        } else {
+            ed.default_limit.clone()
+        },
+        if ed.timestamps_use_utc { "UTC" } else { "Local" }
+    );
     frame.render_widget(
-        Paragraph::new(Line::from(action_spans))
-            .block(Block::default().borders(Borders::ALL).title("Actions")),
-        sections[2],
+        Paragraph::new(summary).style(Style::default().fg(Color::Gray)),
+        layout[6],
     );
 }
 
-fn caret_pos_in(area: Rect, text: &str, cursor: usize) -> (u16, u16) {
-    let inner_x = area.x.saturating_add(1);
-    let inner_y = area.y.saturating_add(1);
-    let max_w = area.width.saturating_sub(2);
-    let max_h = area.height.saturating_sub(2);
-    let idx = cursor.min(text.len());
-    let mut line = 0u16;
-    let mut col = 0u16;
-    let mut count = 0usize;
-    for (li, l) in text.split('\n').enumerate() {
-        let llen = l.len();
-        if count + llen >= idx {
-            line = li as u16;
-            col = (idx - count) as u16;
-            break;
-        } else {
-            count += llen + 1; // account for newline
-        }
-    }
-    if count >= idx {
-        line = 0;
-        col = idx as u16;
-    }
-    line = line.min(max_h.saturating_sub(1));
-    col = col.min(max_w.saturating_sub(1));
-    (inner_x + col, inner_y + line)
-}
-
-// Removed unused manual scrolled-field helpers in favor of tui-textarea
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
-fn caret_pos_multiline(area: Rect, text: &str, cursor: usize, vscroll: u16) -> Option<(u16, u16)> {
-    // Compute (line, col) in logical lines and map to screen using vscroll and wrapping
-    let inner_x = area.x.saturating_add(0);
-    let inner_y = area.y.saturating_add(0);
-    let max_w = area.width;
-    if max_w == 0 {
-        return None;
-    }
-    let (line, col) = line_col_at(text, cursor);
-    // With wrapping, we need to account for col overflow into visual lines
-    let wrap_w = max_w as usize;
-    let add_lines = col / wrap_w; // number of extra wrapped lines within this logical line
-    let vis_line = line + add_lines;
-    let vis_col = (col % wrap_w) as u16;
-    let y = inner_y + vis_line.saturating_sub(vscroll as usize) as u16;
-    let x = inner_x + vis_col;
-    Some((x, y))
-}
-
-fn line_col_at(text: &str, cursor: usize) -> (usize, usize) {
-    let idx = cursor.min(text.len());
-    let mut line = 0usize;
-    let mut col = 0usize;
-    let mut count = 0usize;
-    for l in text.split('\n') {
-        let llen = l.len();
-        if count + llen >= idx {
-            col = idx - count;
-            break;
-        } else {
-            count += llen + 1;
-            line += 1;
-        }
-    }
-    (line, col)
-}
-
-fn cursor_line_col(text: &str, cursor: usize) -> (usize, usize) {
-    let mut line = 1usize;
-    let mut col = 1usize;
-    let mut idx = 0usize;
-    for ch in text.chars() {
-        if idx >= cursor {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-        idx += ch.len_utf8();
-    }
-    (line, col)
-}
-
-fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let mut out: String = s.chars().take(max_chars).collect();
-    if s.chars().count() > max_chars {
-        if max_chars > 1 {
-            out.pop();
-        }
-        out.push('…');
-    }
-    out
-}
-
-fn history_preview(entry: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    let cleaned = entry.replace('\n', " ⏎ ");
-    if cleaned.chars().count() > max_width {
-        let mut truncated: String = cleaned.chars().take(max_width.saturating_sub(1)).collect();
-        truncated.push('…');
-        truncated
-    } else {
-        cleaned
-    }
-}
-
-fn intersects(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
-    // [a_start, a_end) intersects [b_start, b_end)
-    a_start < b_end && b_start < a_end
-}
-
-fn byte_index_to_line(line_starts: &[usize], byte_idx: usize) -> usize {
-    // find greatest line_starts[i] <= byte_idx
-    let mut lo = 0usize;
-    let mut hi = line_starts.len();
-    while lo + 1 < hi {
-        let mid = (lo + hi) / 2;
-        if line_starts[mid] <= byte_idx {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
-}
-
-fn highlight_sql_line(s: &str) -> Vec<Span<'static>> {
-    // Very small SQL-ish highlighter
-    let mut spans: Vec<Span> = Vec::new();
-    let mut word = String::new();
-    let mut in_string = false;
-    for ch in s.chars() {
-        match ch {
-            '\'' | '"' => {
-                if !word.is_empty() {
-                    push_word(&mut spans, &word);
-                    word.clear();
-                }
-                in_string = !in_string;
-                spans.push(Span::styled(
-                    ch.to_string(),
-                    Style::default().fg(Color::Yellow),
-                ));
-            }
-            c if c.is_alphanumeric() || c == '_' => {
-                word.push(c);
-            }
-            _ => {
-                if !word.is_empty() {
-                    push_word(&mut spans, &word);
-                    word.clear();
-                }
-                let color = if in_string {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                };
-                spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
-            }
-        }
-    }
-    if !word.is_empty() {
-        push_word(&mut spans, &word);
-    }
-    spans
-}
-
-fn push_word(spans: &mut Vec<Span<'static>>, w: &str) {
-    let kw = [
-        "select",
-        "list",
-        "from",
-        "where",
-        "and",
-        "or",
-        "limit",
-        "order",
-        "by",
-        "asc",
-        "desc",
-        "contains",
-        // note: treat Kafka columns like key/value as identifiers, not keywords
-        "timestamp",
-        "partition",
-        "offset",
-        "poffset",
-        "poffset_ts",
-    ];
-    if kw.contains(&w.to_ascii_lowercase().as_str()) {
-        spans.push(Span::styled(
-            w.to_uppercase(),
-            Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    } else if w.chars().all(|c| c.is_ascii_digit()) {
-        spans.push(Span::styled(
-            w.to_string(),
-            Style::default().fg(Color::Cyan),
-        ));
-    } else {
-        spans.push(Span::raw(w.to_string()));
-    }
-}
-
-fn draw_results(frame: &mut Frame, area: Rect, app: &AppState) {
-    match app.results_mode {
-        ResultsMode::Messages => {
-            let cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                .split(area);
-            draw_table(frame, cols[0], app);
-            draw_json_detail(frame, cols[1], app);
-        }
-        ResultsMode::TopicList => {
-            draw_topics_results_table(frame, area, app);
-        }
-    }
-}
-
-fn draw_topics_results_table(frame: &mut Frame, area: Rect, app: &AppState) {
-    let headers = vec![
-        Cell::from(header_span("Topic")),
-        Cell::from(header_span("Partitions")),
-    ];
-    let rows: Vec<Row> = if app.topics_with_partitions.is_empty() {
-        vec![Row::new(vec![Cell::from("No topics"), Cell::from("")])]
-    } else {
-        app.topics_with_partitions
-            .iter()
-            .map(|(topic, parts)| {
-                Row::new(vec![
-                    Cell::from(topic.clone()),
-                    Cell::from(parts.to_string()),
-                ])
-            })
-            .collect()
-    };
-    let border_style = if app.focus == Focus::Results {
-        Style::default().fg(Color::LightCyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let table = Table::new(
-        rows,
-        [Constraint::Percentage(70), Constraint::Percentage(30)],
-    )
-    .header(Row::new(headers).style(Style::default().add_modifier(Modifier::BOLD)))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Topics")
-            .border_style(border_style),
-    )
-    .row_highlight_style(Style::default())
-    .column_spacing(2);
-    let mut state = TableState::default();
-    if !app.topics_with_partitions.is_empty() {
-        state.select(Some(
-            app.selected_row
-                .min(app.topics_with_partitions.len().saturating_sub(1)),
-        ));
-    }
-    frame.render_stateful_widget(table, area, &mut state);
-
-    let total = app.topics_with_partitions.len();
-    if total > 0 {
-        let mut vs =
-            ScrollbarState::new(total).position(app.selected_row.min(total.saturating_sub(1)));
-        let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        frame.render_stateful_widget(vbar, area, &mut vs);
-    }
-}
-
-fn draw_topics(frame: &mut Frame, area: Rect, app: &AppState) {
-    let items: Vec<ListItem> = if app.topics.is_empty() {
-        vec![ListItem::new("No topics loaded. Press F6 to refresh.")]
-    } else {
-        app.topics
-            .iter()
-            .map(|t| ListItem::new(t.clone()))
-            .collect()
-    };
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Topics"));
-    frame.render_widget(list, area);
-}
-
-fn draw_about_screen(frame: &mut Frame, area: Rect, app: &AppState) {
+fn draw_help(frame: &mut Frame, area: Rect, app: &AppState) {
     let block = Block::default()
-        .borders(Borders::ALL)
-        .title("About & Help")
-        .border_style(Style::default().fg(Color::Yellow));
-    let inner = block.inner(area);
+        .borders(Borders::NONE)
+        .title("Help")
+        .style(Style::default().bg(PANEL));
     frame.render_widget(block, area);
-
-    let lines = build_about_lines();
-    let total_lines = lines.len();
-    let visible = inner.height.max(1) as usize;
-    let max_scroll = total_lines.saturating_sub(visible);
-    let requested = app.help_vscroll as usize;
-    let scroll = requested.min(max_scroll);
-    let scroll_u16 = scroll.min(u16::MAX as usize) as u16;
-
-    let para = Paragraph::new(Text::from(lines))
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_u16, 0));
-    frame.render_widget(para, inner);
-
-    if total_lines > visible {
-        let mut vs = ScrollbarState::new(total_lines).position(scroll);
-        let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        frame.render_stateful_widget(vbar, inner, &mut vs);
-    }
+    let inner = inset(area, 1);
+    let lines: Vec<Line> = HELP_LINES
+        .iter()
+        .map(|l| Line::from(*l))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .scroll((app.help_vscroll as u16, 0))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(PANEL)),
+        inner,
+    );
 }
 
-fn draw_history_popup(frame: &mut Frame, area: Rect, app: &AppState) {
-    if app.query_history.is_empty() {
-        return;
-    }
-    let popup = centered_rect(60, 60, area);
+fn draw_record_detail(frame: &mut Frame, area: Rect, app: &AppState) {
+    let header = Paragraph::new("Record detail — Esc to return")
+        .style(Style::default().bg(RAISED));
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(5)])
+        .split(area);
+    frame.render_widget(header, layout[0]);
+
+    let body_area = inset(layout[1], 1);
+    let (meta, body) = record_detail_text(app);
+    let mut content = Vec::new();
+    content.extend(meta);
+    content.push(Line::from(" "));
+    content.extend(body);
+    let para = Paragraph::new(Text::from(content))
+        .scroll((app.record_detail_scroll, 0))
+        .wrap(Wrap { trim: false })
+        .style(Style::default().bg(PANEL));
+    frame.render_widget(para, body_area);
+}
+
+fn draw_command_palette(frame: &mut Frame, area: Rect, app: &AppState) {
+    let popup = centered_rect(70, 60, area);
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Query History (Up/Down, Enter, Esc)")
-        .border_style(Style::default().fg(Color::Yellow));
-    let inner = block.inner(popup);
+        .title("Command palette")
+        .style(Style::default().bg(PANEL));
     frame.render_widget(block, popup);
+    let inner = inset(popup, 1);
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(4)])
+        .split(inner);
 
-    let total = app.query_history.len();
-    let display_cap = 15usize.min(total.max(1));
-    let mut start = total.saturating_sub(display_cap);
-    if app.history_selected_index < start {
-        start = app.history_selected_index;
-    } else if app.history_selected_index >= start + display_cap {
-        start = app.history_selected_index + 1 - display_cap;
-    }
-    let items: Vec<ListItem> = app.query_history[start..]
-        .iter()
-        .enumerate()
-        .take(display_cap)
-        .map(|(offset, entry)| {
-            let idx = start + offset;
-            let preview = history_preview(entry, inner.width.saturating_sub(4) as usize);
-            ListItem::new(format!("{:>3}. {}", idx + 1, preview))
-        })
-        .collect();
+    render_textarea(frame, layout[0], &app.command_palette.input, "Type to filter", true);
 
-    let visible_len = items.len().max(1);
-    let list = List::new(if items.is_empty() {
-        vec![ListItem::new("No history yet")]
-    } else {
-        items
-    })
-    .highlight_style(
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-    );
-    let mut state = ListState::default();
-    if !app.query_history.is_empty() {
-        let rel = app.history_selected_index.saturating_sub(start);
-        state.select(Some(rel.min(visible_len.saturating_sub(1))));
-    }
-    frame.render_stateful_widget(list, inner, &mut state);
-
-    if total > display_cap {
-        let mut vs = ScrollbarState::new(total)
-            .position(app.history_selected_index.min(total.saturating_sub(1)));
-        let bar_area = Rect {
-            x: inner.x + inner.width.saturating_sub(1),
-            y: inner.y,
-            width: 1,
-            height: inner.height,
-        };
-        let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        frame.render_stateful_widget(vbar, bar_area, &mut vs);
-    }
-}
-
-pub fn help_content_line_count() -> usize {
-    build_about_lines().len()
-}
-
-fn build_about_lines() -> Vec<Line<'static>> {
-    vec![
-        heading_line("About RKL"),
-        Line::from(
-            "Kafka TUI for SQL-like queries with JSON preview, env manager, and topic browser.",
-        ),
-        Line::from(
-            "Run ad-hoc SELECTs, filter on JSON paths, explore partitions, and copy payloads quickly.",
-        ),
-        Line::from("Designed for on-call debugging and lightweight exploration."),
-        Line::from(""),
-        heading_line("License & goals"),
-        Line::from(
-            "Community-centric copyleft (see LICENSE): share improvements and avoid closed-source forks.",
-        ),
-        Line::from(
-            "Friendly to small developers; enterprises are expected to upstream fixes and keep changes open.",
-        ),
-        Line::from(
-            "Goals: transparent defaults, safe-by-design querying, ergonomic environment handling.",
-        ),
-        Line::from(""),
-        heading_line("Key controls"),
-        Line::from("- Top menu: Query / Envs / App Config / About (clickable, mouse supported)."),
-        Line::from(
-            "- Ctrl-Enter runs query; Tab moves focus; Ctrl-Q/C quits; Ctrl-R opens history popup.",
-        ),
-        Line::from(
-            "- F2 Envs, F8 Home, F12 Info, F10 About. Autocomplete Right or Ctrl-Y; Ctrl-N/P navigate.",
-        ),
-        Line::from(
-            "- Results: arrows move selection; Shift-Left/Right horizontal scroll; PageUp/PageDown/Home/End move.",
-        ),
-        Line::from(
-            "- Env editor: Tab/Shift-Tab move fields; titles expose [Copy]/[Paste]/[Clear]; mouse scroll in PEMs.",
-        ),
-        Line::from(""),
-        heading_line("Query syntax"),
-        Line::from(
-            "- SELECT cols FROM topic [WHERE expr] [ORDER BY timestamp|poffset|poffset_ts ASC|DESC] [LIMIT n]",
-        ),
-        Line::from(
-            "- ORDER BY poffset DESC applies when omitted; timestamp filters accept ISO-8601 or millis.",
-        ),
-        Line::from(
-            "- JSON paths use value->field->subfield; key and timestamp roots are supported; CONTAINS matches substrings.",
-        ),
-        Line::from(""),
-        heading_line("Examples"),
-        Line::from("  SELECT key, value FROM my_topic LIMIT 10;"),
-        Line::from("  SELECT key FROM t WHERE value->response->msg CONTAINS 'error';"),
-        Line::from(
-            "  SELECT key, value FROM random-data WHERE value->event->type = 'purchase' AND value->response->status = 200;",
-        ),
-        Line::from(
-            "  SELECT key FROM t WHERE (key = 'a' OR key = 'b') AND value->foo CONTAINS 'x' ORDER BY timestamp DESC LIMIT 100;",
-        ),
-        Line::from(
-            "  SELECT key FROM t WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z';",
-        ),
-        Line::from("- Special command: LIST topics;"),
-        Line::from(""),
-        heading_line("Help navigation"),
-        Line::from("- Scroll with Up/Down/PageUp/PageDown; Home/End jump."),
-    ]
-}
-
-fn heading_line(text: &'static str) -> Line<'static> {
-    Line::from(vec![Span::styled(
-        text,
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )])
-}
-
-fn draw_table(frame: &mut Frame, area: Rect, app: &AppState) {
-    let headers: Vec<Cell> = app
-        .selected_columns
-        .iter()
-        .map(|col| Cell::from(header_span(column_label(col))))
-        .collect();
-
-    // Create single-line rows with truncated previews; full JSON moves to right pane
-    let rows: Vec<Row> = app
-        .rows
-        .iter()
-        .enumerate()
-        .map(|(i, env)| make_row(i, env, app))
-        .collect();
-
-    let mut constraints: Vec<Constraint> =
-        app.selected_columns.iter().map(column_constraint).collect();
-    if let Some(last) = constraints.last_mut() {
-        *last = Constraint::Percentage(100);
-    } else {
-        constraints.push(Constraint::Percentage(100));
-    }
-
-    let table = Table::new(rows, constraints)
-        .header(Row::new(headers).style(Style::default().add_modifier(Modifier::BOLD)))
-        .block({
-            let border_style = if app.focus == Focus::Results {
-                Style::default().fg(Color::LightCyan)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Results")
-                .border_style(border_style)
-        })
-        .row_highlight_style(Style::default())
-        .column_spacing(1);
-
-    let mut state = TableState::default();
-    if !app.rows.is_empty() {
-        state.select(Some(app.selected_row.min(app.rows.len() - 1)));
-    }
-    frame.render_stateful_widget(table, area, &mut state);
-
-    // Vertical scrollbar for table (binds to selected_row)
-    let total_rows = app.rows.len();
-    if total_rows > 0 {
-        let mut vs = ScrollbarState::new(total_rows).position(app.selected_row.min(total_rows - 1));
-        let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        frame.render_stateful_widget(vbar, area, &mut vs);
-    }
-
-    // Horizontal scrollbar for table (approximate by preview width)
-    if has_value_column(app) {
-        let content_w_estimate = estimate_table_content_width(app);
-        let visible_w = area.width.saturating_sub(2) as usize; // minus borders
-        let h_content = content_w_estimate
-            .saturating_sub(visible_w)
-            .saturating_add(1);
-        if h_content > 1 {
-            let mut hs =
-                ScrollbarState::new(h_content).position(app.table_hscroll.min(h_content - 1));
-            let hbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom);
-            frame.render_stateful_widget(hbar, area, &mut hs);
+    let mut items: Vec<ListItem> = Vec::new();
+    for idx in app.command_palette.matches.iter().copied() {
+        if let Some(spec) = COMMAND_SPECS.get(idx) {
+            items.push(ListItem::new(format!("{} — {}", spec.label, spec.hint)));
         }
     }
-
-    draw_timestamp_toggle_button(frame, area, app);
+    if items.is_empty() {
+        items.push(ListItem::new("No commands match"));
+    }
+    let mut state = ListState::default();
+    state.select(Some(
+        app.command_palette
+            .selected
+            .min(app.command_palette.matches.len().saturating_sub(1)),
+    ));
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .bg(ACCENT)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(PANEL));
+    frame.render_stateful_widget(list, layout[1], &mut state);
 }
 
-fn header_span(text: &str) -> Span<'_> {
-    Span::styled(text, Style::default().add_modifier(Modifier::BOLD))
-}
+fn draw_history_popup(frame: &mut Frame, area: Rect, app: &AppState) {
+    let popup = centered_rect(70, 60, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Query history")
+        .style(Style::default().bg(PANEL));
+    frame.render_widget(block, popup);
+    let inner = inset(popup, 1);
 
-fn draw_timestamp_toggle_button(frame: &mut Frame, area: Rect, app: &AppState) {
-    if !app.should_show_timestamp_switch() {
-        return;
-    }
-    if area.width <= 2 || area.height <= 2 {
-        return;
-    }
-    let label = app.timestamp_toggle_label();
-    let label_width = label.chars().count() as u16;
-    if label_width == 0 {
-        return;
-    }
-    let inner = Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
-    if inner.width <= label_width {
-        return;
-    }
-    let btn_rect = Rect {
-        x: inner.x + inner.width - label_width,
-        y: inner.y,
-        width: label_width,
-        height: 1,
-    };
-    let style = if app.timestamp_switch_pressed {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
+    let mut items: Vec<ListItem> = if app.query_history.is_empty() {
+        vec![ListItem::new("No history")]
     } else {
-        Style::default().fg(Color::Yellow)
+        app.query_history
+            .iter()
+            .enumerate()
+            .map(|(i, q)| {
+                ListItem::new(format!(
+                    "#{:03} {}",
+                    i + 1,
+                    truncate_with_ellipsis(q, inner.width as usize - 6)
+                ))
+            })
+            .collect()
     };
-    frame.render_widget(
-        Paragraph::new(Text::from(Span::styled(label, style))).alignment(Alignment::Center),
-        btn_rect,
-    );
+    if items.is_empty() {
+        items.push(ListItem::new("No history"));
+    }
+    let mut state = ListState::default();
+    state.select(Some(
+        app.history_selected_index
+            .min(app.query_history.len().saturating_sub(1)),
+    ));
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .bg(ACCENT)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(PANEL));
+    frame.render_stateful_widget(list, inner, &mut state);
+}
+
+fn pill(label: &str, active: bool, focused: bool) -> Span<'static> {
+    let (fg, bg) = if active {
+        (Color::Black, ACCENT)
+    } else if focused {
+        (ACCENT_FADED, RAISED)
+    } else {
+        (Color::Gray, PANEL)
+    };
+    Span::styled(format!(" {} ", label), Style::default().fg(fg).bg(bg))
+}
+
+fn inset(area: Rect, margin: u16) -> Rect {
+    Rect {
+        x: area.x + margin,
+        y: area.y + margin,
+        width: area.width.saturating_sub(margin * 2),
+        height: area.height.saturating_sub(margin * 2),
+    }
 }
 
 fn column_label(col: &SelectItem) -> &'static str {
@@ -1609,198 +1165,12 @@ fn column_constraint(col: &SelectItem) -> Constraint {
         SelectItem::Partition => Constraint::Length(10),
         SelectItem::Offset => Constraint::Length(12),
         SelectItem::Timestamp => Constraint::Length(26),
-        SelectItem::Key => Constraint::Length(30),
-        SelectItem::Value => Constraint::Length(30),
+        SelectItem::Key => Constraint::Length(24),
+        SelectItem::Value => Constraint::Percentage(100),
     }
 }
 
-fn make_row(idx: usize, env: &MessageEnvelope, app: &AppState) -> Row<'static> {
-    let selected_row = idx == app.selected_row;
-    let mut cells = Vec::new();
-    for (col_idx, col) in app.selected_columns.iter().enumerate() {
-        let text = match col {
-            SelectItem::Value => {
-                let raw_value = env.value.as_deref().unwrap_or("null");
-                let preview = json_preview_minified(raw_value);
-                apply_hscroll(&preview, app.table_hscroll)
-            }
-            _ => column_raw_text(env, *col, app),
-        };
-        cells.push(style_cell(
-            Cell::from(text),
-            selected_row && app.selected_col == col_idx,
-        ));
-    }
-    Row::new(cells).height(1)
-}
-
-fn style_cell(mut cell: Cell<'static>, selected: bool) -> Cell<'static> {
-    if selected {
-        cell = cell.style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
-    }
-    cell
-}
-
-#[allow(dead_code)]
-fn make_json_cell_and_height(s: &str) -> (Text<'static>, u16) {
-    // Small highlighter for JSON-ish strings.
-    // If it isn't JSON, return plain text with height 1.
-    match serde_json::from_str::<serde_json::Value>(s) {
-        Ok(v) => {
-            let lines = json_to_highlighted_lines(&v);
-            let h = lines.len().max(1) as u16;
-            (Text::from(lines), h)
-        }
-        Err(_) => (Text::from(s.to_string()), 1),
-    }
-}
-
-fn json_to_highlighted_lines(v: &serde_json::Value) -> Vec<Line<'static>> {
-    // Pretty-print JSON into multiple lines with Postman-like colors:
-    // - keys: green, strings: yellow, numbers: cyan, booleans: magenta, null: dark gray, punctuation: gray
-    fn indent(depth: usize) -> Span<'static> {
-        Span::raw(" ".repeat(depth * 2))
-    }
-    fn punct(s: &str) -> Span<'static> {
-        Span::styled(s.to_string(), Style::default().fg(Color::Gray))
-    }
-    fn string_span(s: &str) -> Span<'static> {
-        let rendered = serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s));
-        Span::styled(rendered, Style::default().fg(Color::Yellow))
-    }
-    fn number_span(n: &serde_json::Number) -> Span<'static> {
-        Span::styled(n.to_string(), Style::default().fg(Color::Cyan))
-    }
-    fn bool_span(b: bool) -> Span<'static> {
-        Span::styled(b.to_string(), Style::default().fg(Color::Magenta))
-    }
-    fn null_span() -> Span<'static> {
-        Span::styled("null".to_string(), Style::default().fg(Color::DarkGray))
-    }
-
-    fn render_scalar(val: &serde_json::Value) -> Vec<Span<'static>> {
-        match val {
-            serde_json::Value::String(s) => vec![string_span(s)],
-            serde_json::Value::Number(n) => vec![number_span(n)],
-            serde_json::Value::Bool(b) => vec![bool_span(*b)],
-            serde_json::Value::Null => vec![null_span()],
-            _ => vec![Span::raw(String::new())],
-        }
-    }
-
-    fn render_value(v: &serde_json::Value, depth: usize, out: &mut Vec<Line<'static>>) {
-        match v {
-            serde_json::Value::Null
-            | serde_json::Value::Bool(_)
-            | serde_json::Value::Number(_)
-            | serde_json::Value::String(_) => {
-                let mut spans = Vec::new();
-                spans.push(indent(depth));
-                spans.extend(render_scalar(v));
-                out.push(Line::from(spans));
-            }
-            serde_json::Value::Array(arr) => {
-                if arr.is_empty() {
-                    out.push(Line::from(vec![indent(depth), punct("[]")]));
-                } else {
-                    out.push(Line::from(vec![indent(depth), punct("[")]));
-                    for (i, item) in arr.iter().enumerate() {
-                        let before_len = out.len();
-                        render_value(item, depth + 1, out);
-                        // append comma to the last rendered line for this item if not last
-                        if i + 1 != arr.len() {
-                            let idx = out.len().saturating_sub(1);
-                            if let Some(last) = out.get_mut(idx) {
-                                last.spans.push(punct(","));
-                            }
-                        }
-                        // ensure at least one line was added
-                        if out.len() == before_len {
-                            out.push(Line::from(vec![indent(depth + 1), punct("")]));
-                        }
-                    }
-                    out.push(Line::from(vec![indent(depth), punct("]")]));
-                }
-            }
-            serde_json::Value::Object(map) => {
-                if map.is_empty() {
-                    out.push(Line::from(vec![indent(depth), punct("{}")]));
-                } else {
-                    out.push(Line::from(vec![indent(depth), punct("{")]));
-                    let len = map.len();
-                    for (i, (k, val)) in map.iter().enumerate() {
-                        match val {
-                            serde_json::Value::Null
-                            | serde_json::Value::Bool(_)
-                            | serde_json::Value::Number(_)
-                            | serde_json::Value::String(_) => {
-                                let mut spans = Vec::new();
-                                spans.push(indent(depth + 1));
-                                spans.push(Span::styled(
-                                    format!("\"{}\"", k),
-                                    Style::default().fg(Color::Green),
-                                ));
-                                spans.push(punct(": "));
-                                spans.extend(render_scalar(val));
-                                if i + 1 != len {
-                                    spans.push(punct(","));
-                                }
-                                out.push(Line::from(spans));
-                            }
-                            _ => {
-                                // complex value: print key on its own line, then nested structure
-                                let mut key_line = Vec::new();
-                                key_line.push(indent(depth + 1));
-                                key_line.push(Span::styled(
-                                    format!("\"{}\"", k),
-                                    Style::default().fg(Color::Green),
-                                ));
-                                key_line.push(punct(":"));
-                                out.push(Line::from(key_line));
-
-                                let before_len = out.len();
-                                render_value(val, depth + 1, out);
-                                if i + 1 != len {
-                                    let idx = out.len().saturating_sub(1);
-                                    if let Some(last) = out.get_mut(idx) {
-                                        last.spans.push(punct(","));
-                                    }
-                                }
-                                if out.len() == before_len {
-                                    out.push(Line::from(vec![indent(depth + 1), punct("")]));
-                                }
-                            }
-                        }
-                    }
-                    out.push(Line::from(vec![indent(depth), punct("}")]));
-                }
-            }
-        }
-    }
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    render_value(v, 0, &mut lines);
-    lines
-}
-
-fn json_preview_minified(s: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(s) {
-        Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| s.to_string()),
-        Err(_) => {
-            // Use the first line only for non-JSON
-            s.lines().next().unwrap_or("").to_string()
-        }
-    }
-}
-
-fn apply_hscroll(s: &str, offset: usize) -> String {
-    if offset == 0 {
-        return s.to_string();
-    }
-    s.chars().skip(offset).collect()
-}
-
-fn column_raw_text(env: &MessageEnvelope, col: SelectItem, app: &AppState) -> String {
+fn column_text(env: &MessageEnvelope, col: SelectItem, app: &AppState) -> String {
     match col {
         SelectItem::Partition => env.partition.to_string(),
         SelectItem::Offset => env.offset.to_string(),
@@ -1810,120 +1180,225 @@ fn column_raw_text(env: &MessageEnvelope, col: SelectItem, app: &AppState) -> St
     }
 }
 
-fn column_width_hint(col: SelectItem) -> usize {
-    match col {
-        SelectItem::Partition => 10,
-        SelectItem::Offset => 12,
-        SelectItem::Timestamp => 26,
-        SelectItem::Key => 30,
-        SelectItem::Value => 40,
+fn selected_topic_label(app: &AppState) -> String {
+    if let Some(name) = app
+        .topic_picker
+        .matches
+        .get(app.topic_picker.selected)
+        .and_then(|idx| app.topics.get(*idx))
+    {
+        format!("Topic: {}", name)
+    } else {
+        "Topic: none selected".to_string()
     }
 }
 
-fn has_value_column(app: &AppState) -> bool {
-    app.selected_columns
-        .iter()
-        .any(|c| matches!(c, SelectItem::Value))
-}
-
-fn estimate_table_content_width(app: &AppState) -> usize {
-    // Approximate widths of fixed columns + spacing + average key/value preview length
-    let mut fixed = 0usize;
-    for (idx, col) in app.selected_columns.iter().enumerate() {
-        if idx > 0 {
-            fixed = fixed.saturating_add(1);
-        }
-        match col {
-            SelectItem::Value => {}
-            _ => fixed = fixed.saturating_add(column_width_hint(*col)),
-        }
-    }
-    if !has_value_column(app) {
-        return fixed;
-    }
-    let mut max_preview = 0usize;
-    for env in &app.rows {
-        let raw = env.value.as_deref().unwrap_or("null");
-        let p = json_preview_minified(raw);
-        max_preview = max_preview.max(p.chars().count());
-    }
-    fixed + max_preview
-}
-
-fn draw_json_detail(frame: &mut Frame, area: Rect, app: &AppState) {
-    // Show the currently selected cell content with wrapping and vertical scroll
-    let (title_suffix, raw) = selected_cell_for_detail(app);
-    let title = format!("Details ({})", title_suffix);
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let inner_area = block.inner(area);
-    frame.render_widget(block, area);
-
-    // Build Text using existing highlighter
-    let text: Text = match raw.as_deref() {
-        Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
-            Ok(v) => Text::from(json_to_highlighted_lines(&v)),
-            Err(_) => Text::from(s.to_string()),
-        },
-        None => Text::from(""),
-    };
-
-    let para = Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .scroll((app.json_vscroll, 0));
-    frame.render_widget(para, inner_area);
-
-    // Draw Copy button at top-right of inner area
-    let btn_w = COPY_BTN_LABEL.chars().count() as u16;
-    if inner_area.width > btn_w {
-        let btn_rect = Rect {
-            x: inner_area.x + inner_area.width - btn_w,
-            y: inner_area.y,
-            width: btn_w,
-            height: 1,
-        };
-        let style = if app.copy_btn_pressed {
-            // pressed look
-            Style::default().fg(Color::Black).bg(Color::LightYellow)
-        } else {
-            // raised look
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        };
-        let btn = Paragraph::new(COPY_BTN_LABEL).style(style);
-        frame.render_widget(btn, btn_rect);
-    }
-
-    // Vertical scrollbar for JSON
-    // Estimate content length by lines (simple; Paragraph wrap may change it, but this is sufficient)
-    let content_len = match raw.as_deref() {
-        Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
-            Ok(v) => json_to_highlighted_lines(&v).len(),
-            Err(_) => s.lines().count(),
-        },
-        None => 0,
-    };
-    if content_len > 0 {
-        let mut vs = ScrollbarState::new(content_len)
-            .position(app.json_vscroll.min((content_len.saturating_sub(1)) as u16) as usize);
-        let vbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        frame.render_stateful_widget(vbar, area, &mut vs);
-    }
-}
-
-fn selected_cell_for_detail(app: &AppState) -> (String, Option<String>) {
+fn selected_detail(app: &AppState) -> (String, Option<Text<'static>>) {
     if app.rows.is_empty() || app.selected_columns.is_empty() {
         return ("none".to_string(), None);
     }
-    let idx = app.selected_row.min(app.rows.len() - 1);
-    let env = &app.rows[idx];
-    let col_idx = app
+    let row = app.selected_row.min(app.rows.len().saturating_sub(1));
+    let col = app
         .selected_col
         .min(app.selected_columns.len().saturating_sub(1));
-    let col = app.selected_columns[col_idx];
-    (
-        column_label(&col).to_string(),
-        Some(column_raw_text(env, col, app)),
-    )
+    let env = &app.rows[row];
+    let col_name = column_label(&app.selected_columns[col]);
+    let raw = column_text(env, app.selected_columns[col], app);
+    let text = if app.selected_columns[col] == SelectItem::Value {
+        render_json_text(&raw)
+    } else {
+        Text::from(raw)
+    };
+    (col_name.to_string(), Some(text))
+}
+
+fn paragraph_len(text: Option<&Text<'_>>) -> usize {
+    text.map(|t| t.lines.len()).unwrap_or_default()
+}
+
+fn render_json_text(raw: &str) -> Text<'static> {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) => Text::from(json_lines(&v, 0)),
+        Err(_) => Text::from(raw.to_string()),
+    }
+}
+
+fn json_lines(v: &serde_json::Value, depth: usize) -> Vec<Line<'static>> {
+    fn render(
+        v: &serde_json::Value,
+        depth: usize,
+        prefix: Option<&str>,
+        out: &mut Vec<Line<'static>>,
+    ) {
+        let indent = "  ".repeat(depth);
+        match v {
+            serde_json::Value::Null => out.push(Line::from(vec![
+                Span::raw(indent),
+                prefix_span(prefix),
+                Span::styled("null", Style::default().fg(Color::DarkGray)),
+            ])),
+            serde_json::Value::Bool(b) => out.push(Line::from(vec![
+                Span::raw(indent),
+                prefix_span(prefix),
+                Span::styled(b.to_string(), Style::default().fg(Color::Magenta)),
+            ])),
+            serde_json::Value::Number(n) => out.push(Line::from(vec![
+                Span::raw(indent),
+                prefix_span(prefix),
+                Span::styled(n.to_string(), Style::default().fg(Color::Cyan)),
+            ])),
+            serde_json::Value::String(s) => out.push(Line::from(vec![
+                Span::raw(indent),
+                prefix_span(prefix),
+                Span::styled(
+                    serde_json::to_string(s).unwrap_or_else(|_| s.to_string()),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ])),
+            serde_json::Value::Array(arr) => {
+                let mut first_line = vec![Span::raw(indent.clone()), prefix_span(prefix)];
+                first_line.push(Span::styled("[", Style::default().fg(Color::Gray)));
+                out.push(Line::from(first_line));
+                for (i, item) in arr.iter().enumerate() {
+                    let before = out.len();
+                    render(item, depth + 1, None, out);
+                    if let Some(last) = out.last_mut() {
+                        if i + 1 != arr.len() {
+                            last.spans.push(Span::styled(",", Style::default().fg(Color::Gray)));
+                        }
+                    }
+                    if out.len() == before {
+                        out.push(Line::from("  "));
+                    }
+                }
+                out.push(Line::from(vec![
+                    Span::raw(indent),
+                    Span::styled("]", Style::default().fg(Color::Gray)),
+                ]));
+            }
+            serde_json::Value::Object(map) => {
+                let mut first_line = vec![Span::raw(indent.clone()), prefix_span(prefix)];
+                first_line.push(Span::styled("{", Style::default().fg(Color::Gray)));
+                out.push(Line::from(first_line));
+                let len = map.len();
+                for (i, (k, val)) in map.iter().enumerate() {
+                    let key_prefix = format!("\"{}\": ", k);
+                    let before = out.len();
+                    render(val, depth + 1, Some(&key_prefix), out);
+                    if let Some(last) = out.last_mut() {
+                        if i + 1 != len {
+                            last.spans.push(Span::styled(",", Style::default().fg(Color::Gray)));
+                        }
+                    }
+                    if out.len() == before {
+                        out.push(Line::from("  "));
+                    }
+                }
+                out.push(Line::from(vec![
+                    Span::raw(indent),
+                    Span::styled("}", Style::default().fg(Color::Gray)),
+                ]));
+            }
+        }
+    }
+
+    fn prefix_span(prefix: Option<&str>) -> Span<'static> {
+        match prefix {
+            Some(p) => Span::styled(p.to_string(), Style::default().fg(Color::Green)),
+            None => Span::raw(""),
+        }
+    }
+
+    let mut out = Vec::new();
+    render(v, depth, None, &mut out);
+    out
+}
+
+fn json_preview(raw: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| raw.to_string()),
+        Err(_) => raw.lines().next().unwrap_or("").to_string(),
+    }
+}
+
+fn apply_hscroll(s: &str, offset: usize) -> String {
+    if offset == 0 {
+        s.to_string()
+    } else {
+        s.chars().skip(offset).collect()
+    }
+}
+
+fn record_detail_text(app: &AppState) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+    if app.rows.is_empty() || app.selected_row >= app.rows.len() {
+        return (vec![Line::from("No record")], vec![]);
+    }
+    let env = &app.rows[app.selected_row];
+    let mut meta = Vec::new();
+    meta.push(Line::from(vec![
+        Span::styled("Partition ", Style::default().fg(ACCENT_FADED)),
+        Span::raw(env.partition.to_string()),
+        Span::raw("   "),
+        Span::styled("Offset ", Style::default().fg(ACCENT_FADED)),
+        Span::raw(env.offset.to_string()),
+    ]));
+    meta.push(Line::from(vec![
+        Span::styled("Timestamp ", Style::default().fg(ACCENT_FADED)),
+        Span::raw(fmt_ts(env.timestamp_ms, app.timestamps_use_utc)),
+    ]));
+    let key_text = if env.key.is_empty() {
+        "(empty)".to_string()
+    } else {
+        env.key.clone()
+    };
+    meta.push(Line::from(vec![
+        Span::styled("Key ", Style::default().fg(ACCENT_FADED)),
+        Span::raw(key_text),
+    ]));
+
+    let body = if let Some(v) = env.value.as_ref() {
+        json_lines(&serde_json::from_str::<serde_json::Value>(v).unwrap_or(serde_json::Value::Null), 0)
+    } else {
+        vec![Line::from("null")]
+    };
+    (meta, body)
+}
+
+fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i + 1 >= max {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+pub fn help_content_line_count() -> usize {
+    HELP_LINES.len()
 }
