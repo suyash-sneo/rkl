@@ -49,7 +49,7 @@ static HELP_LINES: &[&str] = &[
     "  • Shift-Left/Right scroll columns; timestamp toggle top-right",
     "",
     "Environments",
-    "  • F4 save, F5 test, F6/F7 cycle envs, Ctrl-Left/Right switches PEM tab",
+    "  • /s save, /t test, /n new, /d delete, /] /[ cycle envs, /] /[ switches PEM tab",
     "",
     "General",
     "  • Copy/paste works in text areas; status log scrolls with mouse/keys",
@@ -383,19 +383,19 @@ fn render_labeled_textarea(
 }
 
 fn draw_results(frame: &mut Frame, area: Rect, app: &AppState) {
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(5)])
-        .split(area);
-    draw_results_header(frame, layout[0], app);
-
-    let body = Layout::default()
+    let columns = Layout::default()
         .direction(Direction::Horizontal)
         .spacing(PANEL_GAP)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(layout[1]);
-    draw_results_table(frame, body[0], app);
-    draw_detail_preview(frame, body[1], app);
+        .split(area);
+
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .split(columns[0]);
+    draw_results_header(frame, left[0], app);
+    draw_results_table(frame, left[1], app);
+    draw_detail_preview(frame, columns[1], app);
 }
 
 fn draw_results_header(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -651,7 +651,7 @@ fn draw_envs(frame: &mut Frame, area: Rect, app: &AppState) {
 
 fn draw_env_header(frame: &mut Frame, area: Rect) {
     frame.render_widget(
-        Paragraph::new("Environments — F4 save • F5 test • Ctrl-Left/Right switch PEM")
+        Paragraph::new("Environments — /n new • /d delete • /s save • /t test • /] /[ cycle")
             .style(Style::default().bg(RAISED).fg(Color::White)),
         area,
     );
@@ -671,11 +671,19 @@ fn draw_env_list(frame: &mut Frame, area: Rect, app: &AppState) {
         Some(EnvFieldFocus::List)
     );
     let list = List::new(items)
+        .style(Style::default().bg(if focused { RAISED } else { PANEL }))
         .highlight_style(
-            Style::default()
-                .bg(ACCENT)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
+            if focused {
+                Style::default()
+                    .bg(ACCENT)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .bg(ROW_HL)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            },
         )
         .block(
             Block::default()
@@ -764,7 +772,7 @@ fn draw_pem_tabs(frame: &mut Frame, area: Rect, ed: &EnvEditor, focused: bool) {
         spans.push(Span::raw(" "));
         spans.push(pill(label, active, focused));
     }
-    spans.push(Span::raw("    Ctrl-Left/Right switches"));
+    spans.push(Span::raw("    /] /[ switches tabs"));
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
         area,
@@ -834,11 +842,11 @@ fn draw_env_connection(frame: &mut Frame, area: Rect, app: &AppState, focused: b
     }
 
     let actions = Line::from(vec![
-        Span::styled("F4 Save", Style::default().fg(POSITIVE)),
+        Span::styled("/s Save", Style::default().fg(POSITIVE)),
         Span::raw("  "),
-        Span::styled("F5 Test", Style::default().fg(ACCENT)),
+        Span::styled("/t Test", Style::default().fg(ACCENT)),
         Span::raw("  "),
-        Span::styled("F6/F7 Cycle  Esc Home", Style::default().fg(Color::Gray)),
+        Span::styled("/] /[ Cycle  Esc Home", Style::default().fg(Color::Gray)),
     ]);
     frame.render_widget(
         Paragraph::new(actions).style(Style::default().bg(PANEL)),

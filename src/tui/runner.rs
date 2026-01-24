@@ -909,6 +909,74 @@ fn attempt_save_app_config(app: &mut AppState) {
     }
 }
 
+fn add_env_profile(app: &mut AppState) {
+    let name = next_unique_env_name(&app.env_store.envs);
+    app.env_store.envs.push(Environment {
+        name: name.clone(),
+        host: String::new(),
+        private_key_pem: None,
+        public_key_pem: None,
+        ssl_ca_pem: None,
+    });
+    let idx = app.env_store.envs.len().saturating_sub(1);
+    app.env_store.selected = Some(idx);
+    if let Some(env) = app.env_store.envs.get(idx) {
+        let mut editor = build_env_editor_from_env(env, Some(idx));
+        editor.name_cursor = editor.name.len();
+        editor.host_cursor = editor.host.len();
+        app.env_editor = Some(editor);
+    }
+}
+
+fn delete_selected_env(app: &mut AppState) {
+    if let Some(i) = app.env_store.selected {
+        if i < app.env_store.envs.len() {
+            app.env_store.envs.remove(i);
+            app.env_store.selected = if app.env_store.envs.is_empty() {
+                None
+            } else {
+                Some(i.min(app.env_store.envs.len() - 1))
+            };
+            let _ = app.env_store.save();
+            sync_env_editor_to_selection(app);
+        }
+    }
+}
+
+fn move_pem_tab(ed: &mut EnvEditor, delta: isize) {
+    let order = [
+        EnvPemField::PrivateKey,
+        EnvPemField::PublicKey,
+        EnvPemField::Ca,
+    ];
+    let len = order.len() as isize;
+    let idx = order
+        .iter()
+        .position(|f| *f == ed.active_pem)
+        .unwrap_or(0) as isize;
+    let mut next = idx + delta;
+    if next < 0 {
+        next = len - 1;
+    } else if next >= len {
+        next = 0;
+    }
+    ed.active_pem = order[next as usize];
+}
+
+fn apply_pem_input(ed: &mut EnvEditor, input: TAInput) {
+    match ed.active_pem {
+        EnvPemField::PrivateKey => {
+            ed.ta_private.input(input);
+        }
+        EnvPemField::PublicKey => {
+            ed.ta_public.input(input);
+        }
+        EnvPemField::Ca => {
+            ed.ta_ca.input(input);
+        }
+    }
+}
+
 fn move_env_selection(app: &mut AppState, delta: isize) {
     if app.env_store.envs.is_empty() {
         return;
@@ -1667,6 +1735,90 @@ async fn handle_home_key(
 fn handle_env_key(app: &mut AppState, key: KeyEvent, tx_evt: &mpsc::UnboundedSender<TuiEvent>) {
     let code = key.code;
     let modifiers = key.modifiers;
+    let focus = app.env_editor.as_ref().map(|ed| ed.field_focus);
+    let pem_focus = matches!(focus, Some(EnvFieldFocus::PemEditor));
+    let mut insert_pending_slash = false;
+
+    if modifiers.is_empty() {
+        if matches!(code, KeyCode::Char('/')) {
+            let text_focus = matches!(focus, Some(EnvFieldFocus::Name | EnvFieldFocus::Host));
+            if text_focus {
+                // Allow raw slash input in text fields.
+            } else if app.slash_pending {
+                app.slash_pending = false;
+                open_command_palette(app);
+                return;
+            } else {
+                app.slash_pending = true;
+                return;
+            }
+        }
+        if app.slash_pending {
+            app.slash_pending = false;
+            match code {
+                KeyCode::Char('s') => {
+                    save_env_from_editor(app);
+                    return;
+                }
+                KeyCode::Char('t') => {
+                    start_env_connection_test(app, tx_evt.clone());
+                    return;
+                }
+                KeyCode::Char('n') => {
+                    add_env_profile(app);
+                    return;
+                }
+                KeyCode::Char('d') => {
+                    delete_selected_env(app);
+                    return;
+                }
+                KeyCode::Char(']') => {
+                    if pem_focus {
+                        if let Some(ed) = app.env_editor.as_mut() {
+                            move_pem_tab(ed, 1);
+                        }
+                    } else {
+                        move_env_selection(app, 1);
+                    }
+                    return;
+                }
+                KeyCode::Char('[') => {
+                    if pem_focus {
+                        if let Some(ed) = app.env_editor.as_mut() {
+                            move_pem_tab(ed, -1);
+                        }
+                    } else {
+                        move_env_selection(app, -1);
+                    }
+                    return;
+                }
+                KeyCode::Char('p') => {
+                    open_command_palette(app);
+                    return;
+                }
+                _ => {}
+            }
+            if pem_focus {
+                insert_pending_slash = true;
+            }
+        }
+    } else if !matches!(code, KeyCode::Char('/')) {
+        app.slash_pending = false;
+    }
+
+    if insert_pending_slash {
+        if let Some(ed) = app.env_editor.as_mut() {
+            apply_pem_input(
+                ed,
+                TAInput {
+                    key: TAKey::Char('/'),
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                },
+            );
+        }
+    }
     if matches!(code, KeyCode::Esc) {
         app.screen = Screen::Home;
         return;
@@ -1711,37 +1863,11 @@ fn handle_env_key(app: &mut AppState, key: KeyEvent, tx_evt: &mpsc::UnboundedSen
 
     match code {
         KeyCode::F(1) => {
-            let name = next_unique_env_name(&app.env_store.envs);
-            app.env_store.envs.push(Environment {
-                name: name.clone(),
-                host: String::new(),
-                private_key_pem: None,
-                public_key_pem: None,
-                ssl_ca_pem: None,
-            });
-            let idx = app.env_store.envs.len().saturating_sub(1);
-            app.env_store.selected = Some(idx);
-            if let Some(env) = app.env_store.envs.get(idx) {
-                let mut editor = build_env_editor_from_env(env, Some(idx));
-                editor.name_cursor = editor.name.len();
-                editor.host_cursor = editor.host.len();
-                app.env_editor = Some(editor);
-            }
+            add_env_profile(app);
             return;
         }
         KeyCode::F(3) => {
-            if let Some(i) = app.env_store.selected {
-                if i < app.env_store.envs.len() {
-                    app.env_store.envs.remove(i);
-                    app.env_store.selected = if app.env_store.envs.is_empty() {
-                        None
-                    } else {
-                        Some(i.min(app.env_store.envs.len() - 1))
-                    };
-                    let _ = app.env_store.save();
-                    sync_env_editor_to_selection(app);
-                }
-            }
+            delete_selected_env(app);
             return;
         }
         KeyCode::F(4) => {
@@ -1763,7 +1889,6 @@ fn handle_env_key(app: &mut AppState, key: KeyEvent, tx_evt: &mpsc::UnboundedSen
         _ => {}
     }
 
-    let focus = app.env_editor.as_ref().map(|ed| ed.field_focus);
     if matches!(focus, Some(EnvFieldFocus::List)) {
         match code {
             KeyCode::Up => move_env_selection(app, -1),
@@ -1812,29 +1937,10 @@ fn handle_env_key(app: &mut AppState, key: KeyEvent, tx_evt: &mpsc::UnboundedSen
             if modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(code, KeyCode::Left | KeyCode::Right)
             {
-                ed.active_pem = match (ed.active_pem, code) {
-                    (EnvPemField::PrivateKey, KeyCode::Left) => EnvPemField::Ca,
-                    (EnvPemField::PrivateKey, KeyCode::Right) => EnvPemField::PublicKey,
-                    (EnvPemField::PublicKey, KeyCode::Left) => EnvPemField::PrivateKey,
-                    (EnvPemField::PublicKey, KeyCode::Right) => EnvPemField::Ca,
-                    (EnvPemField::Ca, KeyCode::Left) => EnvPemField::PublicKey,
-                    (EnvPemField::Ca, KeyCode::Right) => EnvPemField::PrivateKey,
-                    (cur, _) => cur,
-                };
+                move_pem_tab(ed, if matches!(code, KeyCode::Left) { -1 } else { 1 });
                 return;
             }
-            let input = ta_input_from_key(key);
-            match ed.active_pem {
-                EnvPemField::PrivateKey => {
-                    ed.ta_private.input(input);
-                }
-                EnvPemField::PublicKey => {
-                    ed.ta_public.input(input);
-                }
-                EnvPemField::Ca => {
-                    ed.ta_ca.input(input);
-                }
-            }
+            apply_pem_input(ed, ta_input_from_key(key));
         }
         EnvFieldFocus::Conn | EnvFieldFocus::Buttons | EnvFieldFocus::List => {}
     }
