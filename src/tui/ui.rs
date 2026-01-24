@@ -25,6 +25,7 @@ const ACCENT: Color = Color::Cyan; // buttons/pills
 const ACCENT_FADED: Color = Color::Gray;
 const POSITIVE: Color = Color::Green;
 const NEGATIVE: Color = Color::Red;
+const PANEL_GAP: u16 = 1;
 
 static HELP_LINES: &[&str] = &[
     "Home",
@@ -55,13 +56,14 @@ static HELP_LINES: &[&str] = &[
 ];
 
 pub fn draw(frame: &mut Frame, app: &AppState) {
+    let area = inset(frame.area(), PANEL_GAP);
     match app.screen {
-        Screen::Home => draw_home(frame, frame.area(), app),
-        Screen::Envs => draw_envs(frame, frame.area(), app),
-        Screen::Info => draw_info(frame, frame.area(), app),
-        Screen::AppConfig => draw_app_config(frame, frame.area(), app),
-        Screen::Help => draw_help(frame, frame.area(), app),
-        Screen::RecordDetail => draw_record_detail(frame, frame.area(), app),
+        Screen::Home => draw_home(frame, area, app),
+        Screen::Envs => draw_envs(frame, area, app),
+        Screen::Info => draw_info(frame, area, app),
+        Screen::AppConfig => draw_app_config(frame, area, app),
+        Screen::Help => draw_help(frame, area, app),
+        Screen::RecordDetail => draw_record_detail(frame, area, app),
     }
 
     if app.command_palette.open {
@@ -75,6 +77,7 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
 fn draw_home(frame: &mut Frame, area: Rect, app: &AppState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
+        .spacing(PANEL_GAP)
         .constraints([Constraint::Length(2), Constraint::Min(14), Constraint::Length(6)])
         .split(area);
 
@@ -82,6 +85,7 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &AppState) {
 
     let workspace = Layout::default()
         .direction(Direction::Vertical)
+        .spacing(PANEL_GAP)
         .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
         .split(layout[1]);
 
@@ -139,8 +143,9 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &AppState) {
 fn draw_controls(frame: &mut Frame, area: Rect, app: &AppState) {
     let inner = Layout::default()
         .direction(Direction::Horizontal)
+        .spacing(PANEL_GAP)
         .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
-        .split(inset(area, 1));
+        .split(area);
 
     draw_topic_panel(frame, inner[0], app);
     match app.query_mode {
@@ -156,7 +161,7 @@ fn draw_topic_panel(frame: &mut Frame, area: Rect, app: &AppState) {
         .title_alignment(Alignment::Left)
         .style(Style::default().bg(PANEL));
     frame.render_widget(block, area);
-    let inner = inset(area, 1);
+    let inner = inset(area, PANEL_GAP);
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -211,7 +216,7 @@ fn draw_basic_query(frame: &mut Frame, area: Rect, app: &AppState) {
         .title_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(PANEL));
     frame.render_widget(block, area);
-    let inner = inset(area, 1);
+    let inner = inset(area, PANEL_GAP);
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -301,7 +306,7 @@ fn draw_advanced_query(frame: &mut Frame, area: Rect, app: &AppState) {
         .title_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(PANEL));
     frame.render_widget(block, area);
-    let inner = inset(area, 1);
+    let inner = inset(area, PANEL_GAP);
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -386,6 +391,7 @@ fn draw_results(frame: &mut Frame, area: Rect, app: &AppState) {
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
+        .spacing(PANEL_GAP)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(layout[1]);
     draw_results_table(frame, body[0], app);
@@ -556,7 +562,7 @@ fn draw_detail_preview(frame: &mut Frame, area: Rect, app: &AppState) {
         .title_style(Style::default().fg(ACCENT_FADED))
         .style(Style::default().bg(if focused { RAISED } else { PANEL }));
     frame.render_widget(block, area);
-    let inner = inset(area, 1);
+    let inner = inset(area, PANEL_GAP);
 
     let text = body
         .as_ref()
@@ -607,7 +613,7 @@ fn draw_status_log(frame: &mut Frame, area: Rect, app: &AppState) {
         .title("Status")
         .title_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(PANEL));
-    let inner = inset(area, 1);
+    let inner = inset(area, PANEL_GAP);
     frame.render_widget(block, area);
     frame.render_widget(
         Paragraph::new(Text::from(lines.clone()))
@@ -628,14 +634,16 @@ fn draw_status_log(frame: &mut Frame, area: Rect, app: &AppState) {
 fn draw_envs(frame: &mut Frame, area: Rect, app: &AppState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
+        .spacing(PANEL_GAP)
         .constraints([Constraint::Length(3), Constraint::Min(8), Constraint::Length(6)])
         .split(area);
     draw_env_header(frame, layout[0]);
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
+        .spacing(PANEL_GAP)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(inset(layout[1], 1));
+        .split(layout[1]);
     draw_env_list(frame, body[0], app);
     draw_env_editor(frame, body[1], app);
     draw_status_log(frame, layout[2], app);
@@ -685,13 +693,12 @@ fn draw_env_editor(frame: &mut Frame, area: Rect, app: &AppState) {
             .map(|e| e.field_focus == f)
             .unwrap_or(false)
     };
-    let inner = inset(area, 1);
     let ed = match app.env_editor.as_ref() {
         Some(v) => v,
         None => {
             frame.render_widget(
                 Paragraph::new("No environment").style(Style::default().bg(PANEL)),
-                inner,
+                area,
             );
             return;
         }
@@ -705,7 +712,7 @@ fn draw_env_editor(frame: &mut Frame, area: Rect, app: &AppState) {
             Constraint::Min(6),
             Constraint::Length(5),
         ])
-        .split(inner);
+        .split(area);
 
     render_single_line(
         frame,
@@ -778,7 +785,7 @@ fn render_single_line(
         .title_style(Style::default().fg(ACCENT_FADED))
         .style(Style::default().bg(if focused { RAISED } else { PANEL }));
     frame.render_widget(block, area);
-    let inner = inset(area, 1);
+    let inner = inset(area, PANEL_GAP);
     frame.render_widget(
         Paragraph::new(text.to_string())
             .style(Style::default().bg(if focused { RAISED } else { PANEL })),
@@ -812,7 +819,7 @@ fn draw_env_connection(frame: &mut Frame, area: Rect, app: &AppState, focused: b
         .title_style(Style::default().fg(ACCENT_FADED))
         .style(Style::default().bg(if focused { RAISED } else { PANEL }));
     frame.render_widget(block, area);
-    let inner = inset(area, 1);
+    let inner = inset(area, PANEL_GAP);
     frame.render_widget(
         Paragraph::new(Text::from(lines.clone()))
             .scroll((app.env_conn_vscroll, 0))
@@ -847,6 +854,7 @@ fn draw_env_connection(frame: &mut Frame, area: Rect, app: &AppState, focused: b
 fn draw_info(frame: &mut Frame, area: Rect, app: &AppState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
+        .spacing(PANEL_GAP)
         .constraints([Constraint::Length(3), Constraint::Min(5)])
         .split(area);
     frame.render_widget(
@@ -860,8 +868,13 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &AppState) {
 fn draw_app_config(frame: &mut Frame, area: Rect, app: &AppState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
+        .spacing(PANEL_GAP)
+        .constraints([Constraint::Length(3), Constraint::Min(2)])
+        .split(area);
+
+    let body = Layout::default()
+        .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
@@ -869,7 +882,7 @@ fn draw_app_config(frame: &mut Frame, area: Rect, app: &AppState) {
             Constraint::Length(3),
             Constraint::Min(2),
         ])
-        .split(area);
+        .split(layout[1]);
 
     let header = Paragraph::new("App config — Tab/Shift-Tab moves • Enter toggles/save • Esc back")
         .style(Style::default().bg(RAISED));
@@ -880,7 +893,7 @@ fn draw_app_config(frame: &mut Frame, area: Rect, app: &AppState) {
     };
     render_single_line(
         frame,
-        layout[1],
+        body[0],
         &ed.query_scan_multiplier,
         ed.query_scan_multiplier.len(),
         "Query scan multiplier",
@@ -888,7 +901,7 @@ fn draw_app_config(frame: &mut Frame, area: Rect, app: &AppState) {
     );
     render_single_line(
         frame,
-        layout[2],
+        body[1],
         &ed.default_limit,
         ed.default_limit.len(),
         "Default LIMIT (empty = auto)",
@@ -897,8 +910,9 @@ fn draw_app_config(frame: &mut Frame, area: Rect, app: &AppState) {
 
     let order_row = Layout::default()
         .direction(Direction::Horizontal)
+        .spacing(PANEL_GAP)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(layout[3]);
+        .split(body[2]);
     let mut spans = Vec::new();
     spans.push(Span::styled("Order field ", Style::default().fg(Color::Gray)));
     for (i, label) in ["timestamp", "poffset", "poffset_ts"].iter().enumerate() {
@@ -941,7 +955,7 @@ fn draw_app_config(frame: &mut Frame, area: Rect, app: &AppState) {
     }
     frame.render_widget(
         Paragraph::new(Line::from(ts_spans)).style(Style::default().bg(PANEL)),
-        layout[4],
+        body[3],
     );
 
     let actions_style = if matches!(ed.field_focus, AppConfigFieldFocus::Buttons) {
@@ -954,7 +968,7 @@ fn draw_app_config(frame: &mut Frame, area: Rect, app: &AppState) {
     };
     let actions = Paragraph::new("[Enter] save  •  [Backspace] reset field  •  Esc back")
         .style(actions_style);
-    frame.render_widget(actions, layout[5]);
+    frame.render_widget(actions, body[4]);
 
     let summary = format!(
         "Defaults: order {} {}, limit {}, timestamps {}",
@@ -973,7 +987,7 @@ fn draw_app_config(frame: &mut Frame, area: Rect, app: &AppState) {
     );
     frame.render_widget(
         Paragraph::new(summary).style(Style::default().fg(Color::Gray)),
-        layout[6],
+        body[5],
     );
 }
 
@@ -983,7 +997,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &AppState) {
         .title("Help")
         .style(Style::default().bg(PANEL));
     frame.render_widget(block, area);
-    let inner = inset(area, 1);
+    let inner = inset(area, PANEL_GAP);
     let lines: Vec<Line> = HELP_LINES
         .iter()
         .map(|l| Line::from(*l))
@@ -1002,11 +1016,16 @@ fn draw_record_detail(frame: &mut Frame, area: Rect, app: &AppState) {
         .style(Style::default().bg(RAISED));
     let layout = Layout::default()
         .direction(Direction::Vertical)
+        .spacing(PANEL_GAP)
         .constraints([Constraint::Length(2), Constraint::Min(5)])
         .split(area);
     frame.render_widget(header, layout[0]);
 
-    let body_area = inset(layout[1], 1);
+    let body_block = Block::default()
+        .borders(Borders::NONE)
+        .style(Style::default().bg(PANEL));
+    frame.render_widget(body_block, layout[1]);
+    let body_area = inset(layout[1], PANEL_GAP);
     let (meta, body) = record_detail_text(app);
     let mut content = Vec::new();
     content.extend(meta);
@@ -1027,9 +1046,10 @@ fn draw_command_palette(frame: &mut Frame, area: Rect, app: &AppState) {
         .title("Command palette")
         .style(Style::default().bg(PANEL));
     frame.render_widget(block, popup);
-    let inner = inset(popup, 1);
+    let inner = inset(popup, PANEL_GAP);
     let layout = Layout::default()
         .direction(Direction::Vertical)
+        .spacing(PANEL_GAP)
         .constraints([Constraint::Length(3), Constraint::Min(4)])
         .split(inner);
 
@@ -1069,7 +1089,7 @@ fn draw_history_popup(frame: &mut Frame, area: Rect, app: &AppState) {
         .title("Query history")
         .style(Style::default().bg(PANEL));
     frame.render_widget(block, popup);
-    let inner = inset(popup, 1);
+    let inner = inset(popup, PANEL_GAP);
 
     let mut items: Vec<ListItem> = if app.query_history.is_empty() {
         vec![ListItem::new("No history")]
