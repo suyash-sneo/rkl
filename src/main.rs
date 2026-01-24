@@ -13,7 +13,7 @@ use app_config::AppConfig;
 use args::{Cli, Commands, RunArgs};
 use clap::Parser;
 use colored::*;
-use consumer::spawn_partition_consumer;
+use consumer::{spawn_partition_consumer, GlobalLimit};
 use merger::run_merger;
 use models::{MessageEnvelope, OffsetSpec, SslConfig};
 use output::TableOutput;
@@ -126,23 +126,18 @@ async fn main() -> Result<()> {
                     ast.order = Some(OrderSpec { field, dir });
                 }
             }
-            let (max_messages, order_desc, query_limit, global_sort_by_timestamp) =
+            let (max_messages, order_desc, global_sort_by_timestamp) =
                 if let Some(ast) = query_ast.as_ref() {
                     let base_limit = ast
                         .limit
                         .or(args.max_messages)
-                        .or_else(|| app_config.default_limit)
-                        .or_else(|| Some(app_config.query_scan_multiplier * partition_count));
+                        .or_else(|| app_config.default_limit);
                     let plan = ast.execution_plan(partition_count, base_limit);
-                    (
-                        Some(plan.n_global),
-                        plan.order_desc,
-                        plan.per_partition_limit,
-                        plan.global_sort_by_timestamp,
-                    )
+                    (plan.n_global, plan.order_desc, plan.global_sort_by_timestamp)
                 } else {
-                    (args.max_messages, false, None, true)
+                    (args.max_messages, false, true)
                 };
+            let global_limit = max_messages.map(GlobalLimit::new);
 
             // Message channel: producers = partition tasks, consumer = merger task
             let (tx, rx) = mpsc::channel::<MessageEnvelope>(args.channel_capacity);
@@ -161,7 +156,7 @@ async fn main() -> Result<()> {
                     a.max_messages = None;
                 }
                 let q = query_arc.clone();
-                let limit = query_limit;
+                let limit = global_limit.clone();
                 let ssl = if args.ssl_ca_pem.is_some()
                     || args.ssl_certificate_pem.is_some()
                     || args.ssl_key_pem.is_some()
@@ -333,23 +328,18 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
         }
 
         let (tx, rx) = mpsc::channel::<MessageEnvelope>(args.channel_capacity);
-        let (max_messages, order_desc, query_limit, global_sort_by_timestamp) =
+        let (max_messages, order_desc, global_sort_by_timestamp) =
             if let Some(ast) = query_ast.as_ref() {
                 let base_limit = ast
                     .limit
                     .or(args.max_messages)
-                    .or_else(|| app_config.default_limit)
-                    .or_else(|| Some(app_config.query_scan_multiplier * partition_count));
+                    .or_else(|| app_config.default_limit);
                 let plan = ast.execution_plan(partition_count, base_limit);
-                (
-                    Some(plan.n_global),
-                    plan.order_desc,
-                    plan.per_partition_limit,
-                    plan.global_sort_by_timestamp,
-                )
+                (plan.n_global, plan.order_desc, plan.global_sort_by_timestamp)
             } else {
-                (args.max_messages, false, None, true)
+                (args.max_messages, false, true)
             };
+        let global_limit = max_messages.map(GlobalLimit::new);
         let mut joinset = JoinSet::new();
         let offset_spec = OffsetSpec::from_str(&args.offset).unwrap_or(OffsetSpec::Beginning);
         let query_arc = query_ast.clone().map(std::sync::Arc::new);
@@ -362,7 +352,7 @@ async fn run_once_cli(args: RunArgs) -> Result<()> {
                 a.max_messages = None;
             }
             let q = query_arc.clone();
-            let limit = query_limit;
+            let limit = global_limit.clone();
             let ssl = if args.ssl_ca_pem.is_some()
                 || args.ssl_certificate_pem.is_some()
                 || args.ssl_key_pem.is_some()

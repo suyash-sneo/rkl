@@ -386,7 +386,7 @@ pub enum TuiEvent {
     TopicsWithPartitions(Vec<(String, usize)>),
     QueryPlan {
         run_id: u64,
-        planned_limit: usize,
+        planned_limit: Option<usize>,
     },
 }
 

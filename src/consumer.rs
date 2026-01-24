@@ -1,6 +1,6 @@
 use crate::args::RunArgs;
 use crate::models::{MessageEnvelope, OffsetSpec, SslConfig};
-use crate::query::{OrderDir, OrderField, OrderSpec, SelectQuery};
+use crate::query::{CompiledExpr, EvalContext, OrderDir, OrderField, OrderSpec, SelectQuery};
 use anyhow::{Context, Result};
 use rdkafka::Offset;
 use rdkafka::config::ClientConfig;
@@ -8,10 +8,34 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::error::KafkaError;
 use rdkafka::message::{BorrowedMessage, Message};
 use rdkafka::topic_partition_list::TopicPartitionList;
-use serde_json::Value;
 use std::io::Write as _;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
+
+#[derive(Clone)]
+pub struct GlobalLimit {
+    max: usize,
+    counter: Arc<AtomicUsize>,
+}
+
+impl GlobalLimit {
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn reached(&self) -> bool {
+        self.counter.load(Ordering::Relaxed) >= self.max
+    }
+
+    fn incr(&self) -> usize {
+        self.counter.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
 
 pub async fn spawn_partition_consumer(
     args: RunArgs,
@@ -19,7 +43,7 @@ pub async fn spawn_partition_consumer(
     offset_spec: OffsetSpec,
     tx: Sender<MessageEnvelope>,
     query: Option<std::sync::Arc<SelectQuery>>,
-    query_limit: Option<usize>,
+    global_limit: Option<GlobalLimit>,
     ssl: Option<SslConfig>,
     query_scan_multiplier: usize,
 ) -> Result<()> {
@@ -61,13 +85,22 @@ pub async fn spawn_partition_consumer(
             consumer,
             topic,
             query,
-            query_limit,
+            global_limit,
             tx,
             query_scan_multiplier,
         )
         .await
     } else {
-        run_search_partition_consumer(args, partition, offset_spec, consumer, topic, tx).await
+        run_search_partition_consumer(
+            args,
+            partition,
+            offset_spec,
+            consumer,
+            topic,
+            tx,
+            global_limit,
+        )
+        .await
     }
 }
 
@@ -78,6 +111,7 @@ async fn run_search_partition_consumer(
     consumer: StreamConsumer,
     topic: String,
     tx: Sender<MessageEnvelope>,
+    global_limit: Option<GlobalLimit>,
 ) -> Result<()> {
     let mut tpl = TopicPartitionList::new();
     tpl.add_partition_offset(&topic, partition, offset_spec.to_rdkafka())?;
@@ -85,31 +119,36 @@ async fn run_search_partition_consumer(
         .assign(&tpl)
         .context("Failed to assign partition")?;
 
-    let mut processed: usize = 0;
+    let needle = args.search.as_deref();
 
     loop {
+        if global_limit.as_ref().is_some_and(|limit| limit.reached()) {
+            break;
+        }
         match consumer.recv().await {
             Ok(msg) => {
                 if is_partition_eof(&msg) {
                     continue;
                 }
 
-                let key = decode_key(&msg);
-                let (payload_str, payload_json, payload_valid) = decode_payload(&msg);
-                let hay_value = payload_str.as_deref().unwrap_or("");
-                let matches = if let Some(needle) = args.search.as_ref() {
-                    key.contains(needle) || hay_value.contains(needle)
+                let key_bytes = msg.key();
+                let payload_bytes = msg.payload();
+                let matches = if let Some(needle) = needle {
+                    let needle_bytes = needle.as_bytes();
+                    let key_match = key_bytes
+                        .map(|k| bytes_contains(k, needle_bytes))
+                        .unwrap_or_else(|| "null".contains(needle));
+                    let value_match = payload_bytes
+                        .map(|v| bytes_contains(v, needle_bytes))
+                        .unwrap_or(false);
+                    key_match || value_match
                 } else {
                     true
                 };
 
                 if matches {
-                    let value_print = format_value_column(
-                        args.keys_only,
-                        &payload_str,
-                        &payload_json,
-                        payload_valid,
-                    );
+                    let key = decode_key_bytes(key_bytes);
+                    let value_print = format_value_column(args.keys_only, payload_bytes);
 
                     let env = MessageEnvelope {
                         partition,
@@ -122,9 +161,8 @@ async fn run_search_partition_consumer(
                     if tx.send(env).await.is_err() {
                         break;
                     }
-                    processed += 1;
-                    if let Some(max) = args.max_messages {
-                        if processed >= max {
+                    if let Some(limit) = global_limit.as_ref() {
+                        if limit.incr() >= limit.max {
                             break;
                         }
                     }
@@ -186,7 +224,7 @@ async fn run_query_partition_consumer(
     consumer: StreamConsumer,
     topic: String,
     query: std::sync::Arc<SelectQuery>,
-    query_limit: Option<usize>,
+    global_limit: Option<GlobalLimit>,
     tx: Sender<MessageEnvelope>,
     query_scan_multiplier: usize,
 ) -> Result<()> {
@@ -244,114 +282,15 @@ async fn run_query_partition_consumer(
         .assign(&tpl)
         .context("Failed to assign partition")?;
 
+    let compiled = query.r#where.as_ref().map(CompiledExpr::compile);
     let scan_kind = infer_scan_kind(&query);
-    let per_partition_limit = query_limit;
 
     match scan_kind {
-        ScanKind::TimestampDesc | ScanKind::TimestampAsc => {
-            let limit_global = per_partition_limit.or(query.limit);
-            let window_size = limit_global.map(|n| n as i64).unwrap_or(256).max(1);
-            let per_partition_cap =
-                limit_global.map(|n| n.saturating_mul(query_scan_multiplier.max(1)).max(n));
-            let mut matched_rows = 0usize;
-
-            if matches!(scan_kind, ScanKind::TimestampDesc) {
-                let mut scan_end_exclusive = effective_end_exclusive;
-                'outer: loop {
-                    if scan_end_exclusive <= effective_start {
-                        break;
-                    }
-                    if partition_cap_reached(matched_rows, per_partition_cap) {
-                        break;
-                    }
-                    let remaining = scan_end_exclusive - effective_start;
-                    let window = remaining.min(window_size);
-                    let window_start = scan_end_exclusive - window;
-
-                    consumer
-                        .seek(
-                            &topic,
-                            partition,
-                            Offset::Offset(window_start),
-                            Duration::from_secs(5),
-                        )
-                        .context("seek window")?;
-
-                    loop {
-                        match consumer.recv().await {
-                            Ok(msg) => {
-                                if is_partition_eof(&msg) {
-                                    break;
-                                }
-                                if msg.offset() >= scan_end_exclusive {
-                                    break;
-                                }
-
-                                if let Some(env) =
-                                    build_query_envelope(&args, partition, &query, &msg)
-                                {
-                                    if tx.send(env).await.is_err() {
-                                        break 'outer;
-                                    }
-                                    matched_rows += 1;
-                                    if partition_cap_reached(matched_rows, per_partition_cap) {
-                                        break 'outer;
-                                    }
-                                }
-                            }
-                            Err(KafkaError::PartitionEOF(_)) => {
-                                break;
-                            }
-                            Err(e) => {
-                                log_partition_error(partition, &format!("{}", e));
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                            }
-                        }
-                    }
-
-                    scan_end_exclusive = window_start;
-                }
-            } else {
-                'asc: loop {
-                    if partition_cap_reached(matched_rows, per_partition_cap) {
-                        break 'asc;
-                    }
-                    match consumer.recv().await {
-                        Ok(msg) => {
-                            if is_partition_eof(&msg) {
-                                break 'asc;
-                            }
-                            if msg.offset() >= effective_end_exclusive {
-                                break 'asc;
-                            }
-
-                            if let Some(env) = build_query_envelope(&args, partition, &query, &msg)
-                            {
-                                if tx.send(env).await.is_err() {
-                                    break 'asc;
-                                }
-                                matched_rows += 1;
-                                if partition_cap_reached(matched_rows, per_partition_cap) {
-                                    break 'asc;
-                                }
-                            }
-                        }
-                        Err(KafkaError::PartitionEOF(_)) => break 'asc,
-                        Err(e) => {
-                            log_partition_error(partition, &format!("{}", e));
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        }
-                    }
-                }
-            }
-        }
-        ScanKind::PoffsetAsc | ScanKind::PoffsetTsAsc => {
-            let per_limit = per_partition_limit.unwrap_or(usize::MAX);
-            let mut emitted = 0usize;
+        ScanKind::TimestampDesc
+        | ScanKind::TimestampAsc
+        | ScanKind::PoffsetTsAsc
+        | ScanKind::PoffsetTsDesc => {
             'asc: loop {
-                if emitted >= per_limit {
-                    break 'asc;
-                }
                 match consumer.recv().await {
                     Ok(msg) => {
                         if is_partition_eof(&msg) {
@@ -361,12 +300,10 @@ async fn run_query_partition_consumer(
                             break 'asc;
                         }
 
-                        if let Some(env) = build_query_envelope(&args, partition, &query, &msg) {
+                        if let Some(env) =
+                            build_query_envelope(&args, partition, compiled.as_ref(), &msg)
+                        {
                             if tx.send(env).await.is_err() {
-                                break 'asc;
-                            }
-                            emitted += 1;
-                            if emitted >= per_limit {
                                 break 'asc;
                             }
                         }
@@ -379,21 +316,59 @@ async fn run_query_partition_consumer(
                 }
             }
         }
-        ScanKind::PoffsetDesc | ScanKind::PoffsetTsDesc => {
-            let per_limit = per_partition_limit.unwrap_or(usize::MAX);
-            let mut emitted = 0usize;
+        ScanKind::PoffsetAsc => {
+            'asc: loop {
+                if global_limit
+                    .as_ref()
+                    .is_some_and(|limit| limit.reached())
+                {
+                    break 'asc;
+                }
+                match consumer.recv().await {
+                    Ok(msg) => {
+                        if is_partition_eof(&msg) {
+                            break 'asc;
+                        }
+                        if msg.offset() >= effective_end_exclusive {
+                            break 'asc;
+                        }
+
+                        if let Some(env) =
+                            build_query_envelope(&args, partition, compiled.as_ref(), &msg)
+                        {
+                            if tx.send(env).await.is_err() {
+                                break 'asc;
+                            }
+                            if let Some(limit) = global_limit.as_ref() {
+                                if limit.incr() >= limit.max {
+                                    break 'asc;
+                                }
+                            }
+                        }
+                    }
+                    Err(KafkaError::PartitionEOF(_)) => break 'asc,
+                    Err(e) => {
+                        log_partition_error(partition, &format!("{}", e));
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        }
+        ScanKind::PoffsetDesc => {
             let mut scan_end_exclusive = effective_end_exclusive;
             let total_span = (effective_end_exclusive - effective_start).max(1);
-            let per_limit_window = per_partition_limit
-                .map(|n| n.min(i64::MAX as usize) as i64)
-                .unwrap_or(total_span);
-            let mut window_size = per_limit_window.max(1);
-            let min_window = 64i64.min(total_span);
-            window_size = window_size.max(min_window);
-            window_size = window_size.min(total_span);
+            let mut window_size = (query_scan_multiplier.max(1) as i64) * 2048;
+            let max_window = 50_000i64.min(total_span);
+            window_size = window_size.min(max_window).max(64);
 
             'outer: loop {
-                if scan_end_exclusive <= effective_start || emitted >= per_limit {
+                if scan_end_exclusive <= effective_start {
+                    break 'outer;
+                }
+                if global_limit
+                    .as_ref()
+                    .is_some_and(|limit| limit.reached())
+                {
                     break 'outer;
                 }
                 let remaining = scan_end_exclusive - effective_start;
@@ -414,6 +389,12 @@ async fn run_query_partition_consumer(
 
                 let mut local: Vec<MessageEnvelope> = Vec::new();
                 loop {
+                    if global_limit
+                        .as_ref()
+                        .is_some_and(|limit| limit.reached())
+                    {
+                        break;
+                    }
                     match consumer.recv().await {
                         Ok(msg) => {
                             if is_partition_eof(&msg) {
@@ -423,7 +404,8 @@ async fn run_query_partition_consumer(
                                 break;
                             }
 
-                            if let Some(env) = build_query_envelope(&args, partition, &query, &msg)
+                            if let Some(env) =
+                                build_query_envelope(&args, partition, compiled.as_ref(), &msg)
                             {
                                 local.push(env);
                             }
@@ -440,9 +422,10 @@ async fn run_query_partition_consumer(
                     if tx.send(env).await.is_err() {
                         break 'outer;
                     }
-                    emitted += 1;
-                    if emitted >= per_limit {
-                        break 'outer;
+                    if let Some(limit) = global_limit.as_ref() {
+                        if limit.incr() >= limit.max {
+                            break 'outer;
+                        }
                     }
                 }
 
@@ -457,22 +440,22 @@ async fn run_query_partition_consumer(
 fn build_query_envelope(
     args: &RunArgs,
     partition: i32,
-    query: &SelectQuery,
+    compiled: Option<&CompiledExpr>,
     msg: &BorrowedMessage<'_>,
 ) -> Option<MessageEnvelope> {
-    let key = decode_key(msg);
-    let (payload_str, payload_json, payload_valid) = decode_payload(msg);
     let timestamp_ms = msg.timestamp().to_millis().unwrap_or(0);
-    let matches = query
-        .r#where
-        .as_ref()
-        .map(|expr| expr.matches(&key, &payload_json, payload_str.as_deref(), timestamp_ms))
-        .unwrap_or(true);
-    if !matches {
-        return None;
+    let mut ctx = EvalContext::new(msg.key(), msg.payload(), timestamp_ms);
+    if let Some(expr) = compiled {
+        if !expr.matches(&mut ctx) {
+            return None;
+        }
     }
-    let value_print =
-        format_value_column(args.keys_only, &payload_str, &payload_json, payload_valid);
+    let key = ctx.take_key_string();
+    let value_print = if args.keys_only {
+        None
+    } else {
+        ctx.take_value_string()
+    };
     Some(MessageEnvelope {
         partition,
         offset: msg.offset(),
@@ -482,48 +465,35 @@ fn build_query_envelope(
     })
 }
 
-#[inline]
-fn partition_cap_reached(count: usize, cap: Option<usize>) -> bool {
-    cap.map(|c| count >= c).unwrap_or(false)
-}
-
-fn decode_key(msg: &BorrowedMessage<'_>) -> String {
-    msg.key()
-        .map(|k| String::from_utf8_lossy(k).to_string())
+fn decode_key_bytes(key: Option<&[u8]>) -> String {
+    key.map(|k| String::from_utf8_lossy(k).into_owned())
         .unwrap_or_else(|| "null".to_string())
 }
 
-fn decode_payload(msg: &BorrowedMessage<'_>) -> (Option<String>, Value, bool) {
-    if let Some(payload) = msg.payload() {
-        let s = String::from_utf8_lossy(payload).to_string();
-        if let Ok(json) = serde_json::from_str::<Value>(&s) {
-            (Some(s), json, true)
-        } else {
-            (Some(s), Value::Null, false)
-        }
-    } else {
-        (None, Value::Null, false)
-    }
-}
-
-fn format_value_column(
-    keys_only: bool,
-    payload_str: &Option<String>,
-    payload_json: &Value,
-    payload_valid: bool,
-) -> Option<String> {
+fn format_value_column(keys_only: bool, payload: Option<&[u8]>) -> Option<String> {
     if keys_only {
         return None;
     }
-    if let Some(s) = payload_str {
-        if payload_valid {
-            Some(serde_json::to_string_pretty(payload_json).unwrap_or_else(|_| s.clone()))
-        } else {
-            Some(s.clone())
-        }
-    } else {
-        Some("null".to_string())
+    let out = payload
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_else(|| "null".to_string());
+    Some(out)
+}
+
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
     }
+    if let Ok(hay) = std::str::from_utf8(haystack) {
+        let needle_str = std::str::from_utf8(needle).unwrap_or("");
+        return hay.contains(needle_str);
+    }
+    if needle.len() == 1 {
+        return haystack.contains(&needle[0]);
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn is_partition_eof(msg: &BorrowedMessage<'_>) -> bool {

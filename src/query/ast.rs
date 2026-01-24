@@ -1,3 +1,4 @@
+#[cfg(test)]
 use serde_json::Value;
 use std::{cmp::Ordering, sync::OnceLock};
 
@@ -94,7 +95,7 @@ pub struct QueryExecutionPlan {
     pub order_field: OrderField,
     pub order_dir: OrderDir,
     pub order_desc: bool,
-    pub n_global: usize,
+    pub n_global: Option<usize>,
     pub per_partition_limit: Option<usize>,
     pub global_sort_by_timestamp: bool,
 }
@@ -125,10 +126,13 @@ impl SelectQuery {
         let partitions = partition_count.max(1);
         let (order_field, order_dir, _) = self.effective_order();
         let order_desc = matches!(order_dir, OrderDir::Desc);
-        let n_global = base_limit.unwrap_or(50 * partitions);
-        let per_partition_limit = match order_field {
-            OrderField::Poffset | OrderField::PoffsetTs => Some(n_global.div_ceil(partitions)),
-            OrderField::Timestamp => Some(n_global),
+        let n_global = base_limit;
+        let per_partition_limit = match (order_field, n_global) {
+            (OrderField::Poffset | OrderField::PoffsetTs, Some(n)) => {
+                Some(n.div_ceil(partitions))
+            }
+            (OrderField::Timestamp, Some(n)) => Some(n),
+            _ => None,
         };
         let global_sort_by_timestamp =
             matches!(order_field, OrderField::Timestamp | OrderField::PoffsetTs);
@@ -157,6 +161,7 @@ pub struct TimestampBounds {
 
 impl Expr {
     /// Evaluate this expression against a message triple `(key, value_json, timestamp_ms)`.
+    #[cfg(test)]
     pub fn matches(
         &self,
         key: &str,
@@ -313,6 +318,7 @@ impl Expr {
     }
 }
 
+#[cfg(test)]
 fn resolve_path(path: &JsonPath, key: &str, value: &Value, timestamp_ms: i64) -> Value {
     match path.root {
         RootPath::Key => Value::String(key.to_string()),
@@ -336,6 +342,7 @@ fn resolve_path(path: &JsonPath, key: &str, value: &Value, timestamp_ms: i64) ->
     }
 }
 
+#[cfg(test)]
 fn cmp_eq(left: &Value, right: &Literal) -> bool {
     match right {
         Literal::String(s) => left.as_str().map(|x| x == s).unwrap_or(false),
@@ -355,6 +362,7 @@ fn cmp_eq(left: &Value, right: &Literal) -> bool {
     }
 }
 
+#[cfg(test)]
 fn cmp_eq_with_value_str(
     left: &JsonPath,
     right: &Literal,
@@ -372,11 +380,13 @@ fn cmp_eq_with_value_str(
     cmp_eq(&lv, right)
 }
 
+#[cfg(test)]
 fn cmp_contains(left: &str, right: &Literal) -> bool {
     let needle = literal_to_string(right);
     left.contains(&needle)
 }
 
+#[cfg(test)]
 fn literal_to_string(lit: &Literal) -> String {
     match lit {
         Literal::String(s) => s.clone(),
@@ -386,6 +396,7 @@ fn literal_to_string(lit: &Literal) -> String {
     }
 }
 
+#[cfg(test)]
 fn path_to_string(
     left: &JsonPath,
     key: &str,
@@ -401,6 +412,7 @@ fn path_to_string(
     }
 }
 
+#[cfg(test)]
 fn as_full_value_string(value: &Value, value_str: Option<&str>) -> String {
     if let Some(s) = value_str {
         s.to_string()
@@ -409,6 +421,7 @@ fn as_full_value_string(value: &Value, value_str: Option<&str>) -> String {
     }
 }
 
+#[cfg(test)]
 fn value_to_string(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -416,6 +429,7 @@ fn value_to_string(value: &Value) -> String {
     }
 }
 
+#[cfg(test)]
 fn cmp_ordering(left: &Value, right: &Literal, op: CmpOp) -> bool {
     let ordering = match right {
         Literal::Number(n) => left.as_f64().and_then(|x| x.partial_cmp(n)),
@@ -440,7 +454,7 @@ fn cmp_ordering(left: &Value, right: &Literal, op: CmpOp) -> bool {
     )
 }
 
-fn parse_timestamp_literal_ms(s: &str) -> Option<i64> {
+pub(crate) fn parse_timestamp_literal_ms(s: &str) -> Option<i64> {
     use time::format_description::well_known::Rfc3339;
     use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
 

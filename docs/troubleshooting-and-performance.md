@@ -28,4 +28,4 @@
   - This pattern behaves much like querying a relational table with `WHERE timestamp BETWEEN ... AND ...` on a timestamp index: RKL only touches the offsets that fall inside that window.
 - If you just need "what's happening now", prefer:
   - `SELECT ... FROM topic ORDER BY timestamp DESC LIMIT n;`
-  - This uses the optimized backward windowing from the end of the log and avoids scanning from the beginning.
+  - For accuracy this still scans the effective offset range; add timestamp bounds to keep it fast.

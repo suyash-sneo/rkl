@@ -6,14 +6,14 @@ RKL is optimized for topics with millions or billions of messages. The query eng
 
 - `ORDER BY timestamp DESC` means "newest first" with a global timestamp sort across partitions.
 - If you omit `ORDER BY`, RKL uses `ORDER BY poffset DESC` by default, which tails each partition by offset without reordering across partitions.
-- Timestamp-ordered queries seek near the latest offsets in each partition and scan backwards in windows, instead of starting from the beginning of the topic.
+- Timestamp-ordered queries scan the effective offset range and globally sort by timestamp; add timestamp bounds to avoid full-topic scans.
 - Results are globally ordered by timestamp across partitions, so it behaves like a database query on a `timestamp` column.
 
 ## Offset sampling modes
 
 - `ORDER BY poffset DESC` (the default) samples the tail of each partition independently so you see the most recent offsets from each shard with minimal reordering cost.
 - `ORDER BY poffset ASC` walks forward from the effective start offset in each partition, which is useful for historical replays.
-- `ORDER BY poffset_ts` combines offset-based sampling with a global timestamp sort at the end, so you get deterministic ordering without repeated backward seeks per partition.
+- `ORDER BY poffset_ts` combines offset-based scanning with a global timestamp sort at the end, so you get deterministic ordering without repeated backward seeks per partition.
 
 ### Examples
 
@@ -100,4 +100,3 @@ Timestamp comparisons accept either raw millisecond values or ISO-8601 timestamp
   - `timestamp <  '2024-01-01T18:00:00'` (local 6 PM)
 
 This lets you write queries using either UTC (for reproducible, environment-independent queries) or your local time (for quick, ad-hoc debugging) without doing manual timezone math.
-

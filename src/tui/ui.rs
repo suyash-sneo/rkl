@@ -527,7 +527,7 @@ fn build_row(idx: usize, env: &MessageEnvelope, app: &AppState) -> Row<'static> 
             SelectItem::Value => {
                 let raw = env.value.as_deref().unwrap_or("null");
                 let preview = json_preview(raw);
-                apply_hscroll(&preview, app.table_hscroll)
+                apply_hscroll(preview, app.table_hscroll)
             }
             _ => column_text(env, *col, app),
         };
@@ -1329,18 +1329,16 @@ fn json_lines(v: &serde_json::Value, depth: usize) -> Vec<Line<'static>> {
 }
 
 fn json_preview(raw: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(raw) {
-        Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| raw.to_string()),
-        Err(_) => raw.lines().next().unwrap_or("").to_string(),
-    }
+    const PREVIEW_MAX: usize = 512;
+    let line = raw.lines().next().unwrap_or("");
+    truncate_preview(line, PREVIEW_MAX)
 }
 
-fn apply_hscroll(s: &str, offset: usize) -> String {
+fn apply_hscroll(s: String, offset: usize) -> String {
     if offset == 0 {
-        s.to_string()
-    } else {
-        s.chars().skip(offset).collect()
+        return s;
     }
+    s.chars().skip(offset).collect()
 }
 
 fn record_detail_text(app: &AppState) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
@@ -1371,7 +1369,10 @@ fn record_detail_text(app: &AppState) -> (Vec<Line<'static>>, Vec<Line<'static>>
     ]));
 
     let body = if let Some(v) = env.value.as_ref() {
-        json_lines(&serde_json::from_str::<serde_json::Value>(v).unwrap_or(serde_json::Value::Null), 0)
+        match serde_json::from_str::<serde_json::Value>(v) {
+            Ok(json) => json_lines(&json, 0),
+            Err(_) => v.lines().map(|line| Line::from(line.to_string())).collect(),
+        }
     } else {
         vec![Line::from("null")]
     };
@@ -1390,6 +1391,24 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
         out.push(ch);
     }
     out.push('…');
+    out
+}
+
+fn truncate_preview(s: &str, max: usize) -> String {
+    if max == 0 || s.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut iter = s.chars();
+    for _ in 0..max.saturating_sub(1) {
+        match iter.next() {
+            Some(ch) => out.push(ch),
+            None => return out,
+        }
+    }
+    if iter.next().is_some() {
+        out.push('…');
+    }
     out
 }
 

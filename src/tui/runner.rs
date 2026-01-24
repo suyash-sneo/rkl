@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use crate::app_config::{AppConfig, DefaultOrderDir, DefaultOrderField};
 use crate::args::RunArgs;
-use crate::consumer::spawn_partition_consumer;
+use crate::consumer::{GlobalLimit, spawn_partition_consumer};
 use crate::merger::run_merger;
 use crate::models::{MessageEnvelope, OffsetSpec};
 use crate::output::OutputSink;
@@ -174,7 +174,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     planned_limit,
                 } => {
                     if Some(run_id) == app.current_run {
-                        app.query_limit = Some(planned_limit);
+                        app.query_limit = planned_limit;
                         app.query_rows_seen = 0;
                     }
                 }
@@ -558,12 +558,10 @@ async fn run_pipeline_with_ssl(
     let base_limit = ast
         .limit
         .or(args.max_messages)
-        .or_else(|| app_config.default_limit)
-        .or_else(|| Some(app_config.query_scan_multiplier * partition_count));
+        .or_else(|| app_config.default_limit);
     let plan = ast.execution_plan(partition_count, base_limit);
-    let max_messages_global = Some(plan.n_global);
+    let max_messages_global = plan.n_global;
     let order_desc = plan.order_desc;
-    let per_partition_limit = plan.per_partition_limit;
     let global_sort_by_timestamp = plan.global_sort_by_timestamp;
     let _ = tx.send(TuiEvent::QueryPlan {
         run_id,
@@ -573,7 +571,7 @@ async fn run_pipeline_with_ssl(
     let (tx_msg, rx_msg) = mpsc::channel::<MessageEnvelope>(args.channel_capacity);
     let offset_spec = OffsetSpec::from_str(&args.offset).unwrap_or(OffsetSpec::Beginning);
     let query_arc = std::sync::Arc::new(ast.clone());
-    let query_limit = per_partition_limit;
+    let global_limit = max_messages_global.map(GlobalLimit::new);
 
     let mut joinset = tokio::task::JoinSet::new();
     for &p in &partitions {
@@ -583,7 +581,7 @@ async fn run_pipeline_with_ssl(
         a.keys_only = keys_only;
         a.max_messages = None;
         let q = Some(query_arc.clone());
-        let limit = query_limit;
+        let limit = global_limit.clone();
         let ssl_clone = ssl.clone();
         let multiplier = app_config.query_scan_multiplier;
         joinset.spawn(async move {
