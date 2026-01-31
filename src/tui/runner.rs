@@ -2351,9 +2351,10 @@ fn build_basic_query_text(app: &AppState) -> Result<String, String> {
 
     let mut clauses: Vec<String> = Vec::new();
     if !search.is_empty() {
+        let escaped = escape_sql_literal(search.trim());
         clauses.push(format!(
-            "value CONTAINS '{}'",
-            escape_sql_literal(search.trim())
+            "(key CONTAINS '{0}' OR value CONTAINS '{0}')",
+            escaped
         ));
     }
     let where_clause = normalize_where_clause(&where_raw);

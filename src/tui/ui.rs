@@ -241,7 +241,7 @@ fn draw_basic_query(frame: &mut Frame, area: Rect, app: &AppState) {
     render_labeled_textarea(
         frame,
         layout[1],
-        "Value",
+        "Key/Value",
         &app.basic_query.search,
         matches!(app.home_focus, HomeFocus::BasicSearch),
     );

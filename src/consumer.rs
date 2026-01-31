@@ -2,6 +2,8 @@ use crate::args::RunArgs;
 use crate::models::{MessageEnvelope, OffsetSpec, SslConfig};
 use crate::query::{CompiledExpr, EvalContext, OrderDir, OrderField, OrderSpec, SelectQuery};
 use anyhow::{Context, Result};
+use memchr::memmem;
+use rayon::prelude::*;
 use rdkafka::Offset;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -13,6 +15,27 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
+
+const JSON_BATCH_SIZE: usize = 256;
+
+#[derive(Debug, Clone)]
+struct OwnedMessage {
+    offset: i64,
+    timestamp_ms: i64,
+    key: Option<Vec<u8>>,
+    value: Option<Vec<u8>>,
+}
+
+impl OwnedMessage {
+    fn from_borrowed(msg: &BorrowedMessage<'_>) -> Self {
+        Self {
+            offset: msg.offset(),
+            timestamp_ms: msg.timestamp().to_millis().unwrap_or(0),
+            key: msg.key().map(|k| k.to_vec()),
+            value: msg.payload().map(|v| v.to_vec()),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct GlobalLimit {
@@ -283,6 +306,7 @@ async fn run_query_partition_consumer(
         .context("Failed to assign partition")?;
 
     let compiled = query.r#where.as_ref().map(CompiledExpr::compile);
+    let needs_json = compiled.as_ref().is_some_and(|expr| expr.needs_json());
     let scan_kind = infer_scan_kind(&query);
 
     match scan_kind {
@@ -290,66 +314,179 @@ async fn run_query_partition_consumer(
         | ScanKind::TimestampAsc
         | ScanKind::PoffsetTsAsc
         | ScanKind::PoffsetTsDesc => {
-            'asc: loop {
-                match consumer.recv().await {
-                    Ok(msg) => {
-                        if is_partition_eof(&msg) {
-                            break 'asc;
-                        }
-                        if msg.offset() >= effective_end_exclusive {
-                            break 'asc;
-                        }
-
-                        if let Some(env) =
-                            build_query_envelope(&args, partition, compiled.as_ref(), &msg)
-                        {
-                            if tx.send(env).await.is_err() {
+            if needs_json {
+                let mut batch: Vec<OwnedMessage> = Vec::with_capacity(JSON_BATCH_SIZE);
+                let mut stop = false;
+                'asc: loop {
+                    match consumer.recv().await {
+                        Ok(msg) => {
+                            if is_partition_eof(&msg) {
                                 break 'asc;
+                            }
+                            if msg.offset() >= effective_end_exclusive {
+                                break 'asc;
+                            }
+                            batch.push(OwnedMessage::from_borrowed(&msg));
+                            if batch.len() >= JSON_BATCH_SIZE {
+                                let out = drain_batch_to_vec(
+                                    &args,
+                                    partition,
+                                    compiled.as_ref(),
+                                    &mut batch,
+                                );
+                                for env in out {
+                                    if tx.send(env).await.is_err() {
+                                        stop = true;
+                                        break 'asc;
+                                    }
+                                }
+                            }
+                        }
+                        Err(KafkaError::PartitionEOF(_)) => break 'asc,
+                        Err(e) => {
+                            log_partition_error(partition, &format!("{}", e));
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+                if !batch.is_empty() {
+                    if !stop {
+                        let out =
+                            drain_batch_to_vec(&args, partition, compiled.as_ref(), &mut batch);
+                        for env in out {
+                            if tx.send(env).await.is_err() {
+                                break;
                             }
                         }
                     }
-                    Err(KafkaError::PartitionEOF(_)) => break 'asc,
-                    Err(e) => {
-                        log_partition_error(partition, &format!("{}", e));
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            } else {
+                'asc: loop {
+                    match consumer.recv().await {
+                        Ok(msg) => {
+                            if is_partition_eof(&msg) {
+                                break 'asc;
+                            }
+                            if msg.offset() >= effective_end_exclusive {
+                                break 'asc;
+                            }
+
+                            if let Some(env) =
+                                build_query_envelope(&args, partition, compiled.as_ref(), &msg)
+                            {
+                                if tx.send(env).await.is_err() {
+                                    break 'asc;
+                                }
+                            }
+                        }
+                        Err(KafkaError::PartitionEOF(_)) => break 'asc,
+                        Err(e) => {
+                            log_partition_error(partition, &format!("{}", e));
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
                     }
                 }
             }
         }
         ScanKind::PoffsetAsc => {
-            'asc: loop {
-                if global_limit
-                    .as_ref()
-                    .is_some_and(|limit| limit.reached())
-                {
-                    break 'asc;
-                }
-                match consumer.recv().await {
-                    Ok(msg) => {
-                        if is_partition_eof(&msg) {
-                            break 'asc;
-                        }
-                        if msg.offset() >= effective_end_exclusive {
-                            break 'asc;
-                        }
-
-                        if let Some(env) =
-                            build_query_envelope(&args, partition, compiled.as_ref(), &msg)
-                        {
-                            if tx.send(env).await.is_err() {
+            if needs_json {
+                let mut batch: Vec<OwnedMessage> = Vec::with_capacity(JSON_BATCH_SIZE);
+                let mut stop = false;
+                'asc: loop {
+                    if global_limit
+                        .as_ref()
+                        .is_some_and(|limit| limit.reached())
+                    {
+                        break 'asc;
+                    }
+                    match consumer.recv().await {
+                        Ok(msg) => {
+                            if is_partition_eof(&msg) {
                                 break 'asc;
+                            }
+                            if msg.offset() >= effective_end_exclusive {
+                                break 'asc;
+                            }
+                            batch.push(OwnedMessage::from_borrowed(&msg));
+                            if batch.len() >= JSON_BATCH_SIZE {
+                                let out = drain_batch_to_vec(
+                                    &args,
+                                    partition,
+                                    compiled.as_ref(),
+                                    &mut batch,
+                                );
+                                for env in out {
+                                    if tx.send(env).await.is_err() {
+                                        stop = true;
+                                        break 'asc;
+                                    }
+                                    if let Some(limit) = global_limit.as_ref() {
+                                        if limit.incr() >= limit.max {
+                                            stop = true;
+                                            break 'asc;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(KafkaError::PartitionEOF(_)) => break 'asc,
+                        Err(e) => {
+                            log_partition_error(partition, &format!("{}", e));
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+                if !batch.is_empty() {
+                    if !stop {
+                        let out =
+                            drain_batch_to_vec(&args, partition, compiled.as_ref(), &mut batch);
+                        for env in out {
+                            if tx.send(env).await.is_err() {
+                                break;
                             }
                             if let Some(limit) = global_limit.as_ref() {
                                 if limit.incr() >= limit.max {
-                                    break 'asc;
+                                    break;
                                 }
                             }
                         }
                     }
-                    Err(KafkaError::PartitionEOF(_)) => break 'asc,
-                    Err(e) => {
-                        log_partition_error(partition, &format!("{}", e));
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            } else {
+                'asc: loop {
+                    if global_limit
+                        .as_ref()
+                        .is_some_and(|limit| limit.reached())
+                    {
+                        break 'asc;
+                    }
+                    match consumer.recv().await {
+                        Ok(msg) => {
+                            if is_partition_eof(&msg) {
+                                break 'asc;
+                            }
+                            if msg.offset() >= effective_end_exclusive {
+                                break 'asc;
+                            }
+
+                            if let Some(env) =
+                                build_query_envelope(&args, partition, compiled.as_ref(), &msg)
+                            {
+                                if tx.send(env).await.is_err() {
+                                    break 'asc;
+                                }
+                                if let Some(limit) = global_limit.as_ref() {
+                                    if limit.incr() >= limit.max {
+                                        break 'asc;
+                                    }
+                                }
+                            }
+                        }
+                        Err(KafkaError::PartitionEOF(_)) => break 'asc,
+                        Err(e) => {
+                            log_partition_error(partition, &format!("{}", e));
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
                     }
                 }
             }
@@ -357,9 +494,11 @@ async fn run_query_partition_consumer(
         ScanKind::PoffsetDesc => {
             let mut scan_end_exclusive = effective_end_exclusive;
             let total_span = (effective_end_exclusive - effective_start).max(1);
-            let mut window_size = (query_scan_multiplier.max(1) as i64) * 2048;
-            let max_window = 50_000i64.min(total_span);
-            window_size = window_size.min(max_window).max(64);
+            let mut window_size = 512i64.min(total_span).max(64);
+            let max_window = ((query_scan_multiplier.max(1) as i64) * 8192)
+                .min(50_000i64)
+                .min(total_span);
+            let mut empty_windows = 0usize;
 
             'outer: loop {
                 if scan_end_exclusive <= effective_start {
@@ -388,36 +527,80 @@ async fn run_query_partition_consumer(
                     .context("seek window")?;
 
                 let mut local: Vec<MessageEnvelope> = Vec::new();
-                loop {
-                    if global_limit
-                        .as_ref()
-                        .is_some_and(|limit| limit.reached())
-                    {
-                        break;
-                    }
-                    match consumer.recv().await {
-                        Ok(msg) => {
-                            if is_partition_eof(&msg) {
-                                break;
-                            }
-                            if msg.offset() >= scan_end_exclusive {
-                                break;
-                            }
+                if needs_json {
+                    let mut batch: Vec<OwnedMessage> = Vec::with_capacity(JSON_BATCH_SIZE);
+                    loop {
+                        if global_limit
+                            .as_ref()
+                            .is_some_and(|limit| limit.reached())
+                        {
+                            break;
+                        }
+                        match consumer.recv().await {
+                            Ok(msg) => {
+                                if is_partition_eof(&msg) {
+                                    break;
+                                }
+                                if msg.offset() >= scan_end_exclusive {
+                                    break;
+                                }
 
-                            if let Some(env) =
-                                build_query_envelope(&args, partition, compiled.as_ref(), &msg)
-                            {
-                                local.push(env);
+                                batch.push(OwnedMessage::from_borrowed(&msg));
+                                if batch.len() >= JSON_BATCH_SIZE {
+                                    let out = drain_batch_to_vec(
+                                        &args,
+                                        partition,
+                                        compiled.as_ref(),
+                                        &mut batch,
+                                    );
+                                    local.extend(out);
+                                }
+                            }
+                            Err(KafkaError::PartitionEOF(_)) => break,
+                            Err(e) => {
+                                log_partition_error(partition, &format!("{}", e));
+                                tokio::time::sleep(Duration::from_millis(50)).await;
                             }
                         }
-                        Err(KafkaError::PartitionEOF(_)) => break,
-                        Err(e) => {
-                            log_partition_error(partition, &format!("{}", e));
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    if !batch.is_empty() {
+                        let out =
+                            drain_batch_to_vec(&args, partition, compiled.as_ref(), &mut batch);
+                        local.extend(out);
+                    }
+                } else {
+                    loop {
+                        if global_limit
+                            .as_ref()
+                            .is_some_and(|limit| limit.reached())
+                        {
+                            break;
+                        }
+                        match consumer.recv().await {
+                            Ok(msg) => {
+                                if is_partition_eof(&msg) {
+                                    break;
+                                }
+                                if msg.offset() >= scan_end_exclusive {
+                                    break;
+                                }
+
+                                if let Some(env) =
+                                    build_query_envelope(&args, partition, compiled.as_ref(), &msg)
+                                {
+                                    local.push(env);
+                                }
+                            }
+                            Err(KafkaError::PartitionEOF(_)) => break,
+                            Err(e) => {
+                                log_partition_error(partition, &format!("{}", e));
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
                         }
                     }
                 }
 
+                let local_len = local.len();
                 for env in local.into_iter().rev() {
                     if tx.send(env).await.is_err() {
                         break 'outer;
@@ -427,6 +610,16 @@ async fn run_query_partition_consumer(
                             break 'outer;
                         }
                     }
+                }
+
+                if local_len == 0 {
+                    empty_windows += 1;
+                    if empty_windows >= 8 && window_size < max_window {
+                        window_size = (window_size * 2).min(max_window);
+                        empty_windows = 0;
+                    }
+                } else {
+                    empty_windows = 0;
                 }
 
                 scan_end_exclusive = window_start;
@@ -465,6 +658,50 @@ fn build_query_envelope(
     })
 }
 
+fn build_query_envelope_owned(
+    args: &RunArgs,
+    partition: i32,
+    compiled: Option<&CompiledExpr>,
+    msg: &OwnedMessage,
+) -> Option<MessageEnvelope> {
+    let mut ctx = EvalContext::new(msg.key.as_deref(), msg.value.as_deref(), msg.timestamp_ms);
+    if let Some(expr) = compiled {
+        if !expr.matches(&mut ctx) {
+            return None;
+        }
+    }
+    let key = ctx.take_key_string();
+    let value_print = if args.keys_only {
+        None
+    } else {
+        ctx.take_value_string()
+    };
+    Some(MessageEnvelope {
+        partition,
+        offset: msg.offset,
+        timestamp_ms: msg.timestamp_ms,
+        key,
+        value: value_print,
+    })
+}
+
+fn drain_batch_to_vec(
+    args: &RunArgs,
+    partition: i32,
+    compiled: Option<&CompiledExpr>,
+    batch: &mut Vec<OwnedMessage>,
+) -> Vec<MessageEnvelope> {
+    if batch.is_empty() {
+        return Vec::new();
+    }
+    let rows: Vec<Option<MessageEnvelope>> = batch
+        .par_iter()
+        .map(|msg| build_query_envelope_owned(args, partition, compiled, msg))
+        .collect();
+    batch.clear();
+    rows.into_iter().flatten().collect()
+}
+
 fn decode_key_bytes(key: Option<&[u8]>) -> String {
     key.map(|k| String::from_utf8_lossy(k).into_owned())
         .unwrap_or_else(|| "null".to_string())
@@ -484,16 +721,7 @@ fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
     }
-    if let Ok(hay) = std::str::from_utf8(haystack) {
-        let needle_str = std::str::from_utf8(needle).unwrap_or("");
-        return hay.contains(needle_str);
-    }
-    if needle.len() == 1 {
-        return haystack.contains(&needle[0]);
-    }
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+    memmem::find(haystack, needle).is_some()
 }
 
 fn is_partition_eof(msg: &BorrowedMessage<'_>) -> bool {

@@ -1,4 +1,5 @@
 use super::ast::{CmpOp, Expr, JsonPath, Literal, RootPath, parse_timestamp_literal_ms};
+use memchr::memmem;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -21,6 +22,7 @@ struct CompiledCmp {
     op: CmpOp,
     right: Literal,
     contains_needle: Option<String>,
+    contains_needle_bytes: Option<Vec<u8>>,
     timestamp_rhs_ms: Option<i64>,
 }
 
@@ -40,10 +42,11 @@ impl CompiledExpr {
                 ),
             },
             Expr::Cmp { left, op, right } => {
-                let contains_needle = if matches!(op, CmpOp::Contains) {
-                    Some(literal_to_string(right))
+                let (contains_needle, contains_needle_bytes) = if matches!(op, CmpOp::Contains) {
+                    let needle = literal_to_string(right);
+                    (Some(needle.clone()), Some(needle.into_bytes()))
                 } else {
-                    None
+                    (None, None)
                 };
                 let timestamp_rhs_ms =
                     if matches!(op, CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge)
@@ -64,6 +67,7 @@ impl CompiledExpr {
                         op: *op,
                         right: right.clone(),
                         contains_needle,
+                        contains_needle_bytes,
                         timestamp_rhs_ms,
                     }),
                 }
@@ -76,6 +80,14 @@ impl CompiledExpr {
             CompiledExprKind::And(lhs, rhs) => lhs.matches(ctx) && rhs.matches(ctx),
             CompiledExprKind::Or(lhs, rhs) => lhs.matches(ctx) || rhs.matches(ctx),
             CompiledExprKind::Cmp(cmp) => cmp.matches(ctx),
+        }
+    }
+
+    pub fn needs_json(&self) -> bool {
+        match &self.kind {
+            CompiledExprKind::And(lhs, rhs) => lhs.needs_json() || rhs.needs_json(),
+            CompiledExprKind::Or(lhs, rhs) => lhs.needs_json() || rhs.needs_json(),
+            CompiledExprKind::Cmp(cmp) => cmp.needs_json(),
         }
     }
 }
@@ -126,6 +138,14 @@ impl<'a> EvalContext<'a> {
         self.value_str.as_deref().unwrap_or("null")
     }
 
+    fn key_bytes(&self) -> Option<&[u8]> {
+        self.key_bytes
+    }
+
+    fn value_bytes(&self) -> Option<&[u8]> {
+        self.value_bytes
+    }
+
     pub fn take_key_string(&mut self) -> String {
         if let Some(cow) = self.key_str.take() {
             return cow.into_owned();
@@ -171,21 +191,29 @@ impl CompiledCmp {
     }
 
     fn matches_key(&self, ctx: &mut EvalContext<'_>) -> bool {
-        let left = ctx.key_str();
         match self.op {
-            CmpOp::Contains => left.contains(self.contains_needle.as_deref().unwrap_or("")),
-            CmpOp::Eq => match &self.right {
-                Literal::String(s) => left == s,
-                _ => false,
-            },
-            CmpOp::Neq => match &self.right {
-                Literal::String(s) => left != s,
-                _ => true,
-            },
-            CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => match &self.right {
-                Literal::String(s) => cmp_str_ordering(left, s, self.op),
-                _ => false,
-            },
+            CmpOp::Contains => {
+                let needle = self.contains_needle_bytes.as_deref().unwrap_or(b"");
+                bytes_contains(ctx.key_bytes(), needle)
+            }
+            CmpOp::Eq | CmpOp::Neq | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
+                let left = ctx.key_str();
+                match self.op {
+                    CmpOp::Eq => match &self.right {
+                        Literal::String(s) => left == s,
+                        _ => false,
+                    },
+                    CmpOp::Neq => match &self.right {
+                        Literal::String(s) => left != s,
+                        _ => true,
+                    },
+                    CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => match &self.right {
+                        Literal::String(s) => cmp_str_ordering(left, s, self.op),
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            }
         }
     }
 
@@ -226,10 +254,11 @@ impl CompiledCmp {
         let is_root = self.left.segments.is_empty();
         match self.op {
             CmpOp::Contains => {
-                let needle = self.contains_needle.as_deref().unwrap_or("");
                 if is_root {
-                    ctx.value_str().contains(needle)
+                    let needle = self.contains_needle_bytes.as_deref().unwrap_or(b"");
+                    bytes_contains(ctx.value_bytes(), needle)
                 } else {
+                    let needle = self.contains_needle.as_deref().unwrap_or("");
                     let Some(v) = ctx.value_json() else {
                         return false;
                     };
@@ -278,6 +307,20 @@ impl CompiledCmp {
                 };
                 cmp_ordering(value, &self.right, self.op)
             }
+        }
+    }
+
+    fn needs_json(&self) -> bool {
+        if !matches!(self.left.root, RootPath::Value) {
+            return false;
+        }
+        if !self.left.segments.is_empty() {
+            return true;
+        }
+        match self.op {
+            CmpOp::Contains => false,
+            CmpOp::Eq | CmpOp::Neq => !matches!(self.right, Literal::String(_)),
+            CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => true,
         }
     }
 }
@@ -364,4 +407,15 @@ fn cmp_str_ordering(left: &str, right: &str, op: CmpOp) -> bool {
             | (Ordering::Greater, CmpOp::Gt)
             | (Ordering::Greater, CmpOp::Ge)
     )
+}
+
+fn bytes_contains(haystack: Option<&[u8]>, needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let bytes = match haystack {
+        Some(b) => b,
+        None => b"null",
+    };
+    memmem::find(bytes, needle).is_some()
 }

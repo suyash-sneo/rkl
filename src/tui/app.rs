@@ -222,7 +222,7 @@ impl AppState {
             DefaultOrderField::PoffsetTs => 2,
         };
         let basic_query = BasicQueryState {
-            search: build_single_line_input("Search value contains..."),
+            search: build_single_line_input("Search key/value contains..."),
             where_clause: build_single_line_input("WHERE clause (optional)"),
             limit: build_single_line_input("Limit (optional)"),
             order_field_idx,
