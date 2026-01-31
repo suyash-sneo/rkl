@@ -590,7 +590,7 @@ async fn run_pipeline_with_ssl(
     }
     drop(tx_msg);
 
-    let snapshot_mode = max_messages_global.is_some();
+    let snapshot_mode = max_messages_global.is_some() && global_sort_by_timestamp;
     let mut sink = TuiOutput::new(run_id, tx.clone(), snapshot_mode);
     run_merger(
         rx_msg,
@@ -1524,6 +1524,11 @@ async fn handle_home_key(
         return;
     }
 
+    if ctrl && matches!(code, KeyCode::Char('e')) {
+        app.home_focus = HomeFocus::Results;
+        return;
+    }
+
     if matches!(code, KeyCode::Tab | KeyCode::Char('\t')) {
         // Ignore tab in results mode to keep user anchored
         if !matches!(app.home_focus, HomeFocus::Results) {
@@ -2384,13 +2389,20 @@ fn build_basic_query_text(app: &AppState) -> Result<String, String> {
         topic, where_sql, order_field, order_dir
     );
 
-    if !limit_raw.is_empty() {
-        let limit = limit_raw
+    let limit = if !limit_raw.is_empty() {
+        let parsed = limit_raw
             .parse::<usize>()
             .map_err(|_| "LIMIT must be a number".to_string())?;
-        if limit == 0 {
+        if parsed == 0 {
             return Err("LIMIT must be > 0".to_string());
         }
+        Some(parsed)
+    } else {
+        app.app_config
+            .default_limit
+            .or_else(|| Some(app.max_rows_in_memory))
+    };
+    if let Some(limit) = limit {
         query.push_str(&format!(" LIMIT {}", limit));
     }
 

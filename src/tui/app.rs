@@ -249,7 +249,7 @@ impl AppState {
             results_mode: ResultsMode::Messages,
             selected_columns: SelectItem::standard(true),
             current_run: None,
-            max_rows_in_memory: 2000,
+            max_rows_in_memory: 10000,
             host,
             selected_row: 0,
             selected_col: 0,

@@ -494,7 +494,7 @@ async fn run_query_partition_consumer(
         ScanKind::PoffsetDesc => {
             let mut scan_end_exclusive = effective_end_exclusive;
             let total_span = (effective_end_exclusive - effective_start).max(1);
-            let mut window_size = 512i64.min(total_span).max(64);
+            let mut window_size = 64i64.min(total_span).max(64);
             let max_window = ((query_scan_multiplier.max(1) as i64) * 8192)
                 .min(50_000i64)
                 .min(total_span);

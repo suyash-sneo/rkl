@@ -49,6 +49,7 @@ async fn run_merger_passthrough<S: OutputSink + Send>(
     flush_interval_ms: u64,
     interactive: bool,
 ) -> Result<()> {
+    const PASSTHROUGH_FLUSH_THRESHOLD: usize = 64;
     let limit = max_messages.unwrap_or(usize::MAX);
     let mut sent = 0usize;
 
@@ -72,6 +73,12 @@ async fn run_merger_passthrough<S: OutputSink + Send>(
                             if sent < limit {
                                 buf.push(env);
                                 sent += 1;
+                                if sent == 1 || buf.len() >= PASSTHROUGH_FLUSH_THRESHOLD {
+                                    for env in buf.drain(..) {
+                                        out.push(&env);
+                                    }
+                                    out.flush_block();
+                                }
                             }
                         }
                         None => {

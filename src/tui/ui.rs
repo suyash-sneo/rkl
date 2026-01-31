@@ -30,7 +30,8 @@ const PANEL_GAP: u16 = 1;
 static HELP_LINES: &[&str] = &[
     "Home",
     "  • Ctrl-Enter run query (Shift+Ctrl-Enter rerun last)",
-    "  • Tab / Shift-Tab move focus between filter, query, results, detail",
+    "  • Tab / Shift-Tab move focus between filter and query fields",
+    "  • Ctrl-E jumps to results while streaming",
     "  • Ctrl-R opens history, Ctrl-Shift-R reruns last query",
     "  • Ctrl-P or ':' opens command palette, '?' opens help",
     "  • Ctrl-Y drops selected topic into advanced editor",
@@ -38,7 +39,7 @@ static HELP_LINES: &[&str] = &[
     "",
     "Basic mode",
     "  • Type to fuzzy-search topics; Enter jumps to fields",
-    "  • Filters: search value contains, WHERE, time bounds, LIMIT, ORDER",
+    "  • Filters: search key/value contains, WHERE, time bounds, LIMIT, ORDER",
     "",
     "Advanced mode",
     "  • Full SQL editor with multi-line editing; query under cursor runs",
@@ -127,7 +128,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &AppState) {
         Span::styled("Mode ", Style::default().fg(ACCENT_FADED)),
         Span::styled(mode, Style::default().fg(Color::White)),
         Span::raw("    "),
-        Span::styled("Ctrl-P palette  ? help  /r rerun  Ctrl-Enter run", Style::default().fg(Color::Gray)),
+        Span::styled(
+            "Ctrl-P palette  ? help  /r rerun  Ctrl-E results  Ctrl-Enter run",
+            Style::default().fg(Color::Gray),
+        ),
         Span::raw("    "),
         Span::styled(spinner, Style::default().fg(ACCENT_FADED)),
     ]);
@@ -254,10 +258,15 @@ fn draw_basic_query(frame: &mut Frame, area: Rect, app: &AppState) {
     );
 
     let limit_row = layout[3];
+    let limit_label = if let Some(limit) = app.app_config.default_limit {
+        format!("Limit (empty = {limit})")
+    } else {
+        format!("Limit (empty = {})", app.max_rows_in_memory)
+    };
     render_labeled_textarea(
         frame,
         limit_row,
-        "Limit (empty = auto)",
+        &limit_label,
         &app.basic_query.limit,
         matches!(app.home_focus, HomeFocus::BasicLimit),
     );
@@ -268,7 +277,7 @@ fn draw_basic_query(frame: &mut Frame, area: Rect, app: &AppState) {
         app.basic_query.order_dir_idx,
     );
 
-    let tips = "Tab: topic → value → where → limit  •  /. order  •  /, dir  •  /r rerun last";
+    let tips = "Tab: topic → value → where → limit  •  Ctrl-E results  •  /. order  •  /, dir  •  /r rerun last";
     frame.render_widget(
         Paragraph::new(tips)
             .style(Style::default().fg(Color::Gray))
