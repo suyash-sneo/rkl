@@ -78,7 +78,11 @@ pub async fn spawn_partition_consumer(
         .set("group.id", group_id)
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
-        .set("enable.partition.eof", "true");
+        .set("enable.partition.eof", "true")
+        .set("fetch.wait.max.ms", "25")
+        .set("fetch.min.bytes", "1")
+        .set("fetch.max.bytes", "104857600")
+        .set("max.partition.fetch.bytes", "20971520");
     if let Some(ssl) = &ssl {
         if ssl.ca_pem.is_some() || ssl.cert_pem.is_some() || ssl.key_pem.is_some() {
             cfg.set("security.protocol", "ssl");
@@ -499,6 +503,7 @@ async fn run_query_partition_consumer(
                 .min(50_000i64)
                 .min(total_span);
             let mut empty_windows = 0usize;
+            let mut dense_windows = 0usize;
 
             'outer: loop {
                 if scan_end_exclusive <= effective_start {
@@ -618,8 +623,14 @@ async fn run_query_partition_consumer(
                         window_size = (window_size * 2).min(max_window);
                         empty_windows = 0;
                     }
+                    dense_windows = 0;
                 } else {
                     empty_windows = 0;
+                    dense_windows += 1;
+                    if dense_windows >= 2 && window_size < max_window {
+                        window_size = (window_size * 2).min(max_window);
+                        dense_windows = 0;
+                    }
                 }
 
                 scan_end_exclusive = window_start;
